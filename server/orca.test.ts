@@ -30,3 +30,24 @@ test('runs pagination does not silently omit later Runs', async () => {
   const bridge = createOrcaBridge(async () => ({ runs: [{ id: `run-${page}`, objective: 'A' }], nextCursor: page++ === 0 ? 1 : null }));
   assert.equal((await bridge.runs()).length, 2);
 });
+test('openTask switches only to the newest live attempt terminal, resolved server-side', async () => {
+  const calls: string[][] = [];
+  const workers = [
+    { dispatchId: 'dispatch-new', taskId: 'task-a', agentTerminalHandle: 'term_new', terminalState: 'owned', projection: {} },
+    { dispatchId: 'dispatch-old', taskId: 'task-a', agentTerminalHandle: 'term_old', terminalState: 'owned', projection: {} },
+    { dispatchId: 'dispatch-done', taskId: 'task-b', agentTerminalHandle: 'term_done', terminalState: 'released', projection: {} },
+  ];
+  const bridge = createOrcaBridge(async (args) => {
+    calls.push(args);
+    if (args[1] === 'run-show') return { run: { id: 'run-a', objective: 'A' } };
+    if (args[1] === 'task-list') return { tasks: [] };
+    if (args[0] === 'terminal') return {};
+    return { workers, page: { hasMore: false } };
+  });
+  assert.deepEqual(await bridge.openTask('run-a', 'task-a'), { opened: true });
+  assert.deepEqual(calls.at(-1), ['terminal', 'switch', '--terminal', 'term_new']);
+  assert.equal((await bridge.openTask('run-a', 'task-b')).opened, false);
+  assert.equal((await bridge.openTask('run-a', 'task-none')).opened, false);
+  await assert.rejects(bridge.openTask('run-a', '--flag;rm'), /Task ID/);
+  assert.equal(calls.filter((args) => args[0] === 'terminal').length, 1);
+});

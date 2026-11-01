@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import type { RunSnapshot, RunSummary, TaskSummary, WorkerSummary } from '../src/model.ts';
+import type { AutomationState, Locations, RunSnapshot, RunSummary, TaskSummary, WorkerSummary } from '../src/model.ts';
 
 const exec = promisify(execFile);
 type Row = Record<string, any>;
@@ -45,15 +45,52 @@ function normalizeWorker(row: Row): WorkerSummary {
     provider: String(row.projection?.provider?.id ?? ''), model: String(row.projection?.provider?.model ?? ''),
     liveness: String(row.projection?.liveness?.verdict ?? 'unverifiable'),
     stage: String(row.projection?.stage?.activity ?? row.projection?.stage?.worker ?? ''),
-    outcome: String(row.projection?.outcome ?? '') };
+    outcome: String(row.projection?.outcome ?? ''),
+    terminal: typeof row.agentTerminalHandle === 'string' ? row.agentTerminalHandle : undefined,
+    terminalState: typeof row.terminalState === 'string' ? row.terminalState : undefined };
 }
 
 export function createOrcaBridge(command: Command = orcaCommand) {
-  return {
+  const bridge = {
     async status() {
       const result = await command(['status']);
       return { connected: result.runtime?.reachable === true && result.runtime?.state === 'ready',
         version: String(result.runtime?.appVersion ?? ''), observedAt: new Date().toISOString() };
+    },
+    /** Projects (repos) open in Orca and their worktrees, for group nodes. Paths only; no git state. */
+    async locations(): Promise<Locations> {
+      const [repos, worktrees] = await Promise.all([command(['repo', 'list']), command(['worktree', 'list', '--limit', '500'])]);
+      const absolute = (value: unknown): value is string => typeof value === 'string' && value.startsWith('/') && !/[\u0000-\u001f]/.test(value);
+      return {
+        projects: (repos.repos ?? []).filter((row: Row) => absolute(row.path)).map((row: Row) => ({
+          id: String(row.id), name: String(row.displayName || row.path.split('/').pop()), path: row.path })),
+        worktrees: (worktrees.worktrees ?? []).filter((row: Row) => absolute(row.path) && !row.isArchived && !row.isBare).map((row: Row) => ({
+          id: String(row.id), name: String(row.displayName || row.path.split('/').pop()), path: row.path, repoId: String(row.repoId ?? ''),
+          branch: typeof row.branch === 'string' ? row.branch.replace(/^refs\/heads\//, '') : undefined })),
+      };
+    },
+    async automations(): Promise<AutomationState[]> {
+      const result = await command(['automations', 'list']);
+      return (result.automations ?? []).map((row: Row) => ({ orcaId: String(row.id), name: String(row.name ?? ''), enabled: row.enabled === true,
+        ...(typeof row.nextRunAt === 'number' ? { nextRunAt: row.nextRunAt } : {}), ...(typeof row.lastRunAt === 'number' ? { lastRunAt: row.lastRunAt } : {}),
+        ...(typeof row.rrule === 'string' ? { rrule: row.rrule } : {}) }));
+    },
+    /** Creates an enabled, scheduled automation that runs a Claude agent in `project` with `prompt`. Returns the Orca id. */
+    async createAutomation(input: { name: string; trigger: string; time?: string; day?: number; project: string; prompt: string }): Promise<string> {
+      const result = await command(['automations', 'create', '--name', input.name, '--trigger', input.trigger,
+        ...(input.time ? ['--time', input.time] : []), ...(input.day !== undefined ? ['--day', String(input.day)] : []),
+        '--prompt', input.prompt, '--provider', 'claude', '--repo', `path:${input.project}`, '--workspace-mode', 'existing', '--fresh-session', '--enabled']);
+      const id = result.automation?.id ?? result.id;
+      if (typeof id !== 'string' || !/^[a-zA-Z0-9-]{1,128}$/.test(id)) throw new Error('Orca가 만든 자동화의 ID를 확인할 수 없습니다.');
+      return id;
+    },
+    async runAutomation(orcaId: string) {
+      if (!/^[a-zA-Z0-9-]{1,128}$/.test(orcaId)) throw new Error('올바르지 않은 자동화 ID입니다.');
+      await command(['automations', 'run', orcaId]);
+    },
+    async removeAutomation(orcaId: string) {
+      if (!/^[a-zA-Z0-9-]{1,128}$/.test(orcaId)) throw new Error('올바르지 않은 자동화 ID입니다.');
+      await command(['automations', 'remove', orcaId]);
     },
     async runs(): Promise<RunSummary[]> {
       const runs: RunSummary[] = [];
@@ -87,5 +124,33 @@ export function createOrcaBridge(command: Command = orcaCommand) {
       } while (cursor != null);
       return { run: runSummary(detail.run), tasks: (tasks.tasks ?? []).map(normalizeTask), workers, observedAt: new Date().toISOString() };
     },
+    /**
+     * Brings the latest attempt's terminal for a Task to the front in the Orca UI.
+     * The handle is resolved server-side from the Run snapshot; clients never pass a handle.
+     * This is a view action only: it does not send input or change any lifecycle state.
+     */
+    /** Starts the coordinator agent in a terminal (orchestration needs a terminal-bound coordinator). */
+    async launchCoordinator(workspaceRoot: string, prompt: string): Promise<{ terminal?: string }> {
+      const result = await command(['agent', 'launch', '--agent', 'claude', '--model', 'claude-opus-5-5',
+        '--surface', 'terminal', '--worktree', `path:${workspaceRoot}`, '--prompt', prompt]);
+      const text = JSON.stringify(result);
+      return { terminal: text.match(/term_[a-zA-Z0-9-]{1,128}/)?.[0] };
+    },
+    async renameTerminal(terminal: string, title: string) {
+      if (!/^term_[a-zA-Z0-9-]{1,128}$/.test(terminal)) return;
+      await command(['terminal', 'rename', '--terminal', terminal, '--title', title.slice(0, 80)]);
+    },
+    async openTask(runId: string, taskId: string): Promise<{ opened: boolean; reason?: string }> {
+      if (!/^[a-zA-Z0-9_-]{1,128}$/.test(taskId)) throw new Error('올바르지 않은 Task ID입니다.');
+      const snapshot = await bridge.snapshot(runId);
+      // worker-list returns newest attempts first; never open an older attempt's terminal.
+      const latest = snapshot.workers.find((worker) => worker.taskId === taskId);
+      if (!latest) return { opened: false, reason: '이 Task에는 아직 워커가 없습니다.' };
+      if (!latest.terminal || !/^term_[a-zA-Z0-9-]{1,128}$/.test(latest.terminal)) return { opened: false, reason: '워커 터미널을 확인할 수 없습니다.' };
+      if (latest.terminalState === 'released') return { opened: false, reason: '이미 정리된 워커입니다.' };
+      await command(['terminal', 'switch', '--terminal', latest.terminal]);
+      return { opened: true };
+    },
   };
+  return bridge;
 }

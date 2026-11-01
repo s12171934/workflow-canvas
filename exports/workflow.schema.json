@@ -3,42 +3,500 @@
   "$id": "https://github.com/s12171934/workflow-canvas/exports/workflow.schema.json",
   "title": "Workflow Canvas v1",
   "type": "object",
-  "required": ["version", "id", "name", "description", "runId", "nodes", "edges"],
+  "required": [
+    "version",
+    "id",
+    "name",
+    "description",
+    "runId",
+    "nodes",
+    "edges"
+  ],
   "properties": {
-    "version": { "const": 1 },
-    "id": { "$ref": "#/$defs/id" },
-    "name": { "type": "string", "minLength": 1, "maxLength": 500 },
-    "description": { "type": "string", "maxLength": 10000 },
-    "runId": { "anyOf": [{ "const": "" }, { "$ref": "#/$defs/id" }] },
+    "version": {
+      "const": 1
+    },
+    "id": {
+      "$ref": "#/$defs/id"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 500
+    },
+    "description": {
+      "type": "string",
+      "maxLength": 10000
+    },
+    "runId": {
+      "anyOf": [
+        {
+          "const": ""
+        },
+        {
+          "$ref": "#/$defs/id"
+        }
+      ]
+    },
     "nodes": {
-      "type": "array", "maxItems": 500,
+      "type": "array",
+      "maxItems": 500,
       "items": {
-        "type": "object", "required": ["id", "type", "position", "data"],
+        "type": "object",
+        "required": [
+          "id",
+          "type",
+          "position",
+          "data"
+        ],
         "properties": {
-          "id": { "$ref": "#/$defs/id" }, "type": { "const": "stage" },
-          "position": { "type": "object", "required": ["x", "y"], "properties": { "x": { "type": "number" }, "y": { "type": "number" } } },
-          "data": {
-            "type": "object", "required": ["label", "description", "kind"],
+          "id": {
+            "$ref": "#/$defs/id"
+          },
+          "type": {
+            "enum": [
+              "stage",
+              "group",
+              "frame"
+            ],
+            "description": "group = 그룹 노드(kind group), frame = 메모 그룹(kind frame), stage = 일반 노드"
+          },
+          "position": {
+            "type": "object",
+            "required": [
+              "x",
+              "y"
+            ],
             "properties": {
-              "label": { "type": "string", "maxLength": 500 },
-              "description": { "type": "string", "maxLength": 20000 },
-              "kind": { "enum": ["task", "gate", "note"] },
-              "taskId": { "anyOf": [{ "const": "" }, { "$ref": "#/$defs/id" }] }
+              "x": {
+                "type": "number"
+              },
+              "y": {
+                "type": "number"
+              }
+            }
+          },
+          "data": {
+            "type": "object",
+            "required": [
+              "label",
+              "description",
+              "kind"
+            ],
+            "properties": {
+              "label": {
+                "type": "string",
+                "maxLength": 500
+              },
+              "description": {
+                "type": "string",
+                "maxLength": 20000
+              },
+              "kind": {
+                "enum": [
+                  "worker",
+                  "gate",
+                  "branch",
+                  "note",
+                  "workflow",
+                  "group",
+                  "frame"
+                ],
+                "description": "일반 노드: worker(워커), gate(사용자 개입 게이트), branch(분기: 판정 결과에 따라 출력 하나 또는 여럿으로만 진행), note(실행과 무관한 메모), workflow(다른 워크플로 링크). 그룹 노드: group. 분기가 아닌 연결은 모두 병렬이고, 여러 연결이 들어오면 건너뛰지 않은 선행 단계가 모두 끝나야 진행한다. 읽을 때 v1의 task 는 worker 로 바뀐다. frame(메모 그룹)은 노드를 묶어 보여 주기만 하는 상자로, 실행·작업 위치와 무관하고 그룹 안에 넣을 수 없으며 연결도 갖지 않는다."
+              },
+              "taskId": {
+                "anyOf": [
+                  {
+                    "const": ""
+                  },
+                  {
+                    "$ref": "#/$defs/id"
+                  }
+                ]
+              },
+              "scope": {
+                "enum": [
+                  "project",
+                  "worktree"
+                ],
+                "description": "그룹 노드의 대상: Orca에 열린 프로젝트 또는 워크트리"
+              },
+              "path": {
+                "type": "string",
+                "maxLength": 1024,
+                "pattern": "^(/.*)?$",
+                "description": "그룹 노드의 절대 경로. 안의 단계 워커가 여기서 작업한다. 비어 있으면 미지정."
+              },
+              "ref": {
+                "type": "string",
+                "maxLength": 512,
+                "description": "Orca repo ID 또는 worktree ID(참고용)"
+              },
+              "workflowId": {
+                "anyOf": [
+                  {
+                    "const": ""
+                  },
+                  {
+                    "$ref": "#/$defs/id"
+                  }
+                ],
+                "description": "workflow 링크 노드가 가리키는 저장된 워크플로 ID"
+              },
+              "worktreeMode": {
+                "enum": [
+                  "existing",
+                  "create"
+                ],
+                "description": "scope worktree 전용. existing = path 의 기존 워크트리(없으면 worktreeName·branch 로 다시 만든다), create = 실행 때 만든다. 같은 이름·브랜치가 있으면 재사용한다."
+              },
+              "repoPath": {
+                "type": "string",
+                "maxLength": 1024,
+                "pattern": "^(/.*)?$",
+                "description": "워크트리를 만들 프로젝트. 비우면 상위 그룹, 그것도 없으면 실행 때 고른 프로젝트."
+              },
+              "worktreeName": {
+                "type": "string",
+                "pattern": "^(?!-)[A-Za-z0-9._-]{0,80}$",
+                "description": "create+fixed: 새 워크트리 이름. existing: 고를 때 기록한 이름(다시 만들 때 사용)."
+              },
+              "baseBranch": {
+                "type": "string",
+                "pattern": "^(?!-)[A-Za-z0-9._/-]{0,200}$",
+                "description": "worktreeMode create: 기준 브랜치. 비우면 프로젝트 기본값. '..' 금지."
+              },
+              "branch": {
+                "type": "string",
+                "pattern": "^(?!-)[A-Za-z0-9._/-]{0,200}$",
+                "description": "existing: 고를 때 기록한 브랜치"
+              },
+              "nameSource": {
+                "enum": [
+                  "fixed",
+                  "agent",
+                  "input"
+                ],
+                "description": "create: 이름을 정하는 방법 — 직접 지정, 이전 단계 에이전트(nameFrom), 실행 시 입력"
+              },
+              "nameFrom": {
+                "$ref": "#/$defs/id",
+                "description": "nameSource agent: 이름을 정하거나 워크트리를 직접 만드는 단계(그룹 밖)"
+              },
+              "inputPrompt": {
+                "type": "string",
+                "maxLength": 500,
+                "description": "nameSource input: 사용자에게 보여줄 안내"
+              },
+              "perExecution": {
+                "type": "boolean",
+                "description": "create: 실행마다 따로 만든다(이름-#n). 아니면 병렬·반복 실행이 재사용한다."
+              },
+              "mode": {
+                "enum": [
+                  "exclusive",
+                  "inclusive"
+                ],
+                "description": "kind branch: exclusive 는 출력 하나, inclusive 는 조건에 맞는 출력 모두(하나 이상)."
+              },
+              "judge": {
+                "enum": [
+                  "previous",
+                  "worker",
+                  "user"
+                ],
+                "description": "kind branch 의 판정 주체: previous(직전 워커가 worker_done 첫 줄 decision: 으로 보고), worker(판정 전용 워커), user(결정 게이트에서 사용자가 선택)."
+              },
+              "outputs": {
+                "type": "array",
+                "maxItems": 8,
+                "description": "kind branch 의 출력. 각 출력은 연결의 sourceHandle 이 되며, 실행에는 두 개 이상이 필요하다.",
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "id",
+                    "label"
+                  ],
+                  "properties": {
+                    "id": {
+                      "$ref": "#/$defs/id"
+                    },
+                    "label": {
+                      "type": "string",
+                      "maxLength": 200,
+                      "description": "이 출력을 고르는 조건"
+                    }
+                  }
+                }
+              },
+              "workerModel": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._:\\[\\]-]{0,99}$",
+                "description": "워커를 띄우는 노드(worker, judge worker 인 branch)의 모델 ID. 없으면 기본값 claude-opus-5-5."
+              },
+              "effort": {
+                "enum": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "max"
+                ],
+                "description": "워커를 띄우는 노드의 추론 수준. 없으면 모델 기본값(--effort 생략)."
+              }
+            }
+          },
+          "parentId": {
+            "$ref": "#/$defs/id",
+            "description": "들어 있는 그룹 노드 ID. 프로젝트 그룹은 중첩하지 않고, 워크트리 그룹은 프로젝트·워크트리 그룹 안에 넣을 수 있다(워크트리 안의 워크트리는 하위 워크트리). 최대 4단계."
+          },
+          "width": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "description": "그룹·메모 그룹 노드 너비"
+          },
+          "height": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "description": "그룹·메모 그룹 노드 높이"
+          }
+        }
+      }
+    },
+    "executions": {
+      "type": "array",
+      "maxItems": 100,
+      "description": "같은 Run 안에서 그래프를 여러 번 실행한 기록. bindings는 노드 ID → Task ID.",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "label",
+          "bindings"
+        ],
+        "properties": {
+          "id": {
+            "$ref": "#/$defs/id"
+          },
+          "label": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "bindings": {
+            "type": "object",
+            "propertyNames": {
+              "$ref": "#/$defs/id"
+            },
+            "additionalProperties": {
+              "$ref": "#/$defs/id"
+            }
+          },
+          "links": {
+            "type": "object",
+            "description": "워크플로 링크 노드 ID → (펼친 하위 단계 경로 → Task ID).",
+            "propertyNames": {
+              "$ref": "#/$defs/id"
+            },
+            "additionalProperties": {
+              "type": "object",
+              "maxProperties": 500,
+              "propertyNames": {
+                "type": "string",
+                "pattern": "^[a-zA-Z0-9_.-]{1,400}$"
+              },
+              "additionalProperties": {
+                "$ref": "#/$defs/id"
+              }
+            }
+          },
+          "automation": {
+            "type": "object",
+            "required": [
+              "id",
+              "name"
+            ],
+            "properties": {
+              "id": {
+                "$ref": "#/$defs/id"
+              },
+              "name": {
+                "type": "string",
+                "maxLength": 100
+              }
+            },
+            "description": "이 실행을 시작한 자동화"
+          },
+          "decisions": {
+            "type": "object",
+            "maxProperties": 500,
+            "description": "분기 경로(링크 아래는 <링크 nodeId>.<하위 경로>) → 고른 출력 ID. 코디네이터가 판정 API 로 기록한다.",
+            "propertyNames": {
+              "type": "string",
+              "pattern": "^[a-zA-Z0-9_.-]{1,400}$"
+            },
+            "additionalProperties": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 8,
+              "items": {
+                "$ref": "#/$defs/id"
+              }
+            }
+          },
+          "skipped": {
+            "type": "array",
+            "maxItems": 2000,
+            "description": "판정에 따라 건너뛴 단계 경로. 서버가 decisions 로 계산한다.",
+            "items": {
+              "type": "string",
+              "pattern": "^[a-zA-Z0-9_.-]{1,400}$"
             }
           }
         }
       }
     },
     "edges": {
-      "type": "array", "maxItems": 2000,
+      "type": "array",
+      "maxItems": 2000,
       "items": {
-        "type": "object", "required": ["id", "source", "target"],
+        "type": "object",
+        "required": [
+          "id",
+          "source",
+          "target"
+        ],
         "properties": {
-          "id": { "$ref": "#/$defs/id" }, "source": { "$ref": "#/$defs/id" }, "target": { "$ref": "#/$defs/id" },
-          "label": { "type": "string", "maxLength": 500 }
+          "id": {
+            "$ref": "#/$defs/id"
+          },
+          "source": {
+            "$ref": "#/$defs/id"
+          },
+          "target": {
+            "$ref": "#/$defs/id"
+          },
+          "label": {
+            "type": "string",
+            "maxLength": 500,
+            "description": "연결 설명. 참고 정보이며 진행 여부를 바꾸지 않는다. 분기 연결은 비우면 출력 조건을 보여준다."
+          },
+          "sourceHandle": {
+            "$ref": "#/$defs/id",
+            "description": "분기에서 나가는 연결만: 출발한 출력의 ID. 분기 연결에는 필수다."
+          }
+        }
+      },
+      "description": "연결. 노드 사이 연결은 순환할 수 없다."
+    },
+    "cleanup": {
+      "type": "object",
+      "required": [
+        "coordinator",
+        "worktrees",
+        "sessions"
+      ],
+      "properties": {
+        "coordinator": {
+          "type": "boolean"
+        },
+        "worktrees": {
+          "type": "boolean"
+        },
+        "sessions": {
+          "type": "boolean"
+        }
+      },
+      "description": "완료 시 정리: 코디네이터 종료, 이번 실행이 만든 워크트리 삭제, 워커 세션 정리"
+    },
+    "workspace": {
+      "type": "string",
+      "maxLength": 1024,
+      "description": "실행 창에서 기본으로 고를 프로젝트 경로"
+    },
+    "automations": {
+      "type": "array",
+      "maxItems": 20,
+      "description": "이 워크플로를 예약 실행하는 Orca 자동화와 고정된 실행 설정",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "trigger",
+          "project",
+          "count",
+          "cleanup"
+        ],
+        "properties": {
+          "id": {
+            "$ref": "#/$defs/id"
+          },
+          "orcaId": {
+            "type": "string",
+            "pattern": "^[a-zA-Z0-9-]{1,128}$"
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          },
+          "trigger": {
+            "type": "string",
+            "description": "hourly·daily·weekdays·weekly 또는 5필드 cron"
+          },
+          "time": {
+            "type": "string",
+            "pattern": "^([01]\\d|2[0-3]):[0-5]\\d$"
+          },
+          "day": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 6
+          },
+          "project": {
+            "type": "string",
+            "pattern": "^/"
+          },
+          "count": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 20
+          },
+          "cleanup": {
+            "type": "object",
+            "required": [
+              "coordinator",
+              "worktrees",
+              "sessions"
+            ],
+            "properties": {
+              "coordinator": {
+                "type": "boolean"
+              },
+              "worktrees": {
+                "type": "boolean"
+              },
+              "sessions": {
+                "type": "boolean"
+              }
+            },
+            "description": "완료 시 정리: 코디네이터 종료, 이번 실행이 만든 워크트리 삭제, 워커 세션 정리"
+          },
+          "inputs": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          }
         }
       }
     }
   },
-  "$defs": { "id": { "type": "string", "pattern": "^[a-zA-Z0-9_-]{1,128}$" } }
+  "$defs": {
+    "id": {
+      "type": "string",
+      "pattern": "^[a-zA-Z0-9_-]{1,128}$"
+    }
+  }
 }

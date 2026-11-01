@@ -1,12 +1,19 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import type { AddressInfo } from 'node:net';
 import { get } from 'node:http';
 import { createApp } from './app.ts';
 import { createOrcaBridge } from './orca.ts';
 import { newWorkflow } from '../src/model.ts';
+
+/** Orca answers for the run dialog's project check. */
+function places(args: string[]) {
+  if (args[0] === 'repo') return { repos: [{ id: 'repo-a', path: '/example/repo', displayName: 'repo' }] };
+  if (args[0] === 'worktree') return { worktrees: [] };
+  return undefined;
+}
 
 test('local API saves graphs, rejects cross-origin requests, and exposes no worker mutation route', async () => {
   await mkdir('.local', { recursive: true });
@@ -36,4 +43,405 @@ test('local API saves graphs, rejects cross-origin requests, and exposes no work
     await new Promise<void>((resolve, reject) => { server.close((error) => error ? reject(error) : resolve()); server.closeAllConnections(); });
     await rm(directory, { recursive: true, force: true });
   }
+});
+test('execute launches one coordinator with a brief, refuses duplicates, and delete removes the file', async () => {
+  await mkdir('.local', { recursive: true });
+  const directory = await mkdtemp(join(resolve('.local'), 'api-exec-test-'));
+  const calls: string[][] = [];
+  const bridge = createOrcaBridge(async (args) => {
+    calls.push(args);
+    const place = places(args); if (place) return place;
+    if (args[0] === 'agent') return { outcome: { kind: 'terminal' }, terminal: { handle: 'term_coord' } };
+    if (args[1] === 'run-show') return { run: { id: 'run-a', objective: 'A' } };
+    if (args[1] === 'task-list') return { tasks: [{ id: 'task-a', status: 'running', deps: [] }] };
+    if (args[1] === 'worker-list') return { workers: [], page: { hasMore: false } };
+    return {};
+  });
+  const server = createApp(directory, bridge, { root: '/example/canvas' }).listen(0, '127.0.0.1');
+  await new Promise<void>((resolve) => server.once('listening', resolve));
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const json = { 'Content-Type': 'application/json' };
+  try {
+    const graph = { ...newWorkflow(), workspace: '/example/repo' };
+    assert.equal((await fetch(`${base}/api/workflows/${graph.id}`, { method: 'PUT', headers: json, body: JSON.stringify(graph) })).status, 200);
+    assert.equal((await fetch(`${base}/api/workflows/${graph.id}/execute`, { method: 'POST', headers: json, body: JSON.stringify({ count: 0 }) })).status, 400);
+    assert.equal((await fetch(`${base}/api/workflows/${graph.id}/execute`, { method: 'POST', headers: json, body: JSON.stringify({ count: 3, project: '/somewhere/else' }) })).status, 400);
+    const launched = await fetch(`${base}/api/workflows/${graph.id}/execute`, { method: 'POST', headers: json, body: JSON.stringify({ count: 3, project: '/example/repo' }) });
+    assert.equal(launched.status, 200);
+    const launch = calls.find((args) => args[0] === 'agent')!;
+    assert.deepEqual(launch.slice(0, 9), ['agent', 'launch', '--agent', 'claude', '--model', 'claude-opus-5-5', '--surface', 'terminal', '--worktree']);
+    assert.equal(launch[9], 'path:/example/repo'); // the coordinator starts in the project picked for the run
+    const briefPath = launch[11].split(' ')[0];
+    const brief = await readFile(briefPath, 'utf8');
+    assert.match(brief, /3회 병렬 실행/);
+    assert.match(brief, /"location": "\/example\/repo"/);
+    assert.ok(calls.some((args) => args[0] === 'terminal' && args[1] === 'rename'));
+    // Double click within the cooldown never starts a second coordinator.
+    assert.equal((await fetch(`${base}/api/workflows/${graph.id}/execute`, { method: 'POST', headers: json, body: JSON.stringify({ count: 1, project: '/example/repo' }) })).status, 409);
+    assert.equal(calls.filter((args) => args[0] === 'agent').length, 1);
+    // Coordinator registers executions; an unknown node is rejected.
+    const bad = await fetch(`${base}/api/workflows/${graph.id}/executions`, { method: 'PUT', headers: json,
+      body: JSON.stringify({ runId: 'run-a', executions: [{ id: 'exec-1', label: '#1', bindings: { missing: 'task-a' } }] }) });
+    assert.equal(bad.status, 400);
+    const ok = await fetch(`${base}/api/workflows/${graph.id}/executions`, { method: 'PUT', headers: json,
+      body: JSON.stringify({ runId: 'run-a', executions: [{ id: 'exec-1', label: '#1', bindings: { [graph.nodes[0].id]: 'task-a' } }] }) });
+    assert.equal(ok.status, 200);
+    const stored = await (await fetch(`${base}/api/workflows/${graph.id}`)).json();
+    assert.equal(stored.runId, 'run-a');
+    assert.equal(stored.nodes.length, graph.nodes.length);
+    assert.equal(stored.workspace, '/example/repo');
+    assert.equal((await fetch(`${base}/api/workflows/${graph.id}`, { method: 'DELETE' })).status, 200);
+    assert.equal((await fetch(`${base}/api/workflows/${graph.id}`)).status, 404);
+  } finally {
+    await new Promise<void>((resolve, reject) => { server.close((error) => error ? reject(error) : resolve()); server.closeAllConnections(); });
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+test('execute refuses while an earlier execution is still open', async () => {
+  await mkdir('.local', { recursive: true });
+  const directory = await mkdtemp(join(resolve('.local'), 'api-open-test-'));
+  const calls: string[][] = [];
+  const bridge = createOrcaBridge(async (args) => {
+    calls.push(args);
+    const place = places(args); if (place) return place;
+    if (args[1] === 'run-show') return { run: { id: 'run-a', objective: 'A' } };
+    if (args[1] === 'task-list') return { tasks: [{ id: 'task-a', status: 'dispatched', deps: [] }] };
+    if (args[1] === 'worker-list') return { workers: [{ dispatchId: 'd', taskId: 'task-a', projection: { liveness: { verdict: 'live' } } }], page: { hasMore: false } };
+    return {};
+  });
+  const server = createApp(directory, bridge, { root: '/example/canvas' }).listen(0, '127.0.0.1');
+  await new Promise<void>((resolve) => server.once('listening', resolve));
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  try {
+    const graph = newWorkflow();
+    graph.runId = 'run-a';
+    graph.executions = [{ id: 'exec-1', label: '#1', bindings: { [graph.nodes[0].id]: 'task-a' } }];
+    await fetch(`${base}/api/workflows/${graph.id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(graph) });
+    const response = await fetch(`${base}/api/workflows/${graph.id}/execute`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ count: 1, project: '/example/repo' }) });
+    assert.equal(response.status, 409);
+    assert.equal(calls.filter((args) => args[0] === 'agent').length, 0);
+  } finally {
+    await new Promise<void>((resolve, reject) => { server.close((error) => error ? reject(error) : resolve()); server.closeAllConnections(); });
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+test('execute refuses a workflow link that is unset, missing, or cyclic', async () => {
+  await mkdir('.local', { recursive: true });
+  const directory = await mkdtemp(join(resolve('.local'), 'api-link-test-'));
+  const calls: string[][] = [];
+  const bridge = createOrcaBridge(async (args) => { calls.push(args); return places(args) ?? { terminal: { handle: 'term_coord' } }; });
+  const server = createApp(directory, bridge, { root: '/example/canvas' }).listen(0, '127.0.0.1');
+  await new Promise<void>((resolve) => server.once('listening', resolve));
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const json = { 'Content-Type': 'application/json' };
+  const put = (graph: unknown) => fetch(`${base}/api/workflows/${(graph as { id: string }).id}`, { method: 'PUT', headers: json, body: JSON.stringify(graph) });
+  const run = (id: string) => fetch(`${base}/api/workflows/${id}/execute`, { method: 'POST', headers: json, body: JSON.stringify({ count: 1, project: '/example/repo' }) });
+  const link = (id: string, workflowId?: string) => ({ ...newWorkflow(), id, nodes: [{ id: 'link', type: 'stage', position: { x: 0, y: 0 },
+    data: { label: '링크', description: '', kind: 'workflow', ...(workflowId ? { workflowId } : {}) } }], edges: [] });
+  try {
+    await put(link('wf-unset'));
+    assert.equal((await run('wf-unset')).status, 400);
+    await put(link('wf-missing', 'nowhere'));
+    assert.equal((await run('wf-missing')).status, 400);
+    await put(link('wf-a', 'wf-b')); await put(link('wf-b', 'wf-a'));
+    assert.match((await (await run('wf-a')).json()).error, /순환/);
+    assert.equal(calls.filter((args) => args[0] === 'agent').length, 0);
+    const child = { ...newWorkflow(), id: 'wf-child', name: '하위' };
+    await put(child); await put(link('wf-parent', 'wf-child'));
+    assert.equal((await run('wf-parent')).status, 200);
+    const launch = calls.find((args) => args[0] === 'agent')!;
+    const brief = await readFile(launch[11].split(' ')[0], 'utf8');
+    assert.match(brief, /"nodeId": "link\.design"/);
+  } finally {
+    await new Promise<void>((resolve, reject) => { server.close((error) => error ? reject(error) : resolve()); server.closeAllConnections(); });
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+test('brief asks for one new worktree per execution, including inside links', async () => {
+  const { buildBrief, checkGroups } = await import('./execute.ts');
+  const child = { ...newWorkflow(), id: 'wf-child', name: '하위', nodes: [
+    { id: 'g', type: 'group' as const, position: { x: 0, y: 0 }, data: { label: '새 WT', description: '', kind: 'group' as const, scope: 'worktree' as const, path: '', worktreeMode: 'create' as const, repoPath: '/example/repo', worktreeName: 'feat' } },
+    { id: 'inner', type: 'stage' as const, parentId: 'g', position: { x: 10, y: 10 }, data: { label: '안', description: '', kind: 'worker' as const } },
+    { id: 'outer', type: 'stage' as const, position: { x: 0, y: 400 }, data: { label: '밖', description: '', kind: 'worker' as const } },
+  ], edges: [] };
+  const parent = { ...newWorkflow(), id: 'wf-parent', workspace: '/example/default', nodes: [
+    { id: 'link', type: 'stage' as const, position: { x: 0, y: 0 }, data: { label: '링크', description: '', kind: 'workflow' as const, workflowId: 'wf-child' } },
+  ], edges: [] };
+  const brief = buildBrief({ graph: parent, linked: new Map([['wf-child', child]]), count: 2, apiBase: 'http://127.0.0.1:1', workspace: '/example/canvas', artifactDir: '/tmp/x' });
+  assert.match(brief, /## 워크트리/);
+  assert.match(brief, /"location": "new-worktree:link\.g"/);
+  assert.match(brief, /orca worktree create --repo path:<repo>/);
+  // Ungrouped stages run in the project picked for the run (the workflow's own workspace is only the dialog default).
+  assert.match(brief, /"nodeId": "link\.outer",[\s\S]*?"location": "\/example\/canvas"/);
+  // A create-mode group with no project of its own branches from the run project.
+  const noRepo = { ...child, nodes: child.nodes.map((node) => node.id === 'g' ? { ...node, data: { ...node.data, repoPath: '' } } : node) };
+  assert.doesNotThrow(() => checkGroups([noRepo]));
+  assert.match(buildBrief({ graph: noRepo, count: 1, apiBase: 'http://127.0.0.1:1', workspace: '/run/project', artifactDir: '/tmp/x' }), /"repo": "\/run\/project"/);
+  assert.doesNotThrow(() => checkGroups([child]));
+  // A create-mode worktree group inside a project group branches from that project.
+  const nested = { ...child, nodes: [{ id: 'p', type: 'group' as const, position: { x: 0, y: 0 }, data: { label: 'P', description: '', kind: 'group' as const, scope: 'project' as const, path: '/example/project' } },
+    ...child.nodes.map((node) => node.id === 'g' ? { ...node, parentId: 'p', data: { ...node.data, repoPath: '' } } : node)] };
+  assert.doesNotThrow(() => checkGroups([nested]));
+  assert.match(buildBrief({ graph: nested, count: 1, apiBase: 'http://127.0.0.1:1', workspace: '/c', artifactDir: '/tmp/x' }), /"repo": "\/example\/project"/);
+});
+test('brief covers naming sources, child worktrees, clean-up and automation', async () => {
+  const { buildBrief, checkGroups } = await import('./execute.ts');
+  const group = (id: string, data: object, parentId?: string) => ({ id, type: 'group' as const, position: { x: 0, y: 0 }, ...(parentId ? { parentId } : {}),
+    data: { label: id, description: '', kind: 'group' as const, scope: 'worktree' as const, path: '', ...data } });
+  const stage = (id: string, parentId?: string) => ({ id, type: 'stage' as const, position: { x: 0, y: 0 }, ...(parentId ? { parentId } : {}), data: { label: id, description: '', kind: 'worker' as const } });
+  const graph = { ...newWorkflow(), nodes: [
+    group('outer', { worktreeMode: 'create', nameSource: 'agent', nameFrom: 'plan' }),
+    group('inner', { worktreeMode: 'create', nameSource: 'input', inputPrompt: '이슈 키' }, 'outer'),
+    group('picked', { path: '/example/wt', worktreeName: 'feature-a', branch: 'feature/a', repoPath: '/example/repo' }),
+    stage('plan'), stage('build', 'inner'), stage('fix', 'picked'),
+  ], edges: [] };
+  assert.doesNotThrow(() => checkGroups([graph]));
+  const brief = buildBrief({ graph, count: 2, apiBase: 'http://127.0.0.1:1', workspace: '/example/repo', artifactDir: '/tmp/x',
+    inputs: { inner: 'PROJ-1' }, cleanup: { coordinator: true, worktrees: true, sessions: false }, automation: { id: 'auto-1', name: '야간' } });
+  const specs = JSON.parse(brief.match(/## 워크트리[\s\S]*?```json\n([\s\S]*?)\n```/)![1]);
+  assert.deepEqual(specs.map((spec: { location: string }) => spec.location), ['new-worktree:outer', '/example/wt', 'new-worktree:inner']);
+  assert.equal(specs[2].parent, 'new-worktree:outer'); // child worktree of the outer one
+  assert.deepEqual(specs[2].name, { source: 'input', value: 'PROJ-1', prompt: '이슈 키' });
+  assert.deepEqual(specs[0].name, { source: 'agent', fromStage: 'plan' });
+  assert.deepEqual(specs[1].existing, { path: '/example/wt', name: 'feature-a', branch: 'feature/a' });
+  assert.match(brief, /"nodeId": "plan",[\s\S]*?"namesWorktree": \[\s*"new-worktree:outer"/);
+  assert.match(brief, /--parent-worktree path:/);
+  assert.match(brief, /재사용/);
+  assert.match(brief, /worker-retain/);
+  assert.match(brief, /orca worktree rm/);
+  assert.match(brief, /orca terminal close/);
+  assert.match(brief, /자동화 「야간」/);
+  assert.match(brief, /"automation":\{"id":"auto-1","name":"야간"\}/);
+  // The naming stage must sit outside the worktree it names.
+  const inside = { ...graph, nodes: graph.nodes.map((node) => node.id === 'plan' ? { ...node, parentId: 'outer' } : node) };
+  assert.throws(() => checkGroups([inside]), /그룹 밖/);
+});
+test('automations: create in Orca with a brief-fetching prompt, fire, and remove', async () => {
+  await mkdir('.local', { recursive: true });
+  const directory = await mkdtemp(join(resolve('.local'), 'api-auto-test-'));
+  const calls: string[][] = [];
+  let listed: object[] = [];
+  const bridge = createOrcaBridge(async (args) => {
+    calls.push(args);
+    const place = places(args); if (place) return place;
+    if (args[0] === 'automations' && args[1] === 'create') { listed = [{ id: 'orca-auto-1', name: 'x', enabled: true, nextRunAt: 1 }]; return { automation: { id: 'orca-auto-1' } }; }
+    if (args[0] === 'automations' && args[1] === 'list') return { automations: listed };
+    return {};
+  });
+  const server = createApp(directory, bridge).listen(0, '127.0.0.1');
+  await new Promise<void>((resolve) => server.once('listening', resolve));
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const json = { 'Content-Type': 'application/json' };
+  try {
+    const graph = newWorkflow();
+    await fetch(`${base}/api/workflows/${graph.id}`, { method: 'PUT', headers: json, body: JSON.stringify(graph) });
+    const body = { name: '야간', trigger: 'daily', time: '02:00', project: '/example/repo', count: 2, cleanup: { coordinator: true, worktrees: false, sessions: true } };
+    assert.equal((await fetch(`${base}/api/workflows/${graph.id}/automations`, { method: 'POST', headers: json, body: JSON.stringify({ ...body, trigger: 'rm -rf' }) })).status, 400);
+    assert.equal(calls.filter((args) => args[1] === 'create').length, 0); // nothing reaches Orca when the settings are invalid
+    const created = await (await fetch(`${base}/api/workflows/${graph.id}/automations`, { method: 'POST', headers: json, body: JSON.stringify(body) })).json();
+    const config = created.automations[0];
+    assert.equal(config.orcaId, 'orca-auto-1');
+    const create = calls.find((args) => args[1] === 'create')!;
+    assert.ok(create.includes('--repo') && create.includes('path:/example/repo') && create.includes('--time') && create.includes('02:00'));
+    assert.match(create[create.indexOf('--prompt') + 1], new RegExp(`/api/workflows/${graph.id}/automations/${config.id}/brief`));
+    const listing = await (await fetch(`${base}/api/workflows/${graph.id}/automations`)).json();
+    assert.equal(listing.automations[0].state.enabled, true);
+    // When Orca fires it, the agent fetches a brief that records the automation.
+    const fired = await (await fetch(`${base}/api/workflows/${graph.id}/automations/${config.id}/brief`, { method: 'POST' })).json();
+    assert.match(await readFile(fired.briefPath, 'utf8'), /자동화 「야간」/);
+    assert.equal((await fetch(`${base}/api/workflows/${graph.id}/automations/${config.id}/run`, { method: 'POST' })).status, 200);
+    assert.ok(calls.some((args) => args[1] === 'run' && args[2] === 'orca-auto-1'));
+    const removed = await (await fetch(`${base}/api/workflows/${graph.id}/automations/${config.id}`, { method: 'DELETE' })).json();
+    assert.equal(removed.automations, undefined);
+    assert.ok(calls.some((args) => args[1] === 'remove' && args[2] === 'orca-auto-1'));
+  } finally {
+    await new Promise<void>((resolve, reject) => { server.close((error) => error ? reject(error) : resolve()); server.closeAllConnections(); });
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+test('execution log records the launch, registration, observed Task changes and coordinator events', async () => {
+  await mkdir('.local', { recursive: true });
+  const directory = await mkdtemp(join(resolve('.local'), 'api-log-test-'));
+  let status = 'ready';
+  const bridge = createOrcaBridge(async (args) => {
+    const place = places(args); if (place) return place;
+    if (args[0] === 'agent') return { terminal: { handle: 'term_coord' } };
+    if (args[1] === 'run-show') return { run: { id: 'run-a', objective: 'A' } };
+    if (args[1] === 'task-list') return { tasks: [{ id: 'task-a', display_name: '구현 #1', status, deps: [] }] };
+    if (args[1] === 'worker-list') return { workers: [], page: { hasMore: false } };
+    return {};
+  });
+  const server = createApp(directory, bridge).listen(0, '127.0.0.1');
+  await new Promise<void>((resolve) => server.once('listening', resolve));
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const json = { 'Content-Type': 'application/json' };
+  try {
+    const graph = newWorkflow();
+    await fetch(`${base}/api/workflows/${graph.id}`, { method: 'PUT', headers: json, body: JSON.stringify(graph) });
+    assert.deepEqual(await (await fetch(`${base}/api/workflows/${graph.id}/logs`)).json(), []);
+    assert.equal((await fetch(`${base}/api/workflows/${graph.id}/execute`, { method: 'POST', headers: json, body: JSON.stringify({ count: 2, project: '/example/repo' }) })).status, 200);
+    const [entry] = await (await fetch(`${base}/api/workflows/${graph.id}/logs`)).json();
+    assert.equal(entry.count, 2);
+    assert.equal(entry.project, '/example/repo');
+    assert.deepEqual(entry.files, ['brief.md']);
+    const brief = await (await fetch(`${base}/api/workflows/${graph.id}/logs/${entry.id}/files/brief.md`)).json();
+    assert.match(brief.text, new RegExp(`/api/workflows/${graph.id}/logs/${entry.id}/events`));
+    assert.equal((await fetch(`${base}/api/workflows/${graph.id}/logs/${entry.id}/files/meta.json`)).status, 400);
+    assert.equal((await fetch(`${base}/api/workflows/${graph.id}/logs/${entry.id}/files/..%2Fx`)).status, 400);
+    assert.equal((await fetch(`${base}/api/workflows/${graph.id}/logs/2020-01-01T00-00-00-000Z-other`)).status, 400);
+
+    await fetch(`${base}/api/workflows/${graph.id}/executions`, { method: 'PUT', headers: json,
+      body: JSON.stringify({ runId: 'run-a', executions: [{ id: 'exec-1', label: '#1', bindings: { [graph.nodes[0].id]: 'task-a' } }] }) });
+    await fetch(`${base}/api/runs/run-a`);
+    await fetch(`${base}/api/runs/run-a`); // unchanged: no second event
+    status = 'running';
+    await fetch(`${base}/api/runs/run-a`);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal((await fetch(`${base}/api/workflows/${graph.id}/logs/${entry.id}/events`, { method: 'POST', headers: json, body: JSON.stringify({ type: 'task', message: 'x' }) })).status, 400);
+    assert.equal((await fetch(`${base}/api/workflows/${graph.id}/logs/${entry.id}/events`, { method: 'POST', headers: json,
+      body: JSON.stringify({ type: 'worker', taskId: 'task-a', message: '구현 #1: 통과 → 다음 단계 진행' }) })).status, 200);
+
+    const detail = await (await fetch(`${base}/api/workflows/${graph.id}/logs/${entry.id}`)).json();
+    assert.equal(detail.meta.runId, 'run-a');
+    assert.deepEqual(detail.events.map((event: { type: string }) => event.type), ['requested', 'brief', 'coordinator', 'registered', 'task', 'task', 'worker']);
+    const tasks = detail.events.filter((event: { type: string }) => event.type === 'task');
+    assert.deepEqual(tasks.map((event: { status: string; from?: string }) => [event.from, event.status]), [[undefined, 'pending'], ['pending', 'running']]);
+    assert.equal(tasks[0].message, '구현 #1');
+  } finally {
+    await new Promise<void>((resolve, reject) => { server.close((error) => error ? reject(error) : resolve()); server.closeAllConnections(); });
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+test('execution log keeps finished executions: results, completion events, legacy adoption and background watch', async () => {
+  await mkdir('.local', { recursive: true });
+  const directory = await mkdtemp(join(resolve('.local'), 'api-log-done-test-'));
+  let status = 'running';
+  const bridge = createOrcaBridge(async (args) => {
+    const place = places(args); if (place) return place;
+    if (args[1] === 'run-show') return { run: { id: 'run-old', objective: 'A' } };
+    if (args[1] === 'task-list') return { tasks: [{ id: 'task-a', display_name: '구현 #1', status, deps: [] }, { id: 'task-b', display_name: '검토 #1', status: 'ready', deps: ['task-a'] }] };
+    if (args[1] === 'worker-list') return { workers: [], page: { hasMore: false } };
+    return {};
+  });
+  const graph = newWorkflow();
+  // A launch from before execution logs: only a brief and a report, and the workflow still points at its Run.
+  const legacy = `2026-10-31T17-48-45-819Z-${graph.id}`;
+  await mkdir(join(directory, '.executions', legacy), { recursive: true });
+  await writeFile(join(directory, '.executions', legacy, 'report.md'), '# 보고');
+  const app = createApp(directory, bridge, { watchMs: 20 });
+  const server = app.listen(0, '127.0.0.1');
+  await new Promise<void>((resolve) => server.once('listening', resolve));
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const json = { 'Content-Type': 'application/json' };
+  try {
+    await fetch(`${base}/api/workflows/${graph.id}`, { method: 'PUT', headers: json,
+      body: JSON.stringify({ ...graph, runId: 'run-old', executions: [{ id: 'exec-1', label: '#1', bindings: { [graph.nodes[0].id]: 'task-a', [graph.nodes[1].id]: 'task-b' }, skipped: [graph.nodes[1].id] }] }) });
+    const [entry] = await (await fetch(`${base}/api/workflows/${graph.id}/logs`)).json();
+    assert.equal(entry.id, legacy);
+    assert.equal(entry.runId, 'run-old');
+    assert.equal(entry.adopted, true);
+    let detail = await (await fetch(`${base}/api/workflows/${graph.id}/logs/${legacy}`)).json();
+    assert.deepEqual(detail.results.map((item: { label: string; status: string; finished: boolean }) => [item.label, item.status, item.finished]), [['#1', 'running', false]]);
+    assert.equal(detail.outcome, 'running');
+    // The Task completes while no canvas polls: the background watcher logs it; the untaken branch was skipped.
+    status = 'completed';
+    for (let i = 0; i < 50 && detail.outcome !== 'completed'; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      detail = (await (await fetch(`${base}/api/workflows/${graph.id}/logs`)).json())[0];
+    }
+    assert.equal(detail.outcome, 'completed');
+    detail = await (await fetch(`${base}/api/workflows/${graph.id}/logs/${legacy}`)).json();
+    assert.deepEqual(detail.results[0].stages.map((stage: { title: string; status: string }) => [stage.title, stage.status]), [['구현 #1', 'completed'], ['검토 #1', 'skipped']]);
+    assert.equal(detail.results[0].stages[1].skipped, true);
+    assert.equal(detail.results[0].finished, true);
+    const types = detail.events.map((event: { type: string }) => event.type);
+    assert.equal(types.filter((type: string) => type === 'execution').length, 1);
+    assert.equal(types.filter((type: string) => type === 'finished').length, 1);
+    assert.equal(types[0], 'adopted');
+    assert.match(detail.events.find((event: { type: string }) => event.type === 'execution').message, /#1 완료 — 구현 #1 완료, 검토 #1 진행 안 함/);
+  } finally {
+    await new Promise<void>((resolve, reject) => { server.close((error) => error ? reject(error) : resolve()); server.closeAllConnections(); });
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+test('branches: brief carries order and judges, bad branches are refused, decisions skip and close the untaken side', async () => {
+  await mkdir('.local', { recursive: true });
+  const directory = await mkdtemp(join(resolve('.local'), 'api-branch-test-'));
+  const calls: string[][] = [];
+  const bridge = createOrcaBridge(async (args) => { calls.push(args); return places(args) ?? { terminal: { handle: 'term_coord' } }; });
+  const server = createApp(directory, bridge, { root: '/example/canvas' }).listen(0, '127.0.0.1');
+  await new Promise<void>((resolve) => server.once('listening', resolve));
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const json = { 'Content-Type': 'application/json' };
+  const put = (graph: unknown) => fetch(`${base}/api/workflows/${(graph as { id: string }).id}`, { method: 'PUT', headers: json, body: JSON.stringify(graph) });
+  const run = (id: string) => fetch(`${base}/api/workflows/${id}/execute`, { method: 'POST', headers: json, body: JSON.stringify({ count: 1, project: '/example/repo' }) });
+  const stage = (id: string, kind = 'worker', extra = {}) => ({ id, type: 'stage', position: { x: 0, y: 0 }, data: { label: id, description: `${id} 지침`, kind, ...extra } });
+  const outputs = [{ id: 'pass', label: '통과' }, { id: 'fail', label: '실패' }];
+  const graph = { ...newWorkflow(), id: 'wf-branch', name: '분기', nodes: [stage('build'), stage('lint'), stage('test'),
+    stage('check', 'branch', { mode: 'exclusive', judge: 'previous', outputs }), stage('verify'),
+    stage('ship'), stage('fix'), stage('report', 'worker', { join: 'any' })],
+    edges: [['build', 'lint'], ['build', 'test'], ['lint', 'verify'], ['test', 'verify'], ['verify', 'check'], ['check', 'ship', 'pass'], ['check', 'fix', 'fail'], ['ship', 'report'], ['fix', 'report']]
+      .map(([source, target, handle]) => ({ id: `${source}-${target}`, source, target, ...(handle ? { sourceHandle: handle } : {}) })) };
+  try {
+    // A judge 'previous' branch needs exactly one worker in front of it.
+    const twoInFront = { ...graph, id: 'wf-two', edges: [...graph.edges, { id: 'lint-check', source: 'lint', target: 'check' }] };
+    assert.equal((await put(twoInFront)).status, 200);
+    assert.match((await (await run('wf-two')).json()).error, /워커 하나만/);
+    const oneOutput = { ...graph, id: 'wf-one', nodes: graph.nodes.map((node) => node.id === 'check' ? stage('check', 'branch', { outputs: [outputs[0]] }) : node),
+      edges: graph.edges.filter((edge) => edge.id !== 'check-fix') };
+    assert.equal((await put(oneOutput)).status, 200);
+    assert.match((await (await run('wf-one')).json()).error, /두 개 이상/);
+
+    assert.equal((await put(graph)).status, 200);
+    assert.equal((await run('wf-branch')).status, 200);
+    const launch = calls.find((args) => args[0] === 'agent')!;
+    const brief = await readFile(launch[11].split(' ')[0], 'utf8');
+    const stages = JSON.parse(brief.match(/```json\n(\[[\s\S]*?\])\n```/)![1]);
+    assert.deepEqual(stages.map((item: { nodeId: string }) => item.nodeId), ['build', 'lint', 'test', 'verify', 'check', 'ship', 'fix', 'report']);
+    assert.deepEqual(stages.map((item: { wave: number }) => item.wave), [0, 1, 1, 2, 3, 4, 4, 5]);
+    assert.deepEqual(stages.find((item: { nodeId: string }) => item.nodeId === 'verify').decides, [{ nodeId: 'check', mode: 'exclusive', outputs }]);
+    assert.deepEqual(stages.find((item: { nodeId: string }) => item.nodeId === 'ship').after, [{ nodeId: 'check', output: 'pass', condition: '통과' }]);
+    assert.match(brief, /executions\/<실행 id>\/decisions/);
+
+    const bindings = Object.fromEntries(graph.nodes.map((node) => [node.id, `task-${node.id}`]));
+    assert.equal((await fetch(`${base}/api/workflows/wf-branch/executions`, { method: 'PUT', headers: json,
+      body: JSON.stringify({ runId: 'run-a', executions: [{ id: 'exec-1', label: '#1', bindings }] }) })).status, 200);
+    const decide = (body: unknown) => fetch(`${base}/api/workflows/wf-branch/executions/exec-1/decisions`, { method: 'POST', headers: json, body: JSON.stringify(body) });
+    assert.equal((await decide({ node: 'verify', outputs: ['pass'] })).status, 400);
+    assert.equal((await decide({ node: 'check', outputs: ['pass', 'fail'] })).status, 400);
+    const decided = await decide({ node: 'check', outputs: ['pass'] });
+    assert.equal(decided.status, 200);
+    assert.deepEqual(await decided.json(), { decisions: { check: ['pass'] }, skipped: ['fix'], skippedTasks: ['task-fix'] });
+    assert.equal((await decide({ node: 'check', outputs: ['pass'] })).status, 200);
+    assert.equal((await decide({ node: 'check', outputs: ['fail'] })).status, 409);
+    // Re-registering the same Run keeps what was decided.
+    await fetch(`${base}/api/workflows/wf-branch/executions`, { method: 'PUT', headers: json,
+      body: JSON.stringify({ runId: 'run-a', executions: [{ id: 'exec-1', label: '#1', bindings }] }) });
+    const saved = await (await fetch(`${base}/api/workflows/wf-branch`)).json();
+    assert.deepEqual(saved.executions[0].skipped, ['fix']);
+    assert.deepEqual(saved.executions[0].decisions, { check: ['pass'] });
+    // The coordinator polls what was decided; the canvas reads the expanded graph to offer user decisions.
+    assert.deepEqual(await (await fetch(`${base}/api/workflows/wf-branch/executions/exec-1/decisions`)).json(),
+      { decisions: { check: ['pass'] }, skipped: ['fix'], skippedTasks: ['task-fix'] });
+    const flow = await (await fetch(`${base}/api/workflows/wf-branch/flow`)).json();
+    assert.deepEqual(flow.find((item: { id: string }) => item.id === 'check').outputLabels, { pass: '통과', fail: '실패' });
+  } finally {
+    await new Promise<void>((resolve, reject) => { server.close((error) => error ? reject(error) : resolve()); server.closeAllConnections(); });
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+test('brief gives each launching stage its model (default when unset) and effort; memo groups never become stages', async () => {
+  const { buildBrief } = await import('./execute.ts');
+  const stage = (id: string, kind = 'worker', extra = {}) => ({ id, type: 'stage' as const, position: { x: 0, y: 0 }, data: { label: id, description: id, kind, ...extra } });
+  const graph = { ...newWorkflow(), id: 'wf-launch', nodes: [
+    { id: 'frame', type: 'frame' as const, position: { x: 0, y: 0 }, width: 400, height: 200, data: { label: '묶음', description: '', kind: 'frame' } },
+    stage('plain'), stage('tuned', 'worker', { workerModel: 'claude-sonnet-5-5', effort: 'xhigh' }), stage('ask', 'gate', { workerModel: 'claude-haiku-5-5' }),
+    stage('judge', 'branch', { judge: 'worker', effort: 'low', outputs: [{ id: 'a', label: 'A' }, { id: 'b', label: 'B' }] })],
+    edges: [{ id: 'plain-tuned', source: 'plain', target: 'tuned' }, { id: 'tuned-ask', source: 'tuned', target: 'ask' }, { id: 'ask-judge', source: 'ask', target: 'judge' }] } as never;
+  const brief = buildBrief({ graph, count: 1, apiBase: 'http://127.0.0.1:1', workspace: '/example/repo', artifactDir: '/tmp/x' });
+  const stages = JSON.parse(brief.match(/```json\n(\[[\s\S]*?\])\n```/)![1]) as { nodeId: string; model?: string; effort?: string }[];
+  assert.deepEqual(stages.map((item) => [item.nodeId, item.model, item.effort]), [
+    ['plain', 'claude-opus-5-5', undefined], ['tuned', 'claude-sonnet-5-5', 'xhigh'], ['ask', undefined, undefined], ['judge', 'claude-opus-5-5', 'low']]);
+  assert.match(brief, /--model <그 단계의 model> \[--effort <그 단계의 effort>\]/);
+  assert.match(brief, /`location`·`model`·`effort` 가 모두 직전 단계와 같으면/);
 });
