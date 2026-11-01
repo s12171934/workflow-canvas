@@ -223,10 +223,15 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
     if (open) throw new RunError(409, `${inputs === '[]' ? '' : '같은 입력의 '}진행 중인 실행 ${open}개가 끝난 뒤 다시 실행하세요.`);
     launches.set(launchKey, Date.now());
     try {
-      const startedAt = new Date();
+      // Launch directories are named by the millisecond: a request in the same one as another takes the next free one.
+      let startedAt = new Date();
+      await mkdir(runlog.root, { recursive: true, mode: 0o700 });
+      for (;;) {
+        try { await mkdir(join(runlog.root, launchDirName(startedAt, id)), { mode: 0o700 }); break; }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; startedAt = new Date(startedAt.getTime() + 1); }
+      }
       const logId = launchDirName(startedAt, id);
       const artifactDir = join(runlog.root, logId);
-      await mkdir(artifactDir, { recursive: true, mode: 0o700 });
       await runlog.start(logId, { workflowId: id, workflowName: graph.name, startedAt: startedAt.toISOString(), count: settings.count,
         project: settings.project, ...(settings.automation ? { automation: settings.automation } : {}),
         ...(inputs !== '[]' ? { inputs: Object.fromEntries(Object.entries(settings.inputs).filter(([, value]) => value)) } : {}) });
