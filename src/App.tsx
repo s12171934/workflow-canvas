@@ -12,7 +12,7 @@ import {
 } from 'lucide-react';
 import {
   aggregateStatus, executionFinished, executionRun, executionStatuses as computeExecutionStatuses, mergeSnapshots, workflowRuns, openableStatuses, fromSnapshot, newWorkflow, projectNodes, serializableWorkflow, statusLabels,
-  asksAtRun, defaultWorkerModel, effortLevels, frameContents, isFrame, launchesWorker, workerModels, type Effort, type Rect, joinNames, pendingDecisions, gateAskerNames, type GateAsker, linkModeNames, maxSpawnItems, type LinkMode, variableKeyPattern, variableRefs, maxVariables, maxVariableValue, type WorkflowVariable, type FlowStage, type PendingDecision, branchJudgeNames, branchModeNames, isBranch, maxBranchOutputs, type BranchJudge, type BranchMode, type BranchOutput, defaultCleanup, triggerNames, worktreeNamePattern, type AutomationConfig, type AutomationState, type Cleanup, canNest, maxGroupDepth, nameSourceNames, safeWorktreeName, type NameSource, createsWorktree, groupOf, membershipOf, orderNodes, worktreeRepo, isExecutable, isGroup, kindNames, normalizeNodes, scopeNames,
+  asksAtRun, defaultWorkerModel, effortLevels, frameContents, isFrame, launchesWorker, workerModels, type Effort, type Rect, joinNames, pendingDecisions, gateAskerNames, type GateAsker, linkModeNames, maxSpawnItems, type LinkMode, variableKeyPattern, variableRefs, maxVariables, maxVariableValue, type WorkflowVariable, loopBody, maxLoopRounds, type WorkflowEdge, type FlowStage, type PendingDecision, branchJudgeNames, branchModeNames, isBranch, maxBranchOutputs, type BranchJudge, type BranchMode, type BranchOutput, defaultCleanup, triggerNames, worktreeNamePattern, type AutomationConfig, type AutomationState, type Cleanup, canNest, maxGroupDepth, nameSourceNames, safeWorktreeName, type NameSource, createsWorktree, groupOf, membershipOf, orderNodes, worktreeRepo, isExecutable, isGroup, kindNames, normalizeNodes, scopeNames,
   type Workflow, type Execution, type StageNode, type StageKind, type NodeKind, type GroupScope, type StageStatus, type RunSummary, type RunSnapshot, type Locations,
 } from './model';
 import { RunLogDialog } from './RunLog';
@@ -69,6 +69,7 @@ function StageCard({ data, selected }: NodeProps<StageNode>) {
       {data.join === 'any' && <span className="branch-meta join-meta" title="분기에서 갈라진 경로가 다시 모이는 곳">합류: 하나라도</span>}
       {data.kind === 'gate' && data.asker === 'previous' && <span className="branch-meta">{gateAskerNames.previous}이 물음</span>}
       {data.kind === 'branch' && <span className="branch-meta">{branchModeNames[data.mode ?? 'exclusive']} · {branchJudgeNames[data.judge ?? 'previous']}</span>}
+      {data.round && <span className="round-badge" title="되돌아가기로 다시 도는 회차">{data.round}회차</span>}
       <span className={`status-dot ${status}`} /></div>
     <h3>{data.label || '이름 없는 단계'}</h3>
     {launchesWorker({ data }) && (data.workerModel || data.effort) && <div className="launch-chip" title="이 단계 워커의 모델·추론 수준(effort)">
@@ -196,7 +197,7 @@ export function App() { return <ReactFlowProvider><Workspace /></ReactFlowProvid
 function Workspace() {
   const [workflow, setWorkflow] = useState<Workflow>(blankWorkflow);
   const [nodes, setNodes, onNodesChange] = useNodesState<StageNode>(workflow.nodes);
-  const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>(workflow.edges);
+  const [edges, setEdges, onEdgesChange] = useEdgesState<WorkflowEdge>(workflow.edges);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [selectedEdgeId, setSelectedEdgeId] = useState<string | null>(null);
   // 여러 노드 선택(드래그 박스·Shift/⌘ 클릭). Two or more ids; a single pick always goes to selectedId so the inspector shows it.
@@ -326,6 +327,13 @@ function Workspace() {
     const output = source && isBranch(source) ? source.data.outputs?.find((item) => item.id === edge.sourceHandle) : undefined;
     const taken = !!output && !!source?.data.decision?.includes(output.id);
     const dead = (!!output && !!source?.data.decision && !taken) || target?.data.status === 'skipped' || source?.data.status === 'skipped';
+    if (edge.loop) {
+      // A loop goes back: violet, dashed, labelled with its output and limit.
+      const loopStroke = dead ? '#4a4258' : '#b996f2';
+      return { ...edge, selected: edge.id === selectedEdgeId, type: 'smoothstep', label: `↺ ${edge.label || output?.label || edge.sourceHandle} · 최대 ${edge.loop.max}회`,
+        labelStyle: { fill: dead ? '#6b7680' : '#d9c7fb', fontSize: 10 }, labelBgStyle: { fill: '#1b2128' },
+        markerEnd: { type: MarkerType.ArrowClosed, color: loopStroke }, style: { stroke: loopStroke, strokeWidth: taken ? 2 : 1.4, strokeDasharray: '4 3', ...(dead ? { opacity: 0.5 } : {}) } };
+    }
     const stroke = dead ? '#3a434b' : active ? '#76d8bc' : output ? '#e3b45f' : '#414b54';
     return { ...edge, selected: edge.id === selectedEdgeId, animated: active, type: 'smoothstep',
       label: edge.label || output?.label, ...(output ? { labelStyle: { fill: dead ? '#6b7680' : '#f0d49b', fontSize: 10 }, labelBgStyle: { fill: '#1b2128' } } : {}),
@@ -497,8 +505,23 @@ function Workspace() {
 
   const onConnect = useCallback((connection: Connection) => {
     if (connection.source === connection.target) { setNotice('다른 단계에 연결하세요.'); return; }
-    if (nodesRef.current.some((node) => node.id === connection.source && isBranch(node)) && !connection.sourceHandle) { setNotice('분기의 출력에서 연결을 시작하세요.'); return; }
-    setEdges((items) => addEdge({ ...connection, id: crypto.randomUUID() }, items));
+    const source = nodesRef.current.find((node) => node.id === connection.source);
+    if (source && isBranch(source) && !connection.sourceHandle) { setNotice('분기의 출력에서 연결을 시작하세요.'); return; }
+    setEdges((items) => {
+      // A connection back to a stage that already leads here would close a cycle: it can only be a loop from a branch output.
+      const closes = loopBody(items, { source: connection.source, target: connection.target }).includes(connection.source);
+      if (!closes) return addEdge({ ...connection, id: crypto.randomUUID() }, items);
+      if (!source || !isBranch(source) || (source.data.mode ?? 'exclusive') !== 'exclusive') {
+        setNotice('연결이 순환합니다. 되돌아가려면 「하나만」 고르는 분기의 출력에서 앞 단계로 연결하세요.'); return items;
+      }
+      if (items.some((edge) => edge.source === connection.source && edge.sourceHandle === connection.sourceHandle)) {
+        setNotice('되돌아가기 연결은 다른 연결이 없는 분기 출력에서만 만들 수 있습니다. 반복용 출력을 하나 더 만드세요.'); return items;
+      }
+      const exit = (source.data.outputs ?? []).find((output) => output.id !== connection.sourceHandle);
+      if (!exit) { setNotice('되돌아가기에는 반복을 다 썼을 때 갈 출력이 하나 더 필요합니다.'); return items; }
+      setNotice(`되돌아가기 연결을 만들었습니다(최대 3회, 초과 시 「${exit.label || exit.id}」). 연결을 선택해 바꿀 수 있습니다.`);
+      return addEdge({ ...connection, id: crypto.randomUUID(), loop: { max: 3, exit: exit.id } } as WorkflowEdge, items);
+    });
   }, [setEdges]);
 
   // Natural-language generation: Orca launches an agent that sends its result back to the server; the canvas polls and applies it.
@@ -778,7 +801,11 @@ function Workspace() {
   function removeOutput(outputId: string) {
     if (!selected) return;
     updateNode({ outputs: (selected.data.outputs ?? []).filter((item) => item.id !== outputId) });
-    setEdges((items) => items.filter((edge) => !(edge.source === selected.id && edge.sourceHandle === outputId)));
+    // Its edges go with it; a loop that fell back to it falls back to another remaining output (or stops being possible).
+    const others = (selected.data.outputs ?? []).filter((item) => item.id !== outputId);
+    setEdges((items) => items.filter((edge) => !(edge.source === selected.id && edge.sourceHandle === outputId))
+      .flatMap((edge) => edge.source !== selected.id || edge.loop?.exit !== outputId ? [edge]
+        : others.some((item) => item.id !== edge.sourceHandle) ? [{ ...edge, loop: { ...edge.loop, exit: others.find((item) => item.id !== edge.sourceHandle)!.id } }] : []));
   }
   function updateNode(data: Partial<StageNode['data']>) {
     setNodes((items) => items.map((node) => node.id === selectedId ? { ...node, data: { ...node.data, ...data } } : node));
@@ -1197,6 +1224,19 @@ function Workspace() {
           </div> : selectedEdge ? <div className="inspector-content"><label className="field-label" htmlFor="edge-label">연결 설명</label><input id="edge-label" value={String(selectedEdge.label ?? '')} maxLength={500} placeholder="예: 검증 통과" onChange={(event) => setEdges((items) => items.map((edge) => edge.id === selectedEdgeId ? { ...edge, label: event.target.value } : edge))} />{(() => {
               const source = nodes.find((node) => node.id === selectedEdge.source);
               const output = source && isBranch(source) ? source.data.outputs?.find((item) => item.id === selectedEdge.sourceHandle) : undefined;
+              const loop = selectedEdge.loop;
+              if (loop && source) {
+                const setLoop = (patch: Partial<NonNullable<WorkflowEdge['loop']>>) => setEdges((items) => items.map((edge) => edge.id === selectedEdgeId && edge.loop ? { ...edge, loop: { ...edge.loop, ...patch } } : edge));
+                const target = nodes.find((node) => node.id === selectedEdge.target);
+                const body = loopBody(edges, selectedEdge).map((id) => nodes.find((node) => node.id === id)?.data.label || id);
+                return <><p className="field-help">되돌아가기 연결 — 분기 「{source.data.label}」가 출력 <code>{output?.id}</code>({output?.label || '조건 없음'})을 고르면 「{target?.data.label}」로 돌아가 <strong>{body.join(' → ')}</strong> 를 다시 돕니다(새 회차, 새 Task).</p>
+                  <label className="field-label" htmlFor="loop-max">최대 반복 횟수</label>
+                  <input id="loop-max" type="number" min={1} max={maxLoopRounds} value={loop.max} onChange={(event) => setLoop({ max: Math.min(maxLoopRounds, Math.max(1, Number(event.target.value) || 1)) })} />
+                  <label className="field-label" htmlFor="loop-exit">반복을 다 쓰면</label>
+                  <select id="loop-exit" value={loop.exit} onChange={(event) => setLoop({ exit: event.target.value })}>
+                    {(source.data.outputs ?? []).filter((item) => item.id !== selectedEdge.sourceHandle).map((item) => <option key={item.id} value={item.id}>{item.label || item.id} 출력으로 진행</option>)}</select>
+                  <p className="field-help">{loop.max}번 돌아간 뒤에도 이 출력을 고르면 위 출력으로 바뀌어 진행합니다. 다시 도는 단계의 워커는 앞 회차 산출물과 분기 판정 근거를 먼저 읽습니다.</p></>;
+              }
               return output ? <p className="field-help">분기 「{source!.data.label}」의 출력 <code>{output.id}</code>({output.label || '조건 없음'})에서 나온 연결입니다. 분기가 이 출력을 고를 때만 이어지고, 고르지 않으면 뒤 단계는 건너뜁니다.</p>
                 : <p className="field-help">일반 연결은 병렬입니다. 앞 단계가 끝나면 바로 이어지고, 한 단계에 여러 연결이 들어오면 건너뛰지 않은 앞 단계가 모두 끝날 때까지 기다립니다. 연결 설명은 참고용이며 진행 여부를 바꾸지 않습니다. 골라서 진행하려면 분기 노드를 쓰세요.</p>;
             })()}<button className="button danger" onClick={removeSelected}><Trash2 size={14} />연결 삭제</button></div>

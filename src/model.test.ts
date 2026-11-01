@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { pendingDecisions, frameContents, orderNodes, decisionError, skippedStages, topologicalOrder, waves, nodeExecutionStatus, type FlowStage, type StageNode, membershipOf, nodeLocation, aggregateStatus, executionFinished, taskStatus, projectNodes, serializableWorkflow, newWorkflow, fromSnapshot, type TaskSummary, type WorkerSummary, type RunSnapshot, executionRun, inputsKey, mergeSnapshots, workflowRuns, variableRefs, substituteVariables, resolveVariables } from './model.ts';
+import { pendingDecisions, frameContents, orderNodes, decisionError, skippedStages, topologicalOrder, waves, nodeExecutionStatus, type FlowStage, type StageNode, membershipOf, nodeLocation, aggregateStatus, executionFinished, taskStatus, projectNodes, serializableWorkflow, newWorkflow, fromSnapshot, type TaskSummary, type WorkerSummary, type RunSnapshot, executionRun, inputsKey, mergeSnapshots, workflowRuns, variableRefs, substituteVariables, resolveVariables, applyDecision, loopBody, stageRound, loggedExecutions, type Execution } from './model.ts';
 
 const task = (status: string): TaskSummary => ({ id: 'task-a', title: 'A', spec: 'A', status, deps: [] });
 const worker = (liveness: string): WorkerSummary => ({ dispatchId: 'dispatch-a', taskId: 'task-a', liveness, stage: 'working', provider: 'claude', model: 'example-model', outcome: '' });
@@ -337,4 +337,35 @@ test('settings: {{key}} references, substitution, defaults and required keys; sa
   const graph = { ...newWorkflow(), variables: [{ key: 'epic', label: '  ', required: true, description: '' }] };
   assert.deepEqual(serializableWorkflow(graph).variables, [{ key: 'epic', label: 'epic', required: true }]);
   assert.equal(serializableWorkflow(newWorkflow()).variables, undefined);
+});
+test('a loop edge runs its body again: archived passes, cleared decisions, the exit once rounds run out, retries ignored', () => {
+  const flow: FlowStage[] = [
+    { id: 'impl', after: [] }, { id: 'review', after: [{ id: 'impl' }] },
+    { id: 'result', after: [{ id: 'review' }], branch: { mode: 'exclusive', outputs: ['pass', 'fix', 'stop'] },
+      loops: [{ edge: 'back', output: 'fix', to: 'impl', max: 2, exit: 'stop', body: ['impl', 'review', 'result'] }] },
+    { id: 'done', after: [{ id: 'result', output: 'pass' }] }, { id: 'blocked', after: [{ id: 'result', output: 'stop' }] },
+  ];
+  assert.deepEqual(loopBody([{ source: 'impl', target: 'review' }, { source: 'review', target: 'result' }, { source: 'result', target: 'done' },
+    { source: 'result', target: 'impl', loop: { max: 2, exit: 'stop' } }], { source: 'result', target: 'impl' }).sort(), ['impl', 'result', 'review']);
+  let execution: Execution = { id: 'e', label: '#1', bindings: { impl: 't1', review: 't2', result: 't3', done: 't4', blocked: 't5' } };
+  const first = applyDecision(flow, execution, 'result', ['fix']);
+  assert.deepEqual(first.loop, { edge: 'back', to: 'impl', restart: ['impl', 'review', 'result'], pass: 2, max: 2, remaining: 1 });
+  assert.deepEqual(first.execution.bindings, { done: 't4', blocked: 't5' });
+  assert.deepEqual(first.execution.decisions, {});
+  assert.deepEqual(first.execution.skipped, []); // nothing after the branch is skipped while it runs again
+  assert.deepEqual(first.execution.history, [{ edge: 'back', pass: 1, nodes: ['impl', 'review', 'result'], bindings: { impl: 't1', review: 't2', result: 't3' }, decisions: { result: ['fix'] } }]);
+  assert.equal(applyDecision(flow, first.execution, 'result', ['fix']).repeated, true); // a retry before new Tasks are bound
+  execution = { ...first.execution, bindings: { ...first.execution.bindings, impl: 't6', review: 't7', result: 't8' } };
+  assert.equal(stageRound(execution, 'impl'), 2);
+  assert.equal(stageRound(execution, 'done'), 1);
+  const second = applyDecision(flow, execution, 'result', ['fix']);
+  assert.equal(second.loop?.pass, 3);
+  execution = { ...second.execution, bindings: { ...second.execution.bindings, impl: 't9', review: 't10', result: 't11' } };
+  const third = applyDecision(flow, execution, 'result', ['fix']);
+  assert.deepEqual(third.exhausted, { output: 'stop', max: 2 });
+  assert.deepEqual(third.execution.decisions, { result: ['stop'] });
+  assert.deepEqual(third.execution.skipped, ['done']);
+  assert.equal(loggedExecutions([third.execution])[0].tasks.length, 11); // every pass's Tasks stay in the log
+  const [projected] = projectNodes([{ id: 'impl', type: 'stage', position: { x: 0, y: 0 }, data: { label: 'impl', description: '', kind: 'worker' } }], null, false, [third.execution], 'e');
+  assert.equal(projected.data.round, 3);
 });

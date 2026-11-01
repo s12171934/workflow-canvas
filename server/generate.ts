@@ -1,4 +1,4 @@
-import { effortLevels, isExecutable, topologicalOrder, waves, workerModels, defaultWorkerModel, kindNames,
+import { effortLevels, forwardEdges, isExecutable, topologicalOrder, waves, workerModels, defaultWorkerModel, kindNames,
   type StageNode, type Workflow } from '../src/model.ts';
 
 // Natural-language generation runs in Orca: the canvas server writes a prompt file, Orca launches a Claude agent in the
@@ -40,7 +40,7 @@ ${input.request}
 
 ## 그래프 규칙
 - 각 단계는 Orca 코디네이터가 Task 로 만들고, \`worker\` 단계마다 워커 에이전트 하나가 \`description\` 을 지침으로 받아 수행한다.
-- 연결(\`edges\`)은 선행 → 후행이다. 분기가 아닌 연결은 모두 병렬이고, 들어오는 연결이 여럿이면 모두 끝나야 진행한다. 순환은 만들 수 없다.
+- 연결(\`edges\`)은 선행 → 후행이다. 분기가 아닌 연결은 모두 병렬이고, 들어오는 연결이 여럿이면 모두 끝나야 진행한다. 순환은 만들 수 없다 — 단, 반복(보완 후 재검토 등)은 「하나만」 분기의 출력에서 앞 단계로 가는 되돌아가기 연결로 만든다: \`{"source":"<분기>","target":"<앞 단계>","sourceHandle":"<반복 출력>","loop":{"max":3,"exit":"<반복을 다 쓰면 갈 같은 분기의 다른 출력>"}}\`. 반복 출력에는 이 연결 하나만 두고, 반복 구간에 워크플로 링크를 두지 않는다. 재검토용 노드를 따로 복제하지 않는다.
 - 단계 종류(\`kind\`):
   - \`worker\`: 워커 하나가 지침을 수행. \`description\` 은 그 워커가 이것만 읽고 일할 수 있는 브리프다(목표, 작업 범위, 제약, 완료 조건, 산출물).
   - \`gate\`: 사용자 승인. \`description\` 은 사용자에게 물을 내용. 출력은 통과·거절이고 거절하면 뒤 단계를 모두 건너뛴다. \`asker: "previous"\` 면 앞에 연결된 워커 하나가 자기 터미널에서 묻는다(앞에 워커가 정확히 하나여야 함). 없으면 캔버스에서 묻는다.
@@ -61,7 +61,7 @@ ${input.saved.length ? input.saved.map((item) => `- \`${item.id}\` ${item.name}`
   "name": "<워크플로 이름>",
   "description": "<한 줄 설명>",
   "nodes": [{ "id": "<영문·숫자·_·- 로 된 고유 id>", "kind": "worker", "label": "<단계 이름>", "description": "<지침>" }],
-  "edges": [{ "source": "<id>", "target": "<id>", "sourceHandle": "<분기 출력 id, 분기에서 나갈 때만>", "label": "<선택: 연결 설명>" }]
+  "edges": [{ "source": "<id>", "target": "<id>", "sourceHandle": "<분기 출력 id, 분기에서 나갈 때만>", "label": "<선택: 연결 설명>", "loop": { "max": 3, "exit": "<선택: 되돌아가기 연결만>" } }]
 }
 \`\`\`
 
@@ -74,7 +74,7 @@ export function briefPrompt(input: { request: string; resultUrl: string; resultF
   const { graph, nodeId } = input;
   const node = graph.nodes.find((item) => item.id === nodeId)!;
   const executable = graph.nodes.filter(isExecutable);
-  const { order } = topologicalOrder(executable.map((item) => item.id), graph.edges);
+  const { order } = topologicalOrder(executable.map((item) => item.id), forwardEdges(graph.edges));
   const byId = new Map(graph.nodes.map((item) => [item.id, item]));
   const line = (item: StageNode) => `- ${item.id === nodeId ? '**[이 단계]** ' : ''}${item.data.label || '(이름 없음)'} (${kindNames[item.data.kind]})${item.data.description ? `: ${item.data.description.replace(/\s+/g, ' ').slice(0, 300)}` : ''}`;
   const before = graph.edges.filter((edge) => edge.target === nodeId).map((edge) => byId.get(edge.source)).filter(Boolean) as StageNode[];
@@ -139,12 +139,13 @@ export function generatedWorkflow(raw: unknown, id: string): Workflow {
   const edges = body.edges.map((item: Record<string, unknown>, index) => {
     if (!item || typeof item !== 'object') throw new Error(`edges[${index}] 가 객체가 아닙니다.`);
     return { id: `e${index + 1}`, source: String(item.source ?? ''), target: String(item.target ?? ''),
-      ...(str(item.sourceHandle) ? { sourceHandle: str(item.sourceHandle) } : {}), ...(str(item.label) ? { label: str(item.label) } : {}) };
+      ...(str(item.sourceHandle) ? { sourceHandle: str(item.sourceHandle) } : {}), ...(str(item.label) ? { label: str(item.label) } : {}),
+      ...(item.loop && typeof item.loop === 'object' ? { loop: { max: Number((item.loop as Record<string, unknown>).max), exit: String((item.loop as Record<string, unknown>).exit ?? '') } } : {}) };
   });
   // Every edge leaving a gate is its 'approve' output; the canvas draws it from the single port.
   for (const edge of edges) if (nodes.find((node) => node.id === edge.source)?.data.kind === 'gate') delete (edge as { sourceHandle?: string }).sourceHandle;
-  const { order } = topologicalOrder(nodes.map((node) => node.id), edges);
-  const wave = waves(order, edges);
+  const { order } = topologicalOrder(nodes.map((node) => node.id), forwardEdges(edges));
+  const wave = waves(order, forwardEdges(edges));
   const rows = new Map<number, number>();
   for (const node of nodes) {
     const column = wave.get(node.id) ?? 0;

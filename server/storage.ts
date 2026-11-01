@@ -2,7 +2,7 @@ import { mkdir, readFile, readdir, rename, stat, writeFile, unlink } from 'node:
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { Workflow } from '../src/model.ts';
-import { effortLevels, linkModes, maxBranchOutputs, maxSpawnItems, maxVariables, validVariableValue, variableKeyPattern, maxGroupDepth, workerModelPattern, serializableWorkflow, topologicalOrder, validTrigger, worktreeNamePattern } from '../src/model.ts';
+import { effortLevels, forwardEdges, loopBody, maxLoopRounds, linkModes, maxBranchOutputs, maxSpawnItems, maxVariables, validVariableValue, variableKeyPattern, maxGroupDepth, workerModelPattern, serializableWorkflow, topologicalOrder, validTrigger, worktreeNamePattern } from '../src/model.ts';
 
 export function validId(id: string): boolean { return /^[a-zA-Z0-9_-]{1,128}$/.test(id); }
 
@@ -103,10 +103,32 @@ export function validateWorkflow(value: unknown): Workflow {
       throw new Error(`'${source.data.label || '분기'}' 에서 나가는 연결은 분기의 출력에서 시작해야 합니다.`);
     }
   }
-  const { cycle } = topologicalOrder(graph.nodes.map((node) => node.id), graph.edges);
+  const name = (id: string) => byId.get(id)?.data.label || id;
+  const { cycle } = topologicalOrder(graph.nodes.map((node) => node.id), forwardEdges(graph.edges));
   if (cycle) {
-    const name = (id: string) => byId.get(id)?.data.label || id;
-    throw new Error(`연결이 순환합니다: ${cycle.map(name).join(' → ')}. 반복은 연결로 만들 수 없습니다.`);
+    throw new Error(`연결이 순환합니다: ${cycle.map(name).join(' → ')}. 반복하려면 분기의 출력에서 앞 단계로 「되돌아가기」 연결을 쓰세요.`);
+  }
+  // A loop goes back from an output of an exclusive branch to a stage before it, with a limit and an output to take after it.
+  for (const edge of graph.edges.filter((item) => item.loop !== undefined)) {
+    const source = byId.get(edge.source)!;
+    const loop = edge.loop;
+    const where = `'${name(edge.source)}' → '${name(edge.target)}' 되돌아가기 연결`;
+    if (!loop || typeof loop !== 'object' || !Number.isInteger(loop.max) || loop.max < 1 || loop.max > maxLoopRounds || typeof loop.exit !== 'string') {
+      throw new Error(`${where}에는 최대 반복 횟수(1~${maxLoopRounds})와 초과 시 출력이 필요합니다.`);
+    }
+    if (source.data.kind !== 'branch' || (source.data.mode ?? 'exclusive') !== 'exclusive' || !edge.sourceHandle) {
+      throw new Error(`${where}은 「하나만」 고르는 분기의 출력에서 시작해야 합니다.`);
+    }
+    if (loop.exit === edge.sourceHandle || !(source.data.outputs ?? []).some((output) => output.id === loop.exit)) {
+      throw new Error(`${where}의 초과 시 출력은 같은 분기의 다른 출력이어야 합니다.`);
+    }
+    if (graph.edges.some((other) => other.id !== edge.id && other.source === edge.source && other.sourceHandle === edge.sourceHandle)) {
+      throw new Error(`${where}이 나가는 출력에는 다른 연결을 둘 수 없습니다.`);
+    }
+    const body = loopBody(graph.edges, edge);
+    if (!body.includes(edge.source)) throw new Error(`${where}은 분기보다 앞에 있는(분기로 이어지는) 단계로만 돌아갈 수 있습니다.`);
+    const link = body.map((id) => byId.get(id)!).find((node) => node.data.kind === 'workflow');
+    if (link) throw new Error(`${where}이 반복하는 구간에 워크플로 링크 '${name(link.id)}' 를 둘 수 없습니다.`);
   }
   if (graph.cleanup !== undefined && (!graph.cleanup || typeof graph.cleanup !== 'object'
     || (['coordinator', 'worktrees', 'sessions'] as const).some((key) => typeof graph.cleanup![key] !== 'boolean'))) {
@@ -168,6 +190,14 @@ export function validateWorkflow(value: unknown): Workflow {
           || typeof execution.automation.name !== 'string' || execution.automation.name.length > 100))
         || (execution.runId !== undefined && (typeof execution.runId !== 'string' || !validId(execution.runId)))
         || !validInputs(execution.inputs)
+        || (execution.loops !== undefined && (!execution.loops || typeof execution.loops !== 'object' || Array.isArray(execution.loops)
+          || Object.entries(execution.loops).some(([edgeId, count]) => !validId(edgeId) || !Number.isInteger(count) || count < 0 || count > maxLoopRounds)))
+        || (execution.history !== undefined && (!Array.isArray(execution.history) || execution.history.length > 200
+          || execution.history.some((pass) => !pass || !validId(pass.edge) || !Number.isInteger(pass.pass) || !Array.isArray(pass.nodes)
+            || pass.nodes.some((id) => typeof id !== 'string' || !validId(id)) || !pass.bindings || typeof pass.bindings !== 'object'
+            || Object.entries(pass.bindings).some(([nodeId, taskId]) => !validId(nodeId) || typeof taskId !== 'string' || !validId(taskId))
+            || (pass.decisions !== undefined && (!pass.decisions || typeof pass.decisions !== 'object'
+              || Object.entries(pass.decisions).some(([path, outputs]) => !/^[a-zA-Z0-9_.-]{1,400}$/.test(path) || !Array.isArray(outputs) || outputs.some((output) => typeof output !== 'string' || !validId(output))))))))
         || (execution.values !== undefined && (!execution.values || typeof execution.values !== 'object' || Array.isArray(execution.values)
           || Object.entries(execution.values).some(([key, value]) => !variableKeyPattern.test(key) || !validVariableValue(value))))
         || (execution.spawned !== undefined && (!execution.spawned || typeof execution.spawned !== 'object' || Array.isArray(execution.spawned)

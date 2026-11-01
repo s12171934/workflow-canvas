@@ -442,6 +442,64 @@
               "type": "string",
               "maxLength": 2000
             }
+          },
+          "loops": {
+            "type": "object",
+            "description": "되돌아가기 연결 ID → 돌아간 횟수",
+            "propertyNames": {
+              "$ref": "#/$defs/id"
+            },
+            "additionalProperties": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 10
+            }
+          },
+          "history": {
+            "type": "array",
+            "maxItems": 200,
+            "description": "되돌아가기로 끝난 앞 회차들. bindings·decisions 는 그 회차의 반복 구간 것이고, 현재 회차는 실행의 bindings·decisions 에 있다.",
+            "items": {
+              "type": "object",
+              "required": [
+                "edge",
+                "pass",
+                "nodes",
+                "bindings"
+              ],
+              "properties": {
+                "edge": {
+                  "$ref": "#/$defs/id"
+                },
+                "pass": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "description": "이 연결로 끝난 몇 번째 회차"
+                },
+                "nodes": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/id"
+                  },
+                  "description": "반복 구간"
+                },
+                "bindings": {
+                  "type": "object",
+                  "additionalProperties": {
+                    "$ref": "#/$defs/id"
+                  }
+                },
+                "decisions": {
+                  "type": "object",
+                  "additionalProperties": {
+                    "type": "array",
+                    "items": {
+                      "$ref": "#/$defs/id"
+                    }
+                  }
+                }
+              }
+            }
           }
         }
       }
@@ -474,10 +532,29 @@
           "sourceHandle": {
             "$ref": "#/$defs/id",
             "description": "분기에서 나가는 연결만: 출발한 출력의 ID. 분기 연결에는 필수다."
+          },
+          "loop": {
+            "type": "object",
+            "required": [
+              "max",
+              "exit"
+            ],
+            "description": "되돌아가기 연결. 「하나만」 분기의 출력(sourceHandle)에서 그 분기로 이어지는 앞 단계로 간다. 그 출력을 고르면 대상부터 분기까지(반복 구간)를 새 회차로 다시 돈다. 최대 max 번 돌아간 뒤 또 고르면 exit 출력으로 바뀐다. 그 출력에는 이 연결 하나만 두고, 반복 구간에 워크플로 링크를 두지 않는다. 되돌아가기 연결이 있는 워크플로는 펼치는 링크의 대상이 될 수 없다(항목마다 따로 실행은 된다).",
+            "properties": {
+              "max": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 10
+              },
+              "exit": {
+                "$ref": "#/$defs/id",
+                "description": "같은 분기의 다른 출력"
+              }
+            }
           }
         }
       },
-      "description": "연결. 노드 사이 연결은 순환할 수 없다."
+      "description": "연결. 되돌아가기(loop) 연결을 뺀 연결은 순환할 수 없다."
     },
     "cleanup": {
       "type": "object",

@@ -92,6 +92,8 @@ export type StageData = {
   /** kind 'workflow': the linked saved workflow, and whether what follows waits for it (unset: 'wait'). */
   workflowId?: string;
   linkMode?: LinkMode;
+  /** Display only: the round a looped stage is on (2 and up), in the selected execution or the furthest visible one. */
+  round?: number;
   /** Display only, spawn links: the separate executions requested (by the selected execution, or the visible ones). */
   spawned?: SpawnResult[];
   /** kind 'branch': how many outputs it takes, who decides, and its outputs (each a source handle). */
@@ -153,7 +155,7 @@ export type Workflow = {
   description: string;
   runId: string;
   nodes: StageNode[];
-  edges: Edge[];
+  edges: WorkflowEdge[];
   executions?: Execution[];
   /** Default project offered in the run dialog (the run itself always names its project). */
   workspace?: string;
@@ -164,6 +166,32 @@ export type Workflow = {
   /** Settings the run dialog and automations ask for (an epic link, a sheet URL…); stage instructions use them as {{key}}. */
   variables?: WorkflowVariable[];
 };
+/**
+ * A loop edge goes back from an output of an exclusive branch to a stage before it. Choosing that output runs the stages
+ * from the target to the branch again (a new round), at most `max` times; after that the choice becomes `exit`.
+ */
+export type EdgeLoop = { max: number; exit: string };
+export type WorkflowEdge = Edge & { loop?: EdgeLoop };
+export const maxLoopRounds = 10;
+/** Edges that are not loops: the graph they form must be acyclic. */
+export const forwardEdges = <T extends { loop?: EdgeLoop }>(edges: T[]) => edges.filter((edge) => !edge.loop);
+/** Stages a loop runs again: on a forward path from its target to its source, both included. */
+export function loopBody(edges: { source: string; target: string; loop?: EdgeLoop }[], loop: { source: string; target: string }): string[] {
+  const forward = forwardEdges(edges);
+  const reach = (start: string, down: boolean) => {
+    const seen = new Set([start]);
+    for (let queue = [start], id = queue.shift(); id !== undefined; id = queue.shift()) {
+      for (const edge of forward) {
+        const [from, to] = down ? [edge.source, edge.target] : [edge.target, edge.source];
+        if (from === id && !seen.has(to)) { seen.add(to); queue.push(to); }
+      }
+    }
+    return seen;
+  };
+  const after = reach(loop.target, true);
+  const before = reach(loop.source, false);
+  return [...after].filter((id) => before.has(id));
+}
 /**
  * One setting of a workflow, like an environment variable: given per 실행 or fixed per automation, written into the brief,
  * and replacing {{key}} in stage instructions. Linked workflows (expanded or spawned) receive the same key's value.
@@ -214,7 +242,16 @@ export type Execution = { id: string; label: string; bindings: Record<string, st
   /** Setting values of the 실행 request that started it (defaults applied). Together with `inputs` they tell requests apart. */
   values?: Record<string, string>;
   /** Spawn links (node id) → the separate executions they requested, in request order. */
-  spawned?: Record<string, SpawnResult[]> };
+  spawned?: Record<string, SpawnResult[]>;
+  /** Loop edge id → how many times the execution went back along it. */
+  loops?: Record<string, number>;
+  /** Earlier rounds of looped stages: what each pass bound and decided before the loop sent it back. */
+  history?: LoopPass[] };
+/** One finished pass of a loop body: its stages, their Tasks and decisions (the branch's own loop choice included). */
+export type LoopPass = { edge: string; pass: number; nodes: string[]; bindings: Record<string, string>; decisions?: Record<string, string[]> };
+/** Which round a stage is on in one execution: 1 plus the earlier passes that included it. */
+export const stageRound = (execution: Pick<Execution, 'history'>, nodeId: string) =>
+  1 + (execution.history ?? []).filter((pass) => pass.nodes.includes(nodeId)).length;
 /** Run of an execution: its own, or the workflow's for documents from before executions carried one. */
 export const executionRun = (workflow: Pick<Workflow, 'runId'>, execution: Pick<Execution, 'runId'>) => execution.runId || workflow.runId;
 /** Every Run the workflow observes: its current Run first, then the Runs of its executions. */
@@ -363,7 +400,7 @@ export function projectNodes(nodes: StageNode[], snapshot: RunSnapshot | null, s
   executions: Execution[] = [], executionId: string | null = null, visible?: Set<string>): StageNode[] {
   const selected = executionId && executionId !== 'all' ? executions.find((item) => item.id === executionId) : undefined;
   return nodes.map((node) => {
-    if (!isExecutable(node)) return { ...node, data: { ...node.data, status: undefined, runs: undefined, activeTaskId: undefined, decision: undefined, spawned: undefined } };
+    if (!isExecutable(node)) return { ...node, data: { ...node.data, status: undefined, runs: undefined, activeTaskId: undefined, decision: undefined, spawned: undefined, round: undefined } };
     const runs = executions.map((execution) => ({ id: execution.id, label: execution.label,
       taskId: nodeExecutionTask(node, execution, snapshot, stale), status: nodeExecutionStatus(node, execution, snapshot, stale) }));
     const taskId = selected ? nodeExecutionTask(node, selected, snapshot, stale) : executionId === 'all' ? undefined : node.data.taskId;
@@ -377,6 +414,8 @@ export function projectNodes(nodes: StageNode[], snapshot: RunSnapshot | null, s
       .flatMap((execution) => execution.spawned?.[node.id] ?? []) : [];
     return { ...node, data: { ...node.data, status, runs: executionId === 'all' ? shown : undefined, activeTaskId: taskId,
       spawned: requested.length ? requested : undefined,
+      round: (() => { const rounds = (selected ? [selected] : executionId === 'all' ? executions.filter((execution) => !visible || visible.has(execution.id)) : [])
+        .map((execution) => stageRound(execution, node.id)); const top = Math.max(1, ...rounds); return top > 1 ? top : undefined; })(),
       decision: selected && isBranch(node) ? selected.decisions?.[node.id] : undefined,
       agent: worker?.provider,
       model: worker?.model,
@@ -404,6 +443,8 @@ export function serializableWorkflow(workflow: Workflow): Workflow {
       ...(execution.runId ? { runId: execution.runId } : {}),
       ...(execution.inputs && Object.keys(execution.inputs).length ? { inputs: execution.inputs } : {}),
       ...(execution.values && Object.keys(execution.values).length ? { values: execution.values } : {}),
+      ...(execution.loops && Object.keys(execution.loops).length ? { loops: execution.loops } : {}),
+      ...(execution.history?.length ? { history: execution.history } : {}),
       ...(execution.spawned && Object.keys(execution.spawned).some((nodeId) => nodeIds.has(nodeId))
         ? { spawned: Object.fromEntries(Object.entries(execution.spawned).filter(([nodeId]) => nodeIds.has(nodeId))) } : {}) };
   });
@@ -445,7 +486,8 @@ export function serializableWorkflow(workflow: Workflow): Workflow {
   }), edges: workflow.edges.filter((edge) => ![edge.source, edge.target].some((id) => groupIds.has(id) || frameIds.has(id)))
     // Only a branch's edges name an output (its source handle); every other edge leaves the single source port.
     .map((edge) => ({ id: edge.id, source: edge.source, target: edge.target, label: edge.label,
-      ...(edge.sourceHandle && branchIds.has(edge.source) ? { sourceHandle: edge.sourceHandle } : {}) })) };
+      ...(edge.sourceHandle && branchIds.has(edge.source) ? { sourceHandle: edge.sourceHandle } : {}),
+      ...(edge.loop && branchIds.has(edge.source) ? { loop: { max: edge.loop.max, exit: edge.loop.exit } } : {}) })) };
 }
 
 export function fromSnapshot(snapshot: RunSnapshot): Pick<Workflow, 'nodes' | 'edges' | 'runId' | 'name'> {
@@ -620,7 +662,8 @@ export function loggedExecutions(executions: Execution[]): LoggedExecution[] {
   return executions.map((execution) => {
     const skipped = executionTasks(execution, execution.skipped ?? []);
     return { id: execution.id, label: execution.label,
-      tasks: [...new Set([...Object.values(execution.bindings), ...Object.values(execution.links ?? {}).flatMap((tasks) => Object.values(tasks))])],
+      tasks: [...new Set([...(execution.history ?? []).flatMap((pass) => Object.values(pass.bindings)), ...Object.values(execution.bindings),
+        ...Object.values(execution.links ?? {}).flatMap((tasks) => Object.values(tasks))])],
       ...(skipped.length ? { skipped } : {}) };
   });
 }
@@ -646,7 +689,48 @@ export type FlowStage = { id: string; after: { id: string; output?: string }[]; 
   /** Outputs that stop everything after this stage, even a join that another live path reaches (a rejected gate). */
   veto?: string[];
   /** 'any': runs when at least one incoming path is alive (paths meeting again after a branch). Default: every path. */
-  join?: JoinMode };
+  join?: JoinMode;
+  /** Branch outputs that loop back: the stage they go back to, the stages they run again (flow order), the limit and the fallback. */
+  loops?: FlowLoop[] };
+export type FlowLoop = { edge: string; output: string; to: string; max: number; exit: string; body: string[] };
+/** What one decision did: the execution afterwards, and whether it looped back or ran out of rounds. */
+export type DecisionEffect = { execution: Execution;
+  /** Went back: stages to run again from `to` (new Tasks needed); the body now runs its pass number `pass`. */
+  loop?: { edge: string; to: string; restart: string[]; pass: number; max: number; remaining: number };
+  /** The loop output was chosen with no rounds left: `output` (the loop's exit) was recorded instead. */
+  exhausted?: { output: string; max: number };
+  /** Nothing changed: this decision was already recorded (a retried request). */
+  repeated?: boolean };
+/**
+ * Records a (validated) decision. Choosing a loop output with rounds left archives the loop body's Tasks and decisions as a
+ * finished pass and clears them, so the body runs again; with none left, the loop's exit output is recorded instead.
+ */
+export function applyDecision(flow: FlowStage[], execution: Execution, node: string, outputs: string[]): DecisionEffect {
+  const stage = flow.find((item) => item.id === node);
+  const loop = stage?.loops?.find((item) => outputs.includes(item.output));
+  // The same loop choice again before the new round's Tasks are bound is a retried request, not another round.
+  const last = execution.history?.[execution.history.length - 1];
+  if (loop && last?.edge === loop.edge && !execution.bindings[node] && !execution.decisions?.[node]
+    && JSON.stringify(last.decisions?.[node]) === JSON.stringify(outputs)) {
+    const count = execution.loops?.[loop.edge] ?? 0;
+    return { execution, loop: { edge: loop.edge, to: loop.to, restart: loop.body, pass: count + 1, max: loop.max, remaining: loop.max - count }, repeated: true };
+  }
+  const decide = (chosen: string[]) => {
+    const decisions = { ...execution.decisions, [node]: chosen };
+    return { ...execution, decisions, skipped: skippedStages(flow, decisions) };
+  };
+  if (!loop) return { execution: decide(outputs), ...(execution.decisions?.[node] ? { repeated: true } : {}) };
+  const count = execution.loops?.[loop.edge] ?? 0;
+  if (count >= loop.max) return { execution: decide([loop.exit]), exhausted: { output: loop.exit, max: loop.max } };
+  const body = new Set(loop.body);
+  const part = <T,>(record: Record<string, T> | undefined, inside: boolean) => Object.fromEntries(Object.entries(record ?? {}).filter(([id]) => body.has(id) === inside));
+  const decisions = part(execution.decisions, false);
+  const pass: LoopPass = { edge: loop.edge, pass: count + 1, nodes: loop.body, bindings: part(execution.bindings, true),
+    decisions: { ...part(execution.decisions, true), [node]: outputs } };
+  const next: Execution = { ...execution, bindings: part(execution.bindings, false), decisions, skipped: skippedStages(flow, decisions),
+    loops: { ...execution.loops, [loop.edge]: count + 1 }, history: [...(execution.history ?? []), pass] };
+  return { execution: next, loop: { edge: loop.edge, to: loop.to, restart: loop.body, pass: count + 2, max: loop.max, remaining: loop.max - count - 1 } };
+}
 /** A gate is a user decision with two outputs; every edge leaving it is the 'approve' output. */
 export const gateOutputs: BranchOutput[] = [{ id: 'approve', label: '통과' }, { id: 'reject', label: '거절' }];
 /** A user decision the canvas can take now: its stage is reached, undecided, and every live predecessor finished. */

@@ -5,10 +5,10 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { createStorage, validId, validateWorkflow } from './storage.ts';
-import { buildBrief, checkBranches, checkGroups, checkSpawns, checkVariables, flowOf, linkedWorkflows } from './execute.ts';
+import { buildBrief, checkBranches, checkGroups, checkLoops, checkSpawns, checkVariables, flowOf, linkedWorkflows } from './execute.ts';
 import { briefPrompt, generatedWorkflow, generationTimeoutMs, maxPromptLength, workflowPrompt, type Generation } from './generate.ts';
 import { coordinatorEventTypes, createRunLog, launchDirName } from './runlog.ts';
-import { decisionError, executionResults, executionRun, maxSpawnItems, requestKey, resolveVariables, validVariableValue, spawnsRuns, type SpawnResult, executionTasks, inputsKey, loggedExecutions, skippedStages, type Execution, type RunLogDetail } from '../src/model.ts';
+import { applyDecision, decisionError, executionResults, executionRun, maxSpawnItems, requestKey, resolveVariables, validVariableValue, spawnsRuns, type SpawnResult, executionTasks, inputsKey, loggedExecutions, skippedStages, type Execution, type RunLogDetail } from '../src/model.ts';
 import { defaultCleanup, type AutomationConfig, type AutomationState, type Cleanup, asksAtRun, executionFinished, executionStatuses, isExecutable, worktreeNamePattern, type RunSnapshot, type Workflow } from '../src/model.ts';
 
 /** Minimum gap between two 실행 requests for the same workflow, so a double click cannot start two coordinators. */
@@ -159,12 +159,14 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
       const decisions = execution.decisions ?? {};
       const problem = decisionError(flow, decisions, node, outputs);
       if (problem) return { status: decisions[node] ? 409 : 400, error: problem };
-      const updated = { ...execution, decisions: { ...decisions, [node]: outputs }, skipped: skippedStages(flow, { ...decisions, [node]: outputs }) };
+      // A loop output with rounds left sends the loop body back for another pass; with none left it becomes the loop's exit.
+      const effect = applyDecision(flow, execution, node, outputs);
+      const updated = effect.execution;
       const stored = await storage.save({ ...graph, executions: graph.executions!.map((item) => item.id === executionId ? updated : item) });
-      return { status: 200, stored, updated, flow, repeat: !!decisions[node] };
+      return { status: 200, stored, updated, flow, effect, repeat: !!effect.repeated };
     });
     if (!('stored' in result) || !result.stored) { res.status(result.status).json({ error: result.error }); return; }
-    const { stored, updated } = result;
+    const { stored, updated, effect } = result;
     const run = executionRun(stored, updated);
     if (run) await runlog.register(stored.id, run, loggedExecutions((stored.executions ?? []).filter((item) => executionRun(stored, item) === run))).catch(() => {});
     if (run && byUser && 'repeat' in result && !result.repeat) {
@@ -172,8 +174,41 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
       await runlog.appendRun(run, { type: 'gate', taskId: executionTasks(updated, [node])[0],
         message: `${stage?.label ?? node} ${updated.label}: 캔버스에서 사용자가 ${outputs.map((output: string) => stage?.outputLabels?.[output] ?? output).join(', ')} 선택` }).catch(() => {});
     }
+    if (run && effect.loop && !effect.repeated) {
+      const stage = result.flow.find((item) => item.id === effect.loop!.to);
+      await runlog.appendRun(run, { type: 'note', message: `${updated.label}: 되돌아가기 → ${stage?.label ?? effect.loop.to} ${effect.loop.pass}회차 (남은 반복 ${effect.loop.remaining}회)` }).catch(() => {});
+    }
+    if (run && effect.exhausted) {
+      await runlog.appendRun(run, { type: 'note', message: `${updated.label}: 최대 반복 ${effect.exhausted.max}회를 다 써서 ${effect.exhausted.output} 로 진행` }).catch(() => {});
+    }
     // Every skipped Task, not only the new ones, so a retried request still tells the coordinator what to close.
-    res.json({ decisions: updated.decisions, skipped: updated.skipped, skippedTasks: executionTasks(updated, updated.skipped) });
+    res.json({ decisions: updated.decisions, skipped: updated.skipped, skippedTasks: executionTasks(updated, updated.skipped ?? []),
+      ...(effect.loop ? { loop: effect.loop } : {}), ...(effect.exhausted ? { exhausted: effect.exhausted } : {}) });
+  });
+  // Used by the coordinator after a loop went back: the new Tasks of the stages that run again. Merges into the execution's bindings.
+  app.patch('/api/workflows/:id/executions/:executionId/bindings', async (req, res) => {
+    const { id, executionId } = req.params;
+    if (!validId(id) || !validId(executionId)) { res.status(400).json({ error: '올바르지 않은 워크플로 또는 실행 ID입니다.' }); return; }
+    const bindings = req.body?.bindings;
+    if (!bindings || typeof bindings !== 'object' || Array.isArray(bindings) || !Object.keys(bindings).length
+      || Object.entries(bindings).some(([nodeId, taskId]) => !validId(nodeId) || typeof taskId !== 'string' || !validId(taskId))) {
+      res.status(400).json({ error: '{"bindings":{"<nodeId>":"<task_id>", ...}} 형식이어야 합니다.' }); return;
+    }
+    const result = await serial(id, async () => {
+      const graph = await storage.load(id);
+      const execution = graph.executions?.find((item) => item.id === executionId);
+      if (!execution) return { status: 404, error: '이 워크플로에 등록된 실행이 아닙니다.' };
+      const unknown = Object.keys(bindings).find((nodeId) => !graph.nodes.some((node) => node.id === nodeId && isExecutable(node)));
+      if (unknown) return { status: 400, error: `'${unknown}' 는 이 워크플로의 실행 단계가 아닙니다.` };
+      const updated = { ...execution, bindings: { ...execution.bindings, ...bindings as Record<string, string> } };
+      try { return { status: 200, stored: await storage.save({ ...graph, executions: graph.executions!.map((item) => item.id === executionId ? updated : item) }) }; }
+      catch (error) { return { status: 400, error: (error as Error).message }; }
+    });
+    if (!('stored' in result) || !result.stored) { res.status(result.status).json({ error: result.error }); return; }
+    const { stored } = result;
+    const run = executionRun(stored, stored.executions!.find((item) => item.id === executionId)!);
+    if (run) await runlog.register(stored.id, run, loggedExecutions((stored.executions ?? []).filter((item) => executionRun(stored, item) === run))).catch(() => {});
+    res.json(stored.executions!.find((item) => item.id === executionId));
   });
   type RunSettings = { count: number; project: string; inputs: Record<string, string>; cleanup: Cleanup; automation?: { id: string; name: string };
     /** Setting values as given (declared keys, non-empty): what an automation keeps. */
@@ -223,7 +258,7 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
   async function prepareRun(id: string, graph: Workflow, settings: RunSettings, apiBase: string): Promise<{ briefPath: string; logId: string; launchKey: string }> {
     if (!graph.nodes.some(isExecutable)) throw new RunError(400, '실행할 단계가 없습니다.');
     let linked: Map<string, Workflow>;
-    try { linked = await linkedWorkflows(graph, (linkId) => storage.load(linkId)); checkGroups([graph, ...linked.values()]); checkBranches([graph, ...linked.values()]); checkSpawns([graph, ...linked.values()], linked); checkVariables([graph, ...linked.values()]); }
+    try { linked = await linkedWorkflows(graph, (linkId) => storage.load(linkId)); checkGroups([graph, ...linked.values()]); checkBranches([graph, ...linked.values()]); checkSpawns([graph, ...linked.values()], linked); checkVariables([graph, ...linked.values()]); checkLoops([graph, ...linked.values()], linked); }
     catch (error) { throw new RunError(400, (error as Error).message); }
     // Requests with different run-time inputs (one per ticket, say) run side by side; the same inputs never overlap.
     const inputs = inputsKey(settings.inputs);

@@ -748,3 +748,70 @@ test('workflow settings: asked per run, fixed per automation, written into instr
     await rm(directory, { recursive: true, force: true });
   }
 });
+test('loops: a branch output goes back with a limit; the decision API starts a new round and the coordinator binds its Tasks', async () => {
+  await mkdir('.local', { recursive: true });
+  const directory = await mkdtemp(join(resolve('.local'), 'api-loop-test-'));
+  const bridge = createOrcaBridge(async (args) => {
+    const place = places(args); if (place) return place;
+    if (args[0] === 'agent') return { terminal: { handle: 'term_x' } };
+    return {};
+  });
+  const json = { 'Content-Type': 'application/json' };
+  const stage = (id: string, extra = {}) => ({ id, type: 'stage' as const, position: { x: 0, y: 0 }, data: { label: id, description: id, kind: 'worker' as const, ...extra } });
+  const result = stage('result', { kind: 'branch', mode: 'exclusive', judge: 'previous', outputs: [{ id: 'pass', label: '통과' }, { id: 'fix', label: '보완' }, { id: 'stop', label: '막힘' }] });
+  const edges = [{ id: 'e1', source: 'impl', target: 'review' }, { id: 'e2', source: 'review', target: 'result' },
+    { id: 'e3', source: 'result', target: 'done', sourceHandle: 'pass' }, { id: 'e4', source: 'result', target: 'blocked', sourceHandle: 'stop' }];
+  const back = { id: 'back', source: 'result', target: 'impl', sourceHandle: 'fix', loop: { max: 2, exit: 'stop' } };
+  const graph = { version: 1 as const, id: 'looping', name: '반복', description: '', runId: '', nodes: [stage('impl'), stage('review'), result, stage('done'), stage('blocked')], edges: [...edges, back] };
+  const server = createApp(directory, bridge).listen(0, '127.0.0.1');
+  await new Promise<void>((resolve) => server.once('listening', resolve));
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const put = (doc: unknown) => fetch(`${base}/api/workflows/${(doc as { id: string }).id}`, { method: 'PUT', headers: json, body: JSON.stringify(doc) });
+  const errorOf = async (doc: unknown) => (await (await put(doc)).json()).error as string;
+  const decide = (outputs: string[]) => fetch(`${base}/api/workflows/looping/executions/run-l-1/decisions`, { method: 'POST', headers: json, body: JSON.stringify({ node: 'result', outputs }) });
+  try {
+    // Saving: a plain back edge is a cycle; a loop needs a limit, an exit, an exclusive branch output of its own, and a stage before it.
+    assert.match(await errorOf({ ...graph, edges: [...edges, { ...back, loop: undefined }] }), /순환합니다.*되돌아가기/);
+    assert.match(await errorOf({ ...graph, edges: [...edges, { ...back, loop: { max: 0, exit: 'stop' } }] }), /최대 반복/);
+    assert.match(await errorOf({ ...graph, edges: [...edges, { ...back, loop: { max: 2, exit: 'fix' } }] }), /다른 출력/);
+    assert.match(await errorOf({ ...graph, edges: [...edges, { ...back, sourceHandle: 'pass' }] }), /다른 연결을 둘 수 없습니다/);
+    assert.match(await errorOf({ ...graph, edges: [...edges, { ...back, target: 'done', sourceHandle: 'fix' }] }), /앞에 있는/);
+    assert.match(await errorOf({ ...graph, nodes: graph.nodes.map((node) => node.id === 'result' ? { ...result, data: { ...result.data, mode: 'inclusive' } } : node) }), /하나만/);
+    assert.equal((await put(graph)).status, 200);
+    const saved = await (await fetch(`${base}/api/workflows/looping`)).json();
+    assert.deepEqual(saved.edges.find((edge: { id: string }) => edge.id === 'back').loop, { max: 2, exit: 'stop' });
+
+    // Expanding a looping workflow through a link is refused; the brief carries the loop.
+    assert.equal((await put({ version: 1, id: 'outer', name: '바깥', description: '', runId: '', edges: [], nodes: [stage('link', { kind: 'workflow', workflowId: 'looping' })] })).status, 200);
+    assert.match((await (await fetch(`${base}/api/workflows/outer/execute`, { method: 'POST', headers: json, body: JSON.stringify({ count: 1, project: '/example/repo' }) })).json()).error, /되돌아가기 연결이 있습니다/);
+    assert.equal((await fetch(`${base}/api/workflows/looping/execute`, { method: 'POST', headers: json, body: JSON.stringify({ count: 1, project: '/example/repo' }) })).status, 200);
+    const [log] = await (await fetch(`${base}/api/workflows/looping/logs`)).json();
+    const brief = (await (await fetch(`${base}/api/workflows/looping/logs/${log.id}/files/brief.md`)).json()).text as string;
+    assert.match(brief, /"loops": \[\s*\{\s*"edge": "back",\s*"output": "fix",\s*"to": "impl",\s*"max": 2,\s*"exit": "stop",\s*"body": \[\s*"impl",\s*"review",\s*"result"\s*\]/);
+    assert.match(brief, /"nodeId": "impl",[\s\S]*?"after": \[\]/); // the loop edge is not a dependency
+    assert.match(brief, /executions\/<실행 id>\/bindings/);
+
+    assert.equal((await fetch(`${base}/api/workflows/looping/executions`, { method: 'PUT', headers: json, body: JSON.stringify({ runId: 'run-l', launch: log.id,
+      executions: [{ id: 'run-l-1', label: '#1', bindings: { impl: 't1', review: 't2', result: 't3', done: 't4', blocked: 't5' } }] }) })).status, 200);
+    const first = await (await decide(['fix'])).json();
+    assert.deepEqual(first.loop, { edge: 'back', to: 'impl', restart: ['impl', 'review', 'result'], pass: 2, max: 2, remaining: 1 });
+    assert.deepEqual(first.skippedTasks, []);
+    assert.equal((await (await decide(['fix'])).json()).loop.pass, 2); // a retried request does not go round again
+    const patch = (bindings: unknown) => fetch(`${base}/api/workflows/looping/executions/run-l-1/bindings`, { method: 'PATCH', headers: json, body: JSON.stringify({ bindings }) });
+    assert.equal((await patch({ nope: 't9' })).status, 400);
+    assert.deepEqual((await (await patch({ impl: 't6', review: 't7', result: 't8' })).json()).bindings, { done: 't4', blocked: 't5', impl: 't6', review: 't7', result: 't8' });
+    assert.equal((await (await decide(['fix'])).json()).loop.pass, 3);
+    await patch({ impl: 't9', review: 't10', result: 't11' });
+    const last = await (await decide(['fix'])).json();
+    assert.deepEqual(last.exhausted, { output: 'stop', max: 2 });
+    assert.deepEqual(last.decisions, { result: ['stop'] });
+    assert.deepEqual(last.skippedTasks, ['t4']);
+    const detail = await (await fetch(`${base}/api/workflows/looping/logs/${log.id}`)).json();
+    assert.equal(detail.meta.executions[0].tasks.length, 11);
+    assert.ok(detail.events.some((event: { type: string; message: string }) => event.type === 'note' && /되돌아가기 → impl 2회차/.test(event.message)));
+    assert.ok(detail.events.some((event: { type: string; message: string }) => event.type === 'note' && /최대 반복 2회를 다 써서 stop/.test(event.message)));
+  } finally {
+    await new Promise<void>((resolve, reject) => { server.close((error) => error ? reject(error) : resolve()); server.closeAllConnections(); });
+    await rm(directory, { recursive: true, force: true });
+  }
+});

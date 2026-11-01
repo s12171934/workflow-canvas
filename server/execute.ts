@@ -1,4 +1,4 @@
-import { asksAtRun, spawnsRuns, maxSpawnItems, resolveVariables, substituteVariables, variableRefs, createsWorktree, gateOutputs, defaultWorkerModel, launchesWorker, isBranch, isExecutable, isGroup, membershipOf, newWorktreeToken, orderNodes, parentWorktree, topologicalOrder, waves, worktreeRepo, type FlowStage, type StageNode, type Workflow, type Cleanup, defaultCleanup } from '../src/model.ts';
+import { asksAtRun, forwardEdges, loopBody, spawnsRuns, maxSpawnItems, resolveVariables, substituteVariables, variableRefs, createsWorktree, gateOutputs, defaultWorkerModel, launchesWorker, isBranch, isExecutable, isGroup, membershipOf, newWorktreeToken, orderNodes, parentWorktree, topologicalOrder, waves, worktreeRepo, type FlowStage, type StageNode, type Workflow, type Cleanup, defaultCleanup } from '../src/model.ts';
 
 export type BriefInput = {
   graph: Workflow;
@@ -87,6 +87,18 @@ export function checkSpawns(workflows: Workflow[], linked: Map<string, Workflow>
   }
 }
 
+/** Refuses expanding (wait/start) a linked workflow that loops: rounds are tracked per top-level stage. Spawn it instead. */
+export function checkLoops(workflows: Workflow[], linked: Map<string, Workflow>) {
+  for (const workflow of workflows) {
+    for (const node of workflow.nodes.filter((item) => item.data.kind === 'workflow' && !spawnsRuns(item))) {
+      const target = node.data.workflowId ? linked.get(node.data.workflowId) : undefined;
+      if (target?.edges.some((edge) => edge.loop)) {
+        throw new Error(`'${node.data.label || '링크'}' 링크가 펼칠 '${target.name}'에 되돌아가기 연결이 있습니다. 반복하는 워크플로는 「항목마다 따로 실행」으로 연결하거나 링크 없이 실행하세요.`);
+      }
+    }
+  }
+}
+
 /** Refuses {{key}} in instructions that the workflow does not declare as a setting (each workflow declares what it uses). */
 export function checkVariables(workflows: Workflow[]) {
   for (const workflow of workflows) {
@@ -138,7 +150,9 @@ type BriefStage = {
   wave: number;
   /** `output`: the edge leaves this output of a branch, so it is taken only when the branch chooses it. */
   after: { nodeId: string; output?: string; condition?: string }[];
-  branch?: { mode: string; judge: string; outputs: { id: string; label: string }[] };
+  branch?: { mode: string; judge: string; outputs: { id: string; label: string }[];
+    /** Outputs that go back: the stage they return to, how often at most, the output taken after that, and the stages run again. */
+    loops?: { edge: string; output: string; to: string; max: number; exit: string; body: string[] }[] };
   /** 'any': paths that split at a branch meet here; the stage runs if at least one arrives. Absent: every path is needed. */
   join?: 'any';
   /** This worker also decides these branches (judge 'previous'): it reports `decision: <output id>`. */
@@ -187,7 +201,7 @@ function stagesOf(graph: Workflow, ctx: BriefContext, fallback: string, prefix =
     if (source === 'agent' && group.data.nameFrom) namers.set(group.data.nameFrom, [...(namers.get(group.data.nameFrom) ?? []), base.location]);
     ctx.worktrees.push({ ...base, mode: 'create', name, ...(group.data.baseBranch ? { baseBranch: group.data.baseBranch } : {}), perExecution: !!group.data.perExecution });
   }
-  const stageEdges = graph.edges.filter((edge) => executable.has(edge.source) && executable.has(edge.target));
+  const stageEdges = forwardEdges(graph.edges).filter((edge) => executable.has(edge.source) && executable.has(edge.target));
   const { order } = topologicalOrder([...executable], stageEdges);
   const wave = waves(order, stageEdges);
   const byId = new Map(graph.nodes.map((node) => [node.id, node]));
@@ -212,7 +226,15 @@ function stagesOf(graph: Workflow, ctx: BriefContext, fallback: string, prefix =
           ...(edge.label || output ? { condition: String(edge.label || output!.label) } : {}) };
       }),
       ...(isBranch(node) ? { branch: { mode: node.data.mode ?? 'exclusive', judge: node.data.judge ?? 'previous',
-        outputs: (node.data.outputs ?? []).map((output) => ({ id: output.id, label: output.label })) } } : {}),
+        outputs: (node.data.outputs ?? []).map((output) => ({ id: output.id, label: output.label })),
+        ...(() => {
+          const loops = graph.edges.filter((edge) => edge.loop && edge.source === node.id && edge.sourceHandle).map((edge) => {
+            const body = new Set(loopBody(graph.edges, edge));
+            return { edge: edge.id, output: edge.sourceHandle!, to: `${prefix}${edge.target}`, max: edge.loop!.max, exit: edge.loop!.exit,
+              body: order.filter((id) => body.has(id)).map((id) => `${prefix}${id}`) };
+          });
+          return loops.length ? { loops } : {};
+        })() } } : {}),
       ...(node.data.kind === 'gate' ? { branch: { mode: 'exclusive', judge: node.data.asker === 'previous' ? 'previous' : 'user', outputs: gateOutputs } } : {}),
       ...(node.data.join === 'any' ? { join: 'any' as const } : {}),
       ...(() => {
@@ -252,7 +274,8 @@ function flatten(stages: BriefStage[]): FlowStage[] {
     : [{ id: stage.nodeId, after: resolve(stage.after), label: stage.label, question: stage.instructions,
       ...(stage.branch ? { branch: { mode: stage.branch.mode as 'exclusive' | 'inclusive', outputs: stage.branch.outputs.map((output) => output.id) },
         judge: stage.branch.judge as 'previous' | 'worker' | 'user', outputLabels: Object.fromEntries(stage.branch.outputs.map((output) => [output.id, output.label])) } : {}),
-      ...(stage.kind === 'gate' ? { veto: ['reject'] } : {}), ...(stage.join ? { join: stage.join } : {}) }]);
+      ...(stage.kind === 'gate' ? { veto: ['reject'] } : {}), ...(stage.join ? { join: stage.join } : {}),
+      ...(stage.branch?.loops ? { loops: stage.branch.loops } : {}) }]);
 }
 /** The executable graph of a run, links expanded, with brief stage ids (the keys of decisions and skipped). */
 export function flowOf(graph: Workflow, linked: Map<string, Workflow>): FlowStage[] {
@@ -363,6 +386,13 @@ ${worktreeSection}
        --data '{"node":"<링크 nodeId>","project":"${workspace}","items":["<항목>", ...]}'
      \`\`\`
      캔버스가 항목마다 대상 워크플로의 코디네이터를 따로 띄우고(항목 = 대상의 실행 시 입력 워크트리 이름) \`results\` 를 돌려준다. 이 실행에서 이미 요청한 항목은 다시 띄우지 않는다. 응답 \`results\` 를 그대로 산출물 \`<n>-<링크 nodeId>.txt\` 에 쓰고, 링크 Task 를 \`task-update --status completed --result "요청 <성공 수>건 · 실패 <실패 수>건"\` 으로 닫은 뒤 다음 단계를 띄운다. 일부 항목이 실패해도 막지 않는다(뒤 단계가 산출물로 처리한다). 요청 자체가 400 이면 오류를 실행 로그 \`error\` 로 남기고 링크 Task 를 blocked 로 둔다. 따로 띄운 실행은 이 실행의 일부가 아니다 — 기다리지 않고, 정리하지도 않는다.
+   - **되돌아가기(\`branch.loops\` 의 출력)**: 판정은 다른 출력과 똑같이 "판정 등록" 으로 보낸다. 응답이 회차를 알려 준다.
+     - 응답에 \`loop\` 가 있으면 되돌아간 것이다: 분기 Task 를 \`task-update --status completed --result "decision: <출력 id> · <loop.pass - 1>회차 종료"\` 로 닫고, \`loop.restart\` 의 단계(순서대로)마다 **새 Task** 를 만든다 — title·display-name "<단계 이름> #<n> · <loop.pass>회차", deps 는 같은 회차에 새로 만든 선행 단계 Task(첫 단계 \`loop.to\` 는 deps 없음). 앞 회차 Task 는 그대로 둔다. 만든 Task 를 아래처럼 등록한 뒤 진행 규칙대로 \`loop.to\` 부터 띄운다. 이후 이 단계들의 완료·판정은 새 Task 기준이다.
+       \`\`\`sh
+       curl -s -X PATCH -H 'Content-Type: application/json' ${apiBase}/api/workflows/${graph.id}/executions/<실행 id>/bindings \\
+         --data '{"bindings":{"<nodeId>":"<새 task_id>", ...}}'
+       \`\`\`
+     - 응답에 \`exhausted\` 가 있으면 최대 반복 횟수를 다 써서 판정이 \`exhausted.output\` 으로 바뀌어 기록된 것이다. 그 출력으로 판정 반영을 하고, 실행 로그 \`note\` 에 남긴다.
    - **판정 등록**: 응답의 \`skippedTasks\` 는 지금까지의 판정으로 더 이상 갈 수 없게 된 단계의 Task 다.
      \`\`\`sh
      curl -s -X POST -H 'Content-Type: application/json' ${apiBase}/api/workflows/${graph.id}/executions/<실행 id>/decisions \\
@@ -393,6 +423,7 @@ curl -s -X POST -H 'Content-Type: application/json' ${logUrl} \\
 - 단계에 \`decides\` 가 있으면 spec 에 그 분기의 출력 목록(id·조건)과 "작업을 마치면 조건에 맞는 출력을 고르고(\`mode: exclusive\` 면 하나만) worker_done 첫 줄에 \`decision: <출력 id>\` 로 보고한다. 판정은 한 번만 내고 재실행해 결과를 고르지 않는다" 를 넣는다. \`namesWorktree\` 도 있으면 \`worktree:\` 줄을 그다음 줄에 쓴다.
 - \`decides\` 항목에 \`ask\` 가 있으면(이 워커 뒤의 게이트를 이 워커가 묻는다) spec 에 다음을 넣는다: "작업을 마치면 worker_done 을 보내기 전에 이 터미널에서 사용자에게 \`ask\` 를 묻는다. 결과 요약과 산출물 경로를 함께 보여 주고, 통과(approve)·거절(reject) 중 하나를 고르게 한다. 사용자가 답할 때까지 기다리며, 그사이 사용자가 묻거나 고쳐 달라는 것은 작업 범위 안에서 반영한다. 답을 받으면 worker_done 첫 줄에 \`decision: approve\` 또는 \`decision: reject\` 로 보고한다. 코디네이터가 사용자가 이미 골랐다고 알려 오면 묻기를 멈추고 그 결정으로 보고한다."
 - 단계에 \`reportsItems\` 가 있으면 spec 에 "작업을 마치면 다음 단계가 따로 실행할 항목(각각 대상 워크플로의 워크트리 이름이 된다 — 영문·숫자·\`.\`·\`_\`·\`-\`)을 worker_done 에 \`items: <항목>, <항목>, ...\` 한 줄로 보고한다. 없으면 \`items:\` 만 쓴다" 를 넣는다. \`decision:\`·\`worktree:\` 줄이 있으면 그다음 줄에 쓴다.
+- 되돌아가기로 다시 띄우는 단계(2회차 이상)의 spec 에는 "<회차>회차다. 이 단계의 앞 회차 산출물과, 되돌아오게 한 분기를 판정한 단계의 산출물을 먼저 읽고 그 지적을 반영한다" 를 넣고, 산출물은 \`${artifactDir}/<n>-<nodeId>-r<회차>.txt\` 에 쓴다(1회차는 위 이름 그대로).
 - worker_done 본문은 3줄 이하: 결과, 산출물 경로, 결정이 필요한 것.
 
 ## 완료 시 정리 (사용자가 실행할 때 고른 설정)

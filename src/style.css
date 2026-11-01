@@ -446,3 +446,4 @@ button.run-chip:hover { border-color:#76d8bc; color:#e3f6ef; }
 .generate-actions { display:flex; justify-content:flex-end; gap:6px; }
 .field-help.generating { display:flex; align-items:center; gap:6px; }
 .empty-actions { display:flex; gap:8px; justify-content:center; flex-wrap:wrap; }
+.round-badge { margin-left:6px; padding:1px 6px; border:1px solid #5b4a7a; border-radius:999px; font-size:9px; color:#d9c7fb; background:#251d33; }
