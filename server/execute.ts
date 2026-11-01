@@ -1,4 +1,4 @@
-import { createsWorktree, gateOutputs, defaultWorkerModel, launchesWorker, isBranch, isExecutable, isGroup, membershipOf, newWorktreeToken, orderNodes, parentWorktree, topologicalOrder, waves, worktreeRepo, type FlowStage, type StageNode, type Workflow, type Cleanup, defaultCleanup } from '../src/model.ts';
+import { asksAtRun, spawnsRuns, maxSpawnItems, createsWorktree, gateOutputs, defaultWorkerModel, launchesWorker, isBranch, isExecutable, isGroup, membershipOf, newWorktreeToken, orderNodes, parentWorktree, topologicalOrder, waves, worktreeRepo, type FlowStage, type StageNode, type Workflow, type Cleanup, defaultCleanup } from '../src/model.ts';
 
 export type BriefInput = {
   graph: Workflow;
@@ -64,6 +64,27 @@ export function checkGroups(workflows: Workflow[]) {
   }
 }
 
+/**
+ * Refuses spawn links that could not be carried out: the one worker in front reports the items, and the target takes each
+ * item as its single run-time worktree name.
+ */
+export function checkSpawns(workflows: Workflow[], linked: Map<string, Workflow>) {
+  for (const workflow of workflows) {
+    const where = workflows.length > 1 ? `'${workflow.name}'의 ` : '';
+    const executable = new Map(workflow.nodes.filter(isExecutable).map((node) => [node.id, node]));
+    for (const node of workflow.nodes.filter(spawnsRuns)) {
+      const name = `${where}'${node.data.label || '링크'}'`;
+      const sources = workflow.edges.filter((edge) => edge.target === node.id && executable.has(edge.source)).map((edge) => executable.get(edge.source)!);
+      if (sources.length !== 1 || sources[0].data.kind !== 'worker') throw new Error(`${name} 링크가 항목마다 따로 실행하려면 항목 목록을 보고할 워커 하나만 앞에 연결해야 합니다.`);
+      const target = node.data.workflowId ? linked.get(node.data.workflowId) : undefined;
+      const inputs = target?.nodes.filter(asksAtRun) ?? [];
+      if (target && inputs.length !== 1) {
+        throw new Error(`${name} 링크의 대상 '${target.name}'에는 항목을 받을 「실행 시 입력」 워크트리 그룹이 정확히 하나 있어야 합니다(지금 ${inputs.length}개).`);
+      }
+    }
+  }
+}
+
 type WorktreeSpec = {
   location: string; group: string; mode: 'existing' | 'create'; repo: string; parent?: string;
   existing?: { path: string; name?: string; branch?: string };
@@ -117,6 +138,10 @@ type BriefStage = {
   effort?: string;
   /** `wait: false`: stages after this link do not wait for its sub-graph; they follow the link's own predecessors. */
   workflow?: { id: string; name: string; wait: boolean; stages: BriefStage[] };
+  /** A link that is not expanded: it requests one separate 실행 of the target per item its predecessor reports. */
+  spawn?: { workflowId: string; name: string; input: string };
+  /** This worker reports the items for these spawn links (`items:` line of worker_done). */
+  reportsItems?: string[];
 };
 
 type BriefContext = { linked: Map<string, Workflow>; project: string; inputs: Record<string, string>; worktrees: WorktreeSpec[] };
@@ -155,7 +180,10 @@ function stagesOf(graph: Workflow, ctx: BriefContext, fallback: string, prefix =
     const { project, worktrees } = membershipOf(graph, node);
     const inner = worktrees[worktrees.length - 1];
     const location = inner ? groupLocation(inner, prefix) : project?.data.path || fallback;
-    const sub = node.data.kind === 'workflow' && node.data.workflowId ? ctx.linked.get(node.data.workflowId) : undefined;
+    const target = node.data.kind === 'workflow' && node.data.workflowId ? ctx.linked.get(node.data.workflowId) : undefined;
+    const sub = spawnsRuns(node) ? undefined : target;
+    const spawnTarget = spawnsRuns(node) ? target : undefined;
+    const feeds = stageEdges.filter((edge) => edge.source === node.id).map((edge) => byId.get(edge.target)!).filter(spawnsRuns);
     return {
       nodeId: `${prefix}${node.id}`, label: node.data.label, kind: node.data.kind, instructions: node.data.description, location,
       wave: wave.get(node.id) ?? 0,
@@ -182,6 +210,8 @@ function stagesOf(graph: Workflow, ctx: BriefContext, fallback: string, prefix =
       ...(namers.has(node.id) ? { namesWorktree: namers.get(node.id) } : {}),
       ...(launchesWorker(node) ? { model: node.data.workerModel || defaultWorkerModel, ...(node.data.effort ? { effort: node.data.effort } : {}) } : {}),
       ...(sub ? { workflow: { id: sub.id, name: sub.name, wait: node.data.linkMode !== 'start', stages: stagesOf(sub, ctx, location, `${prefix}${node.id}.`) } } : {}),
+      ...(spawnTarget ? { spawn: { workflowId: spawnTarget.id, name: spawnTarget.name, input: spawnTarget.nodes.find(asksAtRun)?.id ?? '' } } : {}),
+      ...(feeds.length ? { reportsItems: feeds.map((item) => `${prefix}${item.id}`) } : {}),
     };
   });
 }
@@ -263,6 +293,7 @@ ${JSON.stringify(worktrees, null, 2)}
   - 들어오는 연결이 여럿인 단계: 기본은 **모두 필요**다. 앞 경로 중 하나라도 건너뛰어지면(고르지 않은 분기 출력, 건너뛴 단계) 이 단계도 건너뛴다. \`join: any\` 인 단계는 분기에서 갈라진 경로가 다시 모이는 곳이라 하나라도 오면 진행한다. 어느 쪽이든 건너뜀 계산은 캔버스가 하고, 너는 건너뛰지 않은 선행이 모두 끝났을 때 띄운다.
   - \`gate\`: 사용자 개입 게이트. 워커를 띄우지 않는다. 출력이 \`approve\`(통과)·\`reject\`(거절) 두 개인 사용자 결정이다. 게이트에서 나가는 연결은 모두 \`approve\` 출력이다. \`branch.judge\` 가 \`user\` 면 코디네이터(캔버스 결정 대기 카드)가 묻고, \`previous\` 면 직전 워커가 자기 터미널에서 사용자에게 묻는다(그 워커의 \`decides\` 에 \`ask\` 로 들어 있다).
   - \`branch\`: 분기. 어느 출력으로 갈지 판정만 한다. \`branch.mode\` 가 \`exclusive\` 면 출력 하나, \`inclusive\` 면 조건에 맞는 출력 모두(하나 이상)를 고른다. \`branch.judge\` 가 판정 주체다: \`previous\` 직전 워커, \`worker\` 판정 전용 워커, \`user\` 사용자. \`after\` 항목에 \`output\` 이 있으면 그 분기가 그 출력을 골랐을 때만 이어지는 연결이다.
+  - \`workflow\` 이고 \`spawn\` 이 있는 단계: **펼치지 않는다.** 대상 워크플로를 항목마다 **따로 실행 요청**하는 단계다. 워커를 띄우지 않는다. 아래 "항목마다 따로 실행" 을 따른다.
   - \`workflow\`: 다른 워크플로로의 링크. \`workflow.stages\` 를 그 자리에 펼쳐 실행한다. 펼친 첫 단계들은 링크의 선행 단계를 deps 로 갖는다. \`workflow.wait\` 가 \`true\` 면 링크의 후행 단계는 펼친 마지막 단계들을 deps 로 갖고(끝날 때까지 대기), \`false\` 면 펼친 단계를 기다리지 않고 링크의 선행 단계를 deps 로 갖는다(시작만 하고 진행. 펼친 단계는 따로 끝까지 돌고, 실행은 그것까지 끝나야 끝난다). 펼친 단계의 \`nodeId\` 는 \`<링크 nodeId>.<하위 nodeId>\` 꼴이다.
 
 \`\`\`json
@@ -281,7 +312,7 @@ ${worktreeSection}
    curl -s -X PUT -H 'Content-Type: application/json' ${apiBase}/api/workflows/${graph.id}/executions \\
      --data '{"runId":"<run_id>",${launchId ? `"launch":"${launchId}",` : ''}"executions":[{"id":"<run_id>-1","label":"#1","bindings":{"<nodeId>":"<task_id>", ...},"links":{"<링크 nodeId>":{"<하위 경로>":"<task_id>", ...}}${automationJson.replace(/'/g, '')}}, ...]}'
    \`\`\`
-   - \`bindings\` 에는 최상위 \`worker\`·\`gate\`·\`branch\` 단계만 넣는다. 링크 아래 펼친 단계는 \`links\` 에 **최상위 링크 nodeId** 를 키로, 그 아래 \`nodeId\` 에서 링크 접두사를 뗀 경로(예: \`sub\`, 중첩이면 \`sub.inner\`)를 키로 넣는다. 링크가 없으면 \`links\` 는 생략한다.
+   - \`bindings\` 에는 최상위 \`worker\`·\`gate\`·\`branch\` 단계와 \`spawn\` 링크 단계만 넣는다. 링크 아래 펼친 단계는 \`links\` 에 **최상위 링크 nodeId** 를 키로, 그 아래 \`nodeId\` 에서 링크 접두사를 뗀 경로(예: \`sub\`, 중첩이면 \`sub.inner\`)를 키로 넣는다. 링크가 없으면 \`links\` 는 생략한다.
    - 실행 id 는 \`<run_id>-<n>\` 이다(같은 워크플로의 다른 요청이 동시에 돌 수 있어 Run 마다 달라야 한다). 아래 \`<실행 id>\` 는 이 값이다.${launchId ? `
    - \`launch\` 는 이 실행 요청의 실행 로그 ID 다. 그대로 보낸다.` : ''}
    응답이 200 이 아니면 오류 메시지를 읽고 고쳐서 다시 보낸다.
@@ -307,6 +338,12 @@ ${worktreeSection}
        \`\`\`
        새로 생긴 판정은 \`gate-resolve --resolution "<출력 id>"\` 로 게이트를 닫고 "판정 반영" 을 한다.
      - 사용자가 이 터미널에 직접 답하면 그 답을 "판정 등록" 으로 보낸다. 409 면 캔버스에서 먼저 고른 것이므로 등록된 판정을 따른다.
+   - **항목마다 따로 실행(\`spawn\` 이 있는 단계)**: 선행 워커가 끝나면, 그 worker_done 의 \`items: <항목>, <항목>, ...\` 줄을 항목 목록으로 읽는다(줄이 없거나 비었으면 빈 목록). 항목을 고치거나 더하지 않는다. 한 번에 ${maxSpawnItems}개까지 보낸다.
+     \`\`\`sh
+     curl -s -X POST -H 'Content-Type: application/json' ${apiBase}/api/workflows/${graph.id}/executions/<실행 id>/spawn \\
+       --data '{"node":"<링크 nodeId>","project":"${workspace}","items":["<항목>", ...]}'
+     \`\`\`
+     캔버스가 항목마다 대상 워크플로의 코디네이터를 따로 띄우고(항목 = 대상의 실행 시 입력 워크트리 이름) \`results\` 를 돌려준다. 이 실행에서 이미 요청한 항목은 다시 띄우지 않는다. 응답 \`results\` 를 그대로 산출물 \`<n>-<링크 nodeId>.txt\` 에 쓰고, 링크 Task 를 \`task-update --status completed --result "요청 <성공 수>건 · 실패 <실패 수>건"\` 으로 닫은 뒤 다음 단계를 띄운다. 일부 항목이 실패해도 막지 않는다(뒤 단계가 산출물로 처리한다). 요청 자체가 400 이면 오류를 실행 로그 \`error\` 로 남기고 링크 Task 를 blocked 로 둔다. 따로 띄운 실행은 이 실행의 일부가 아니다 — 기다리지 않고, 정리하지도 않는다.
    - **판정 등록**: 응답의 \`skippedTasks\` 는 지금까지의 판정으로 더 이상 갈 수 없게 된 단계의 Task 다.
      \`\`\`sh
      curl -s -X POST -H 'Content-Type: application/json' ${apiBase}/api/workflows/${graph.id}/executions/<실행 id>/decisions \\
@@ -336,6 +373,7 @@ curl -s -X POST -H 'Content-Type: application/json' ${logUrl} \\
 - 산출물·로그는 \`${artifactDir}/<n>-<nodeId>.txt\` 에 쓴다.
 - 단계에 \`decides\` 가 있으면 spec 에 그 분기의 출력 목록(id·조건)과 "작업을 마치면 조건에 맞는 출력을 고르고(\`mode: exclusive\` 면 하나만) worker_done 첫 줄에 \`decision: <출력 id>\` 로 보고한다. 판정은 한 번만 내고 재실행해 결과를 고르지 않는다" 를 넣는다. \`namesWorktree\` 도 있으면 \`worktree:\` 줄을 그다음 줄에 쓴다.
 - \`decides\` 항목에 \`ask\` 가 있으면(이 워커 뒤의 게이트를 이 워커가 묻는다) spec 에 다음을 넣는다: "작업을 마치면 worker_done 을 보내기 전에 이 터미널에서 사용자에게 \`ask\` 를 묻는다. 결과 요약과 산출물 경로를 함께 보여 주고, 통과(approve)·거절(reject) 중 하나를 고르게 한다. 사용자가 답할 때까지 기다리며, 그사이 사용자가 묻거나 고쳐 달라는 것은 작업 범위 안에서 반영한다. 답을 받으면 worker_done 첫 줄에 \`decision: approve\` 또는 \`decision: reject\` 로 보고한다. 코디네이터가 사용자가 이미 골랐다고 알려 오면 묻기를 멈추고 그 결정으로 보고한다."
+- 단계에 \`reportsItems\` 가 있으면 spec 에 "작업을 마치면 다음 단계가 따로 실행할 항목(각각 대상 워크플로의 워크트리 이름이 된다 — 영문·숫자·\`.\`·\`_\`·\`-\`)을 worker_done 에 \`items: <항목>, <항목>, ...\` 한 줄로 보고한다. 없으면 \`items:\` 만 쓴다" 를 넣는다. \`decision:\`·\`worktree:\` 줄이 있으면 그다음 줄에 쓴다.
 - worker_done 본문은 3줄 이하: 결과, 산출물 경로, 결정이 필요한 것.
 
 ## 완료 시 정리 (사용자가 실행할 때 고른 설정)

@@ -312,3 +312,19 @@ test('executions of several Runs: each keeps its Run and inputs, and one merged 
   assert.deepEqual(graph.executions.map((execution) => nodeExecutionStatus(stage, execution, merged, false)), ['completed', 'running']);
   assert.equal(mergeSnapshots([]), null);
 });
+test('a spawn link reads its own Task and shows the items it requested; saving keeps its mode and requests', () => {
+  const graph = newWorkflow();
+  const link = { id: 'fan', type: 'stage' as const, position: { x: 0, y: 0 }, data: { label: '티켓마다', description: '', kind: 'workflow' as const, workflowId: 'per-ticket', linkMode: 'spawn' as const } };
+  graph.nodes = [...graph.nodes, link];
+  const spawned = { fan: [{ item: 'ABC-1', at: '2026-01-01T00:00:00Z', workflowId: 'per-ticket', launch: 'L1' }, { item: 'ABC-2', at: '2026-01-01T00:00:00Z', workflowId: 'per-ticket', error: '실패' }] };
+  graph.executions = [{ id: 'run-p-1', label: '#1', bindings: { fan: 'task-fan' }, runId: 'run-p', spawned }];
+  const snapshot = { run: { id: 'run-p', objective: 'p', updatedAt: '' }, observedAt: '', workers: [],
+    tasks: [{ id: 'task-fan', title: 'fan', spec: '', status: 'completed', deps: [] }] } as RunSnapshot;
+  assert.equal(nodeExecutionStatus(link, graph.executions[0], snapshot, false), 'completed');
+  const [projected] = projectNodes([link], snapshot, false, graph.executions, 'run-p-1');
+  assert.deepEqual(projected.data.spawned?.map((item) => item.item), ['ABC-1', 'ABC-2']);
+  const saved = serializableWorkflow(graph);
+  assert.equal(saved.nodes.find((node) => node.id === 'fan')!.data.linkMode, 'spawn');
+  assert.equal(saved.nodes.find((node) => node.id === 'fan')!.data.spawned, undefined);
+  assert.equal(saved.executions![0].spawned!.fan.length, 2);
+});

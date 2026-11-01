@@ -405,6 +405,9 @@ button.run-chip:hover { border-color:#76d8bc; color:#e3f6ef; }
 .join-meta { color:#9fc3d9; background:#7fb0f514; border-color:#7fb0f533; }
 .decision-asker { display:flex; align-items:center; gap:6px; flex-wrap:wrap; margin:4px 0 8px; color:#9fb6c6; font-size:11px; line-height:1.4; }
 .decision-asker span { flex:1 1 160px; }
+.spawn-chips { display:flex; flex-wrap:wrap; gap:4px; margin:6px 0 2px; }
+.spawn-chip { padding:1px 7px; border:1px solid #2f5a54; border-radius:999px; font-size:10px; color:#8fd8cb; background:#16302c; }
+.spawn-chip.failed { border-color:#6b3434; color:#f0a0a0; background:#2e1a1a; }
 .link-mode { margin-left:6px; padding:1px 6px; border:1px solid #2f5a54; border-radius:999px; font-size:9px; color:#8fd8cb; }
 /* Natural-language generation */
 .generate-open { justify-self:start; margin-top:6px; }

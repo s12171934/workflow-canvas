@@ -45,7 +45,7 @@ ${input.request}
   - \`worker\`: 워커 하나가 지침을 수행. \`description\` 은 그 워커가 이것만 읽고 일할 수 있는 브리프다(목표, 작업 범위, 제약, 완료 조건, 산출물).
   - \`gate\`: 사용자 승인. \`description\` 은 사용자에게 물을 내용. 출력은 통과·거절이고 거절하면 뒤 단계를 모두 건너뛴다. \`asker: "previous"\` 면 앞에 연결된 워커 하나가 자기 터미널에서 묻는다(앞에 워커가 정확히 하나여야 함). 없으면 캔버스에서 묻는다.
   - \`branch\`: 조건에 따라 출력 하나(\`mode: "exclusive"\`) 또는 여럿(\`"inclusive"\`)으로만 진행. \`outputs\` 는 두 개 이상 \`[{"id":"pass","label":"<이 출력을 고르는 조건>"}]\`. \`judge\` 는 \`previous\`(앞의 워커 하나가 판정, 앞에 워커가 정확히 하나여야 함)·\`worker\`(판정 전용 워커)·\`user\`(사용자). 분기에서 나가는 연결에는 \`sourceHandle\` 로 출력 id 를 적는다.
-  - \`workflow\`: 저장된 다른 워크플로를 그 자리에 펼쳐 실행. \`workflowId\` 는 아래 목록에서만 고른다. \`linkMode: "start"\` 면 뒤 단계가 기다리지 않는다.
+  - \`workflow\`: 저장된 다른 워크플로를 그 자리에 펼쳐 실행. \`workflowId\` 는 아래 목록에서만 고른다. \`linkMode: "start"\` 면 뒤 단계가 기다리지 않는다. \`linkMode: "spawn"\` 이면 펼치지 않고, 앞의 워커 하나가 worker_done 에 \`items: a, b\` 로 보고한 항목마다 대상 워크플로를 따로 실행한다(항목 = 대상의 「실행 시 입력」 워크트리 이름. 대상에 그런 그룹이 정확히 하나 있어야 한다).
   - \`note\`: 실행과 무관한 메모.
 - 분기에서 갈라진 경로가 다시 모이는 단계는 \`join: "any"\` 로 둔다(하나라도 오면 진행).
 - 워커·판정 워커 단계는 필요할 때만 \`workerModel\`(${workerModels.join(', ')}; 없으면 ${defaultWorkerModel})과 \`effort\`(${effortLevels.join(', ')}; 없으면 모델 기본)를 지정한다. 단순 작업은 가벼운 모델, 설계·검토처럼 깊은 판단은 높은 effort.

@@ -5,10 +5,10 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { createStorage, validId, validateWorkflow } from './storage.ts';
-import { buildBrief, checkBranches, checkGroups, flowOf, linkedWorkflows } from './execute.ts';
+import { buildBrief, checkBranches, checkGroups, checkSpawns, flowOf, linkedWorkflows } from './execute.ts';
 import { briefPrompt, generatedWorkflow, generationTimeoutMs, maxPromptLength, workflowPrompt, type Generation } from './generate.ts';
 import { coordinatorEventTypes, createRunLog, launchDirName } from './runlog.ts';
-import { decisionError, executionResults, executionRun, executionTasks, inputsKey, loggedExecutions, skippedStages, type Execution, type RunLogDetail } from '../src/model.ts';
+import { decisionError, executionResults, executionRun, maxSpawnItems, spawnsRuns, type SpawnResult, executionTasks, inputsKey, loggedExecutions, skippedStages, type Execution, type RunLogDetail } from '../src/model.ts';
 import { defaultCleanup, type AutomationConfig, type AutomationState, type Cleanup, asksAtRun, executionFinished, executionStatuses, isExecutable, worktreeNamePattern, type RunSnapshot, type Workflow } from '../src/model.ts';
 
 /** Minimum gap between two 실행 requests for the same workflow, so a double click cannot start two coordinators. */
@@ -172,7 +172,9 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
     // Every skipped Task, not only the new ones, so a retried request still tells the coordinator what to close.
     res.json({ decisions: updated.decisions, skipped: updated.skipped, skippedTasks: executionTasks(updated, updated.skipped) });
   });
-  type RunSettings = { count: number; project: string; inputs: Record<string, string>; cleanup: Cleanup; automation?: { id: string; name: string } };
+  type RunSettings = { count: number; project: string; inputs: Record<string, string>; cleanup: Cleanup; automation?: { id: string; name: string };
+    /** Set when another workflow's spawn link asked for this run: shown in the execution log. */
+    origin?: string };
   class RunError extends Error { constructor(readonly status: number, message: string) { super(message); } }
 
   /** Checks a run request against the saved graph and Orca; never trusts a path or name the client sends without checking it. */
@@ -204,7 +206,7 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
   async function prepareRun(id: string, graph: Workflow, settings: RunSettings, apiBase: string): Promise<{ briefPath: string; logId: string; launchKey: string }> {
     if (!graph.nodes.some(isExecutable)) throw new RunError(400, '실행할 단계가 없습니다.');
     let linked: Map<string, Workflow>;
-    try { linked = await linkedWorkflows(graph, (linkId) => storage.load(linkId)); checkGroups([graph, ...linked.values()]); checkBranches([graph, ...linked.values()]); }
+    try { linked = await linkedWorkflows(graph, (linkId) => storage.load(linkId)); checkGroups([graph, ...linked.values()]); checkBranches([graph, ...linked.values()]); checkSpawns([graph, ...linked.values()], linked); }
     catch (error) { throw new RunError(400, (error as Error).message); }
     // Requests with different run-time inputs (one per ticket, say) run side by side; the same inputs never overlap.
     const inputs = inputsKey(settings.inputs);
@@ -235,7 +237,8 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
       await runlog.start(logId, { workflowId: id, workflowName: graph.name, startedAt: startedAt.toISOString(), count: settings.count,
         project: settings.project, ...(settings.automation ? { automation: settings.automation } : {}),
         ...(inputs !== '[]' ? { inputs: Object.fromEntries(Object.entries(settings.inputs).filter(([, value]) => value)) } : {}) });
-      await runlog.append(logId, { type: 'requested', message: `${settings.automation ? `자동화 「${settings.automation.name}」` : '실행 버튼'} · ${settings.count}회 · ${settings.project}` });
+      await runlog.append(logId, { type: 'requested', message: `${settings.origin ?? (settings.automation ? `자동화 「${settings.automation.name}」` : '실행 버튼')} · ${settings.count}회 · ${settings.project}`
+        + (Object.values(settings.inputs).some(Boolean) ? ` · 입력 ${Object.values(settings.inputs).filter(Boolean).join('·')}` : '') });
       const briefPath = join(artifactDir, 'brief.md');
       await writeFile(briefPath, buildBrief({ graph, linked, count: settings.count, apiBase, workspace: settings.project, artifactDir,
         logUrl: `${apiBase}/api/workflows/${id}/logs/${logId}/events`, launchId: logId,
@@ -249,25 +252,74 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
     return false;
   }
 
+  /** Writes the brief and launches the coordinator in Orca: the 실행 button, and every item of a spawn link. */
+  async function startRun(id: string, graph: Workflow, settings: RunSettings, apiBase: string): Promise<string> {
+    const { briefPath, logId, launchKey } = await prepareRun(id, graph, settings, apiBase);
+    try {
+      const { terminal } = await bridge.launchCoordinator(settings.project, `${briefPath} 파일의 브리프를 읽고 그대로 수행해줘. 워크플로 "${graph.name}"을(를) ${settings.count}회 실행하는 코디네이터 역할이다.`);
+      await runlog.append(logId, { type: 'coordinator', message: `코디네이터 기동${terminal ? ` · ${terminal}` : ''}` }).catch(() => {});
+      const given = Object.values(settings.inputs).filter(Boolean).join('·');
+      if (terminal) await bridge.renameTerminal(terminal, `${graph.name}${given ? ` ${given}` : ''} ×${settings.count} · 코디네이터`).catch(() => {});
+    } catch (error) {
+      launches.delete(launchKey);
+      await runlog.append(logId, { type: 'coordinator-failed', message: `코디네이터 기동 실패: ${(error as Error).message}` }).catch(() => {});
+      throw error;
+    }
+    return logId;
+  }
+
   app.post('/api/workflows/:id/execute', async (req, res) => {
     const id = req.params.id;
     if (!validId(id)) { res.status(400).json({ error: '올바르지 않은 워크플로 ID입니다.' }); return; }
     const graph = await storage.load(id);
     try {
-      const settings = await settingsFor(graph, req.body ?? {});
-      const { briefPath, logId, launchKey } = await prepareRun(id, graph, settings, `http://${req.get('host')}`);
-      try {
-        const { terminal } = await bridge.launchCoordinator(settings.project, `${briefPath} 파일의 브리프를 읽고 그대로 수행해줘. 워크플로 "${graph.name}"을(를) ${settings.count}회 실행하는 코디네이터 역할이다.`);
-        await runlog.append(logId, { type: 'coordinator', message: `코디네이터 기동${terminal ? ` · ${terminal}` : ''}` }).catch(() => {});
-        const given = Object.values(settings.inputs).filter(Boolean).join('·');
-        if (terminal) await bridge.renameTerminal(terminal, `${graph.name}${given ? ` ${given}` : ''} ×${settings.count} · 코디네이터`).catch(() => {});
-      } catch (error) {
-        launches.delete(launchKey);
-        await runlog.append(logId, { type: 'coordinator-failed', message: `코디네이터 기동 실패: ${(error as Error).message}` }).catch(() => {});
-        throw error;
-      }
+      await startRun(id, graph, await settingsFor(graph, req.body ?? {}), `http://${req.get('host')}`);
       res.json({ launched: true });
     } catch (error) { if (!sendRunError(res, error)) throw error; }
+  });
+
+  // Used by the coordinator at a spawn link: one separate 실행 of the link's target per item (the item is the target's
+  // run-time worktree name). Items this execution already requested are not started again; failures are reported per item.
+  app.post('/api/workflows/:id/executions/:executionId/spawn', async (req, res) => {
+    const { id, executionId } = req.params;
+    if (!validId(id) || !validId(executionId)) { res.status(400).json({ error: '올바르지 않은 워크플로 또는 실행 ID입니다.' }); return; }
+    const { node, project, items } = req.body ?? {};
+    if (typeof node !== 'string' || !validId(node) || typeof project !== 'string' || !Array.isArray(items) || items.length > maxSpawnItems
+      || items.some((item) => typeof item !== 'string' || !worktreeNamePattern.test(item))) {
+      res.status(400).json({ error: `{"node":"<링크 nodeId>","project":"<실행 프로젝트>","items":["<항목>", ...]} 형식이어야 합니다. 항목은 ${maxSpawnItems}개까지, 영문·숫자·. _ - 만 쓴다.` }); return;
+    }
+    const graph = await storage.load(id);
+    const execution = graph.executions?.find((item) => item.id === executionId);
+    if (!execution) { res.status(404).json({ error: '이 워크플로에 등록된 실행이 아닙니다.' }); return; }
+    const link = graph.nodes.find((item) => item.id === node);
+    if (!link || !spawnsRuns(link) || !link.data.workflowId) { res.status(400).json({ error: '항목마다 따로 실행하는 링크 노드가 아닙니다.' }); return; }
+    let target: Workflow;
+    try { target = await storage.load(link.data.workflowId); } catch { res.status(400).json({ error: '링크가 가리키는 워크플로를 찾지 못했습니다.' }); return; }
+    const inputGroups = target.nodes.filter(asksAtRun);
+    if (inputGroups.length !== 1) { res.status(400).json({ error: `'${target.name}'에는 항목을 받을 「실행 시 입력」 워크트리 그룹이 정확히 하나 있어야 합니다.` }); return; }
+    const requested = new Set((execution.spawned?.[node] ?? []).filter((result) => !result.error).map((result) => result.item));
+    const origin = `「${graph.name}」 ${execution.label} 의 ${link.data.label || '링크'}`;
+    const results: (SpawnResult & { status: 'requested' | 'already' | 'failed' })[] = [];
+    for (const item of [...new Set(items as string[])]) {
+      const at = new Date().toISOString();
+      if (requested.has(item)) { results.push({ item, at, workflowId: target.id, status: 'already' }); continue; }
+      try {
+        const settings = await settingsFor(target, { count: 1, project, inputs: { [inputGroups[0].id]: item }, cleanup: target.cleanup ?? defaultCleanup });
+        const launch = await startRun(target.id, target, { ...settings, origin }, `http://${req.get('host')}`);
+        results.push({ item, at, workflowId: target.id, launch, status: 'requested' });
+      } catch (error) {
+        results.push({ item, at, workflowId: target.id, error: (error as Error).message.slice(0, 500), status: 'failed' });
+      }
+    }
+    const fresh = results.filter((result) => result.status !== 'already').map(({ status: _status, ...result }) => result);
+    if (fresh.length) {
+      await serial(id, async () => {
+        const latest = await storage.load(id);
+        await storage.save({ ...latest, executions: latest.executions?.map((item) => item.id === executionId
+          ? { ...item, spawned: { ...item.spawned, [node]: [...(item.spawned?.[node] ?? []), ...fresh] } } : item) });
+      });
+    }
+    res.json({ results });
   });
 
   // Automations: an Orca schedule whose agent asks this server for a fresh brief and then coordinates the run itself.

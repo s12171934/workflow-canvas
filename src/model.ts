@@ -12,9 +12,20 @@ export const branchModeNames: Record<BranchMode, string> = { exclusive: '하나�
 export const branchJudgeNames: Record<BranchJudge, string> = { previous: '직전 단계 워커', worker: '판정 워커', user: '사용자' };
 /** Where a gate asks the user: the coordinator (decision card / its terminal), or the terminal of the worker right before it. */
 export type GateAsker = 'coordinator' | 'previous';
-/** Workflow link: 'wait' — what follows the link waits for its whole sub-graph; 'start' — the sub-graph starts and what follows goes on without it. */
-export type LinkMode = 'wait' | 'start';
-export const linkModeNames: Record<LinkMode, string> = { wait: '끝날 때까지 대기', start: '시작만 하고 진행' };
+/**
+ * Workflow link: 'wait' — what follows the link waits for its whole sub-graph; 'start' — the sub-graph starts and what follows
+ * goes on without it; 'spawn' — not expanded: one separate 실행 of the target per item the worker before it reports
+ * (the item is the target's run-time worktree name), and the link is done once they are requested.
+ */
+export type LinkMode = 'wait' | 'start' | 'spawn';
+export const linkModes: LinkMode[] = ['wait', 'start', 'spawn'];
+export const linkModeNames: Record<LinkMode, string> = { wait: '끝날 때까지 대기', start: '시작만 하고 진행', spawn: '항목마다 따로 실행' };
+/** A link that requests separate executions of its target instead of expanding it. */
+export const spawnsRuns = (node: Pick<StageNode, 'data'>) => node.data.kind === 'workflow' && node.data.linkMode === 'spawn';
+/** How many separate executions one spawn request may start. */
+export const maxSpawnItems = 20;
+/** One item a spawn link asked to run: the launch it started, or why it could not. */
+export type SpawnResult = { item: string; at: string; workflowId: string; launch?: string; error?: string };
 export const gateAskerNames: Record<GateAsker, string> = { coordinator: '코디네이터', previous: '직전 워커' };
 export const maxBranchOutputs = 8;
 export type JoinMode = 'all' | 'any';
@@ -81,6 +92,8 @@ export type StageData = {
   /** kind 'workflow': the linked saved workflow, and whether what follows waits for it (unset: 'wait'). */
   workflowId?: string;
   linkMode?: LinkMode;
+  /** Display only, spawn links: the separate executions requested (by the selected execution, or the visible ones). */
+  spawned?: SpawnResult[];
   /** kind 'branch': how many outputs it takes, who decides, and its outputs (each a source handle). */
   mode?: BranchMode;
   judge?: BranchJudge;
@@ -163,7 +176,9 @@ export type Execution = { id: string; label: string; bindings: Record<string, st
   /** The Run that holds this execution's Tasks. Absent in older documents: the workflow's `runId`. */
   runId?: string;
   /** Run-time worktree names of the 실행 request that started it (group id → name). Runs with the same inputs never overlap. */
-  inputs?: Record<string, string> };
+  inputs?: Record<string, string>;
+  /** Spawn links (node id) → the separate executions they requested, in request order. */
+  spawned?: Record<string, SpawnResult[]> };
 /** Run of an execution: its own, or the workflow's for documents from before executions carried one. */
 export const executionRun = (workflow: Pick<Workflow, 'runId'>, execution: Pick<Execution, 'runId'>) => execution.runId || workflow.runId;
 /** Every Run the workflow observes: its current Run first, then the Runs of its executions. */
@@ -259,7 +274,7 @@ function bindingStatus(taskId: string | undefined, snapshot: RunSnapshot | null,
 export function nodeExecutionStatus(node: StageNode, execution: Execution, snapshot: RunSnapshot | null, stale: boolean): StageStatus {
   // Skipping is decided by the canvas from branch decisions; it wins over the Task, which the coordinator closes as completed.
   const skipped = new Set(execution.skipped ?? []);
-  if (node.data.kind === 'workflow') {
+  if (node.data.kind === 'workflow' && !spawnsRuns(node)) {
     const tasks = Object.entries(execution.links?.[node.id] ?? {});
     const statuses = tasks.map(([path, taskId]) => skipped.has(`${node.id}.${path}`) ? 'skipped' : bindingStatus(taskId, snapshot, stale));
     return statuses.length && statuses.every((status) => status === 'skipped') ? 'skipped' : aggregateStatus(statuses.filter((status) => status !== 'skipped'));
@@ -269,7 +284,7 @@ export function nodeExecutionStatus(node: StageNode, execution: Execution, snaps
 }
 /** The Task to open for a node in one execution: its own Task, or a link's first open sub-Task. */
 function nodeExecutionTask(node: StageNode, execution: Execution, snapshot: RunSnapshot | null, stale: boolean): string | undefined {
-  if (node.data.kind !== 'workflow') return execution.bindings[node.id];
+  if (node.data.kind !== 'workflow' || spawnsRuns(node)) return execution.bindings[node.id];
   const tasks = Object.values(execution.links?.[node.id] ?? {});
   return tasks.find((taskId) => openableStatuses.includes(bindingStatus(taskId, snapshot, stale))) ?? tasks[0];
 }
@@ -306,7 +321,7 @@ export function projectNodes(nodes: StageNode[], snapshot: RunSnapshot | null, s
   executions: Execution[] = [], executionId: string | null = null, visible?: Set<string>): StageNode[] {
   const selected = executionId && executionId !== 'all' ? executions.find((item) => item.id === executionId) : undefined;
   return nodes.map((node) => {
-    if (!isExecutable(node)) return { ...node, data: { ...node.data, status: undefined, runs: undefined, activeTaskId: undefined, decision: undefined } };
+    if (!isExecutable(node)) return { ...node, data: { ...node.data, status: undefined, runs: undefined, activeTaskId: undefined, decision: undefined, spawned: undefined } };
     const runs = executions.map((execution) => ({ id: execution.id, label: execution.label,
       taskId: nodeExecutionTask(node, execution, snapshot, stale), status: nodeExecutionStatus(node, execution, snapshot, stale) }));
     const taskId = selected ? nodeExecutionTask(node, selected, snapshot, stale) : executionId === 'all' ? undefined : node.data.taskId;
@@ -316,7 +331,10 @@ export function projectNodes(nodes: StageNode[], snapshot: RunSnapshot | null, s
     const shown = visible ? runs.filter((run) => visible.has(run.id)) : runs;
     const status = executionId === 'all' ? aggregateStatus((shown.length ? shown : runs).map((run) => run.status))
       : selected ? nodeExecutionStatus(node, selected, snapshot, stale) : bindingStatus(taskId, snapshot, stale);
+    const requested = spawnsRuns(node) ? (selected ? [selected] : executionId === 'all' ? executions.filter((execution) => !visible || visible.has(execution.id)) : [])
+      .flatMap((execution) => execution.spawned?.[node.id] ?? []) : [];
     return { ...node, data: { ...node.data, status, runs: executionId === 'all' ? shown : undefined, activeTaskId: taskId,
+      spawned: requested.length ? requested : undefined,
       decision: selected && isBranch(node) ? selected.decisions?.[node.id] : undefined,
       agent: worker?.provider,
       model: worker?.model,
@@ -342,7 +360,9 @@ export function serializableWorkflow(workflow: Workflow): Workflow {
       ...(execution.skipped?.length ? { skipped: execution.skipped } : {}),
       ...(execution.automation ? { automation: { id: execution.automation.id, name: execution.automation.name } } : {}),
       ...(execution.runId ? { runId: execution.runId } : {}),
-      ...(execution.inputs && Object.keys(execution.inputs).length ? { inputs: execution.inputs } : {}) };
+      ...(execution.inputs && Object.keys(execution.inputs).length ? { inputs: execution.inputs } : {}),
+      ...(execution.spawned && Object.keys(execution.spawned).some((nodeId) => nodeIds.has(nodeId))
+        ? { spawned: Object.fromEntries(Object.entries(execution.spawned).filter(([nodeId]) => nodeIds.has(nodeId))) } : {}) };
   });
   const { executions: _omit, workspace, cleanup, automations, ...rest } = workflow;
   const ordered = orderNodes(workflow.nodes);
@@ -366,7 +386,7 @@ export function serializableWorkflow(workflow: Workflow): Workflow {
       ...(node.data.ref ? { ref: node.data.ref } : {}), ...(node.data.repoPath ? { repoPath: node.data.repoPath } : {}),
       ...(node.data.worktreeName ? { worktreeName: node.data.worktreeName } : {}), ...(node.data.branch ? { branch: node.data.branch } : {}) });
     else if (group) Object.assign(data, { scope: node.data.scope ?? 'project', path: node.data.path ?? '', ...(node.data.ref ? { ref: node.data.ref } : {}) });
-    else if (node.data.kind === 'workflow') Object.assign(data, node.data.workflowId ? { workflowId: node.data.workflowId } : {}, node.data.linkMode === 'start' ? { linkMode: 'start' } : {});
+    else if (node.data.kind === 'workflow') Object.assign(data, node.data.workflowId ? { workflowId: node.data.workflowId } : {}, node.data.linkMode && node.data.linkMode !== 'wait' ? { linkMode: node.data.linkMode } : {});
     else if (isBranch(node)) Object.assign(data, { mode: node.data.mode ?? 'exclusive', judge: node.data.judge ?? 'previous',
       outputs: (node.data.outputs ?? []).map((output) => ({ id: output.id, label: output.label })), ...(node.data.taskId ? { taskId: node.data.taskId } : {}) });
     else if (node.data.taskId) data.taskId = node.data.taskId;

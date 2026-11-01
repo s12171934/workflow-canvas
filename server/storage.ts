@@ -2,7 +2,7 @@ import { mkdir, readFile, readdir, rename, stat, writeFile, unlink } from 'node:
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { Workflow } from '../src/model.ts';
-import { effortLevels, maxBranchOutputs, maxGroupDepth, workerModelPattern, serializableWorkflow, topologicalOrder, validTrigger, worktreeNamePattern } from '../src/model.ts';
+import { effortLevels, linkModes, maxBranchOutputs, maxSpawnItems, maxGroupDepth, workerModelPattern, serializableWorkflow, topologicalOrder, validTrigger, worktreeNamePattern } from '../src/model.ts';
 
 export function validId(id: string): boolean { return /^[a-zA-Z0-9_-]{1,128}$/.test(id); }
 
@@ -32,7 +32,7 @@ export function validateWorkflow(value: unknown): Workflow {
       || !['worker', 'gate', 'branch', 'note', 'workflow', 'group', 'frame'].includes(node.data.kind)
       || (node.data.workerModel !== undefined && (typeof node.data.workerModel !== 'string' || !workerModelPattern.test(node.data.workerModel)))
       || (node.data.effort !== undefined && !(effortLevels as readonly string[]).includes(node.data.effort))
-      || (node.data.linkMode !== undefined && (node.data.kind !== 'workflow' || !['wait', 'start'].includes(node.data.linkMode)))
+      || (node.data.linkMode !== undefined && (node.data.kind !== 'workflow' || !(linkModes as string[]).includes(node.data.linkMode)))
       || (node.data.asker !== undefined && (node.data.kind !== 'gate' || !['coordinator', 'previous'].includes(node.data.asker)))
       || (node.data.taskId !== undefined && node.data.taskId !== '' && (typeof node.data.taskId !== 'string' || !validId(node.data.taskId)))
       || (node.data.workflowId !== undefined && node.data.workflowId !== '' && (typeof node.data.workflowId !== 'string' || !validId(node.data.workflowId)))) {
@@ -153,7 +153,13 @@ export function validateWorkflow(value: unknown): Workflow {
         || (execution.automation !== undefined && (!execution.automation || !validId(execution.automation.id)
           || typeof execution.automation.name !== 'string' || execution.automation.name.length > 100))
         || (execution.runId !== undefined && (typeof execution.runId !== 'string' || !validId(execution.runId)))
-        || !validInputs(execution.inputs)) {
+        || !validInputs(execution.inputs)
+        || (execution.spawned !== undefined && (!execution.spawned || typeof execution.spawned !== 'object' || Array.isArray(execution.spawned)
+          || Object.entries(execution.spawned).some(([nodeId, results]) => !ids.has(nodeId) || !Array.isArray(results) || results.length > maxSpawnItems * 10
+            || results.some((result) => !result || typeof result.item !== 'string' || !worktreeNamePattern.test(result.item) || typeof result.at !== 'string'
+              || result.at.length > 40 || typeof result.workflowId !== 'string' || !validId(result.workflowId)
+              || (result.launch !== undefined && (typeof result.launch !== 'string' || !/^[a-zA-Z0-9_-]{1,200}$/.test(result.launch)))
+              || (result.error !== undefined && (typeof result.error !== 'string' || result.error.length > 500))))))) {
         throw new Error('실행 ID·이름·Task 연결이 올바르지 않습니다.');
       }
       executionIds.add(execution.id);

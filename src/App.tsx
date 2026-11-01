@@ -12,7 +12,7 @@ import {
 } from 'lucide-react';
 import {
   aggregateStatus, executionFinished, executionRun, executionStatuses as computeExecutionStatuses, mergeSnapshots, workflowRuns, openableStatuses, fromSnapshot, newWorkflow, projectNodes, serializableWorkflow, statusLabels,
-  asksAtRun, defaultWorkerModel, effortLevels, frameContents, isFrame, launchesWorker, workerModels, type Effort, type Rect, joinNames, pendingDecisions, gateAskerNames, type GateAsker, linkModeNames, type LinkMode, type FlowStage, type PendingDecision, branchJudgeNames, branchModeNames, isBranch, maxBranchOutputs, type BranchJudge, type BranchMode, type BranchOutput, defaultCleanup, triggerNames, worktreeNamePattern, type AutomationConfig, type AutomationState, type Cleanup, canNest, maxGroupDepth, nameSourceNames, safeWorktreeName, type NameSource, createsWorktree, groupOf, membershipOf, orderNodes, worktreeRepo, isExecutable, isGroup, kindNames, normalizeNodes, scopeNames,
+  asksAtRun, defaultWorkerModel, effortLevels, frameContents, isFrame, launchesWorker, workerModels, type Effort, type Rect, joinNames, pendingDecisions, gateAskerNames, type GateAsker, linkModeNames, maxSpawnItems, type LinkMode, type FlowStage, type PendingDecision, branchJudgeNames, branchModeNames, isBranch, maxBranchOutputs, type BranchJudge, type BranchMode, type BranchOutput, defaultCleanup, triggerNames, worktreeNamePattern, type AutomationConfig, type AutomationState, type Cleanup, canNest, maxGroupDepth, nameSourceNames, safeWorktreeName, type NameSource, createsWorktree, groupOf, membershipOf, orderNodes, worktreeRepo, isExecutable, isGroup, kindNames, normalizeNodes, scopeNames,
   type Workflow, type Execution, type StageNode, type StageKind, type NodeKind, type GroupScope, type StageStatus, type RunSummary, type RunSnapshot, type Locations,
 } from './model';
 import { RunLogDialog } from './RunLog';
@@ -78,7 +78,9 @@ function StageCard({ data, selected }: NodeProps<StageNode>) {
       {data.membership.worktrees.map((name, index) => <span key={index} className="member-link">
         {(index > 0 || data.membership!.project) && <ChevronRight size={11} className="member-sep" />}<span className="member-chip worktree"><GitBranch size={11} />{name}</span></span>)}</div>}
     {data.kind === 'workflow' && <div className={`link-target ${linked ? '' : 'missing'}`}><Link2 size={12} />{linked ?? (data.workflowId ? '찾을 수 없는 워크플로' : '연결할 워크플로를 고르세요')}
-      {data.linkMode === 'start' && <span className="link-mode">{linkModeNames.start}</span>}</div>}
+      {data.linkMode && data.linkMode !== 'wait' && <span className="link-mode">{linkModeNames[data.linkMode]}</span>}</div>}
+    {data.spawned && <div className="spawn-chips" aria-label="따로 실행한 항목">{data.spawned.map((result, index) =>
+      <span key={index} className={`spawn-chip ${result.error ? 'failed' : ''}`} title={result.error ?? `${result.at} 요청`}>{result.item}</span>)}</div>}
     <p>{data.description || (data.kind === 'branch' ? '무엇을 근거로 어느 출력을 고를지 적으세요.' : '단계를 선택해 내용을 작성하세요.')}</p>
     {data.kind === 'branch' && <ul className="branch-outputs" aria-label="분기 출력">
       {(data.outputs ?? []).map((output) => <li key={output.id} className={`branch-output ${data.decision ? (data.decision.includes(output.id) ? 'taken' : 'untaken') : ''}`}>
@@ -1023,13 +1025,23 @@ function Workspace() {
                 {saved.filter((item) => item.id !== workflow.id).map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
               </select>
               <button className="icon-button" title="연결한 워크플로 열기" aria-label="연결한 워크플로 열기" disabled={!selected.data.workflowId || !saved.some((item) => item.id === selected.data.workflowId)} onClick={() => void load(selected.data.workflowId!)}><ExternalLink size={15} /></button></div>
-              <p className="field-help">실행하면 연결한 워크플로의 단계가 이 자리에 펼쳐집니다. 노드 상태는 펼친 단계들의 상태를 모은 것입니다.</p>
-              <label className="field-label" htmlFor="link-mode">다음 단계</label>
-              <select id="link-mode" value={selected.data.linkMode ?? 'wait'} onChange={(event) => updateNode({ linkMode: event.target.value === 'start' ? 'start' as LinkMode : undefined })}>
-                <option value="wait">{linkModeNames.wait} — 펼친 단계가 모두 끝나야 진행</option><option value="start">{linkModeNames.start} — 시작시키고 바로 진행</option></select>
+              <p className="field-help">{selected.data.linkMode === 'spawn'
+                ? '실행하면 연결한 워크플로를 펼치지 않고, 항목마다 따로 실행을 요청합니다. 노드 상태는 요청 단계의 상태입니다.'
+                : '실행하면 연결한 워크플로의 단계가 이 자리에 펼쳐집니다. 노드 상태는 펼친 단계들의 상태를 모은 것입니다.'}</p>
+              <label className="field-label" htmlFor="link-mode">실행 방식</label>
+              <select id="link-mode" value={selected.data.linkMode ?? 'wait'} onChange={(event) => updateNode({ linkMode: event.target.value === 'wait' ? undefined : event.target.value as LinkMode })}>
+                <option value="wait">{linkModeNames.wait} — 펼친 단계가 모두 끝나야 진행</option><option value="start">{linkModeNames.start} — 시작시키고 바로 진행</option>
+                <option value="spawn">{linkModeNames.spawn} — 앞 워커가 보고한 항목마다 별도 실행</option></select>
               <p className="field-help">{selected.data.linkMode === 'start'
                 ? '링크 뒤 단계는 링크 앞 단계가 끝나면 펼친 단계와 동시에 시작합니다. 펼친 단계는 따로 끝까지 돌고, 이 실행은 그것까지 끝나야 끝납니다.'
-                : '링크 뒤 단계는 펼친 워크플로의 마지막 단계들이 끝난 뒤 시작합니다.'}</p></>}
+                : selected.data.linkMode === 'spawn'
+                  ? `앞에 연결한 워커 하나가 worker_done 에 "items: 항목, 항목" 으로 목록을 보고하면, 항목마다 연결한 워크플로를 따로 실행합니다(한 번에 ${maxSpawnItems}개까지). 항목은 그 워크플로의 「실행 시 입력」 워크트리 이름이 되므로, 대상에는 그런 그룹이 하나 있어야 합니다. 요청이 끝나면 이 링크는 완료이고, 따로 띄운 실행은 기다리지 않습니다 — 진행 상황은 대상 워크플로에서 봅니다.`
+                  : '링크 뒤 단계는 펼친 워크플로의 마지막 단계들이 끝난 뒤 시작합니다.'}</p>
+              {selected.data.linkMode === 'spawn' && <><label className="field-label">요청한 실행</label>
+                {selectedProjected?.data.spawned?.length ? <ul className="run-list">{selectedProjected.data.spawned.map((result, index) => <li key={index}>
+                  <button className={`run-chip ${result.error ? 'failed' : 'completed'}`} onClick={() => void load(result.workflowId)} title="대상 워크플로 열기"><span className="status-dot" />{result.item}</button>
+                  <span>{result.error ?? '실행 요청됨'}</span></li>)}</ul>
+                  : <p className="field-help">실행이 항목을 요청하면 항목별 결과가 여기에 보입니다. 항목을 누르면 대상 워크플로를 엽니다.</p>}</>}</>}
             {selected.data.kind === 'gate' && <>
               <label className="field-label" htmlFor="gate-asker">묻는 곳</label>
               <select id="gate-asker" value={selected.data.asker ?? 'coordinator'} onChange={(event) => updateNode({ asker: event.target.value === 'previous' ? 'previous' as GateAsker : undefined })}>

@@ -611,3 +611,72 @@ test('one workflow runs side by side for different run-time inputs; the same inp
     await rm(directory, { recursive: true, force: true });
   }
 });
+test('a spawn link starts one separate execution of its target per reported item, once per item', async () => {
+  await mkdir('.local', { recursive: true });
+  const directory = await mkdtemp(join(resolve('.local'), 'api-spawn-test-'));
+  const calls: string[][] = [];
+  const bridge = createOrcaBridge(async (args) => {
+    calls.push(args);
+    const place = places(args); if (place) return place;
+    if (args[0] === 'agent') return { terminal: { handle: `term_${calls.length}` } };
+    return {};
+  });
+  const json = { 'Content-Type': 'application/json' };
+  const target = { version: 1 as const, id: 'per-ticket', name: '티켓 처리', description: '', runId: '', edges: [], nodes: [
+    { id: 'wt', type: 'group' as const, position: { x: 0, y: 0 }, width: 400, height: 300,
+      data: { label: '티켓', description: '', kind: 'group' as const, scope: 'worktree' as const, path: '', worktreeMode: 'create' as const, nameSource: 'input' as const } },
+    { id: 'fix', type: 'stage' as const, parentId: 'wt', position: { x: 20, y: 40 }, data: { label: '수정', description: '고친다', kind: 'worker' as const } },
+  ] };
+  const stage = (id: string, kind: 'worker' | 'workflow', extra = {}) => ({ id, type: 'stage' as const, position: { x: 0, y: 0 }, data: { label: id, description: id, kind, ...extra } });
+  const picker = { version: 1 as const, id: 'picker', name: '선별', description: '', runId: '',
+    nodes: [stage('pick', 'worker'), stage('fan', 'workflow', { workflowId: 'per-ticket', linkMode: 'spawn' }), stage('after', 'worker')],
+    edges: [{ id: 'e1', source: 'pick', target: 'fan' }, { id: 'e2', source: 'fan', target: 'after' }] };
+  const server = createApp(directory, bridge).listen(0, '127.0.0.1');
+  await new Promise<void>((resolve) => server.once('listening', resolve));
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const put = (graph: unknown) => fetch(`${base}/api/workflows/${(graph as { id: string }).id}`, { method: 'PUT', headers: json, body: JSON.stringify(graph) });
+  const execute = (id: string) => fetch(`${base}/api/workflows/${id}/execute`, { method: 'POST', headers: json, body: JSON.stringify({ count: 1, project: '/example/repo' }) });
+  const spawn = (body: unknown) => fetch(`${base}/api/workflows/picker/executions/run-p-1/spawn`, { method: 'POST', headers: json, body: JSON.stringify(body) });
+  try {
+    assert.equal((await put(target)).status, 200);
+    // Refused before a coordinator starts: no worker in front, or a target without exactly one run-time input.
+    assert.equal((await put({ ...picker, id: 'loose', edges: [picker.edges[1]] })).status, 200);
+    assert.match((await (await execute('loose')).json()).error, /워커 하나만/);
+    assert.equal((await put({ ...target, id: 'no-input', nodes: [target.nodes[1]].map((node) => ({ ...node, parentId: undefined })) })).status, 200);
+    assert.equal((await put({ ...picker, id: 'no-input-link', nodes: [picker.nodes[0], stage('fan', 'workflow', { workflowId: 'no-input', linkMode: 'spawn' }), picker.nodes[2]] })).status, 200);
+    assert.match((await (await execute('no-input-link')).json()).error, /정확히 하나/);
+    assert.equal(calls.filter((args) => args[0] === 'agent').length, 0);
+
+    assert.equal((await put(picker)).status, 200);
+    assert.equal((await execute('picker')).status, 200);
+    const [log] = await (await fetch(`${base}/api/workflows/picker/logs`)).json();
+    const brief = (await (await fetch(`${base}/api/workflows/picker/logs/${log.id}/files/brief.md`)).json()).text as string;
+    assert.match(brief, /"reportsItems": \[\s*"fan"\s*\]/);
+    assert.match(brief, /"spawn": \{\s*"workflowId": "per-ticket",\s*"name": "티켓 처리",\s*"input": "wt"/);
+    assert.match(brief, /\/api\/workflows\/picker\/executions\/<실행 id>\/spawn/);
+    // Not expanded: the link stays one stage that follows the worker.
+    const flow = await (await fetch(`${base}/api/workflows/picker/flow`)).json();
+    assert.deepEqual(flow.map((item: { id: string; after: { id: string }[] }) => [item.id, item.after.map((after) => after.id)]), [['pick', []], ['fan', ['pick']], ['after', ['fan']]]);
+
+    assert.equal((await fetch(`${base}/api/workflows/picker/executions`, { method: 'PUT', headers: json,
+      body: JSON.stringify({ runId: 'run-p', launch: log.id, executions: [{ id: 'run-p-1', label: '#1', bindings: { pick: 'tp1', fan: 'tp2', after: 'tp3' } }] }) })).status, 200);
+    assert.equal((await spawn({ node: 'pick', project: '/example/repo', items: ['ABC-1'] })).status, 400);
+    assert.equal((await spawn({ node: 'fan', project: '/example/repo', items: ['bad name'] })).status, 400);
+    const first = await (await spawn({ node: 'fan', project: '/example/repo', items: ['ABC-1', 'ABC-2', 'ABC-1'] })).json();
+    assert.deepEqual(first.results.map((item: { item: string; status: string }) => [item.item, item.status]), [['ABC-1', 'requested'], ['ABC-2', 'requested']]);
+    const again = await (await spawn({ node: 'fan', project: '/somewhere/else', items: ['ABC-1', 'ABC-3'] })).json();
+    assert.deepEqual(again.results.map((item: { item: string; status: string }) => [item.item, item.status]), [['ABC-1', 'already'], ['ABC-3', 'failed']]);
+    assert.match(again.results[1].error, /프로젝트/);
+    assert.equal(calls.filter((args) => args[0] === 'agent').length, 3); // picker + two tickets
+
+    const launches = await (await fetch(`${base}/api/workflows/per-ticket/logs`)).json() as { inputs?: Record<string, string>; last?: { message: string } }[];
+    assert.deepEqual(launches.map((item) => item.inputs?.wt).sort(), ['ABC-1', 'ABC-2']);
+    const requested = (await (await fetch(`${base}/api/workflows/per-ticket/logs/${(launches[0] as unknown as { id: string }).id}`)).json()).events[0].message as string;
+    assert.match(requested, /「선별」 #1 의 fan/);
+    const stored = (await (await fetch(`${base}/api/workflows/picker`)).json()).executions[0];
+    assert.deepEqual(stored.spawned.fan.map((item: { item: string; error?: string }) => [item.item, !!item.error]), [['ABC-1', false], ['ABC-2', false], ['ABC-3', true]]);
+  } finally {
+    await new Promise<void>((resolve, reject) => { server.close((error) => error ? reject(error) : resolve()); server.closeAllConnections(); });
+    await rm(directory, { recursive: true, force: true });
+  }
+});

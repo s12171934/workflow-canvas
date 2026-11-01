@@ -262,9 +262,10 @@
               "linkMode": {
                 "enum": [
                   "wait",
-                  "start"
+                  "start",
+                  "spawn"
                 ],
-                "description": "kind workflow 전용. wait(기본): 링크 뒤 단계는 펼친 워크플로의 마지막 단계들이 끝난 뒤 시작. start: 펼친 단계를 시작시키고 링크 뒤 단계는 링크 앞 단계만 기다린다(펼친 단계는 따로 끝까지 돌고, 실행은 그것까지 끝나야 끝난다)."
+                "description": "kind workflow 전용. wait(기본): 링크 뒤 단계는 펼친 워크플로의 마지막 단계들이 끝난 뒤 시작. start: 펼친 단계를 시작시키고 링크 뒤 단계는 링크 앞 단계만 기다린다(펼친 단계는 따로 끝까지 돌고, 실행은 그것까지 끝나야 끝난다). spawn: 펼치지 않는다. 앞에 연결한 워커 하나가 worker_done 에 `items: a, b` 로 보고한 항목마다 대상 워크플로를 따로 실행한다(항목 = 대상의 「실행 시 입력」 워크트리 이름, 대상에 그런 그룹이 정확히 하나 필요, 한 번에 20개까지). 요청이 끝나면 링크는 완료이고 따로 띄운 실행은 기다리지 않는다."
               }
             }
           },
@@ -388,6 +389,46 @@
             "additionalProperties": {
               "type": "string",
               "pattern": "^$|^(?!-)(?!.*\\.\\.)[A-Za-z0-9._-]{1,80}$"
+            }
+          },
+          "spawned": {
+            "type": "object",
+            "description": "spawn 링크 nodeId → 그 링크가 요청한 별도 실행(요청 순서). 같은 실행에서 이미 요청에 성공한 항목은 다시 띄우지 않는다.",
+            "propertyNames": {
+              "$ref": "#/$defs/id"
+            },
+            "additionalProperties": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "item",
+                  "at",
+                  "workflowId"
+                ],
+                "properties": {
+                  "item": {
+                    "type": "string",
+                    "description": "항목(대상의 실행 시 입력 워크트리 이름)"
+                  },
+                  "at": {
+                    "type": "string",
+                    "description": "요청 시각(ISO)"
+                  },
+                  "workflowId": {
+                    "$ref": "#/$defs/id"
+                  },
+                  "launch": {
+                    "type": "string",
+                    "description": "대상 워크플로의 실행 로그 ID"
+                  },
+                  "error": {
+                    "type": "string",
+                    "maxLength": 500,
+                    "description": "요청 실패 사유"
+                  }
+                }
+              }
             }
           }
         }
