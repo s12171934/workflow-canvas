@@ -124,6 +124,9 @@ select { text-overflow:ellipsis; }
 .task-state { display:flex; align-items:center; gap:7px; padding:11px; border:1px solid #34424c; border-radius:6px; margin-top:14px; color:#8c9fac; font-size:10px; }
 .task-state .status-dot { background:currentColor; }
 .task-state small { margin-left:auto; color:#6f8493; font-family:monospace; font-size:9px; }
+.multi-list { list-style:none; margin:16px 0 0; padding:0; display:flex; flex-direction:column; gap:4px; max-height:280px; overflow:auto; }
+.multi-list li { display:flex; gap:8px; align-items:baseline; font-size:12px; color:#c9d3db; padding:6px 8px; background:#ffffff06; border-radius:5px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.multi-list li span { flex:none; font-size:10px; color:#6b7b88; }
 .inspector-note { display:flex; align-items:flex-start; gap:9px; color:#6b8e85; padding:13px 10px; background:#84d8bb06; border:1px solid #35524855; border-radius:7px; margin-top:23px; }
 .inspector-note>svg { flex-shrink:0; margin-top:3px; }
 .inspector-note p { margin:0; font-size:10px; color:#8da59c; line-height:1.9; }

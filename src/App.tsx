@@ -2,7 +2,7 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useRef, use
 import {
   ReactFlow, ReactFlowProvider, Background, Controls, MiniMap, Handle, Position, NodeResizer,
   addEdge, useNodesState, useEdgesState, useReactFlow, useStore, MarkerType,
-  type Connection, type MiniMapNodeProps, type NodeProps, type Edge,
+  type Connection, type NodeChange, type MiniMapNodeProps, type NodeProps, type Edge,
 } from '@xyflow/react';
 import {
   Activity, ArrowDownToLine, History, ArrowUpFromLine, Bot, Check, ChevronRight, Circle,
@@ -157,6 +157,11 @@ function Workspace() {
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>(workflow.edges);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [selectedEdgeId, setSelectedEdgeId] = useState<string | null>(null);
+  // 여러 노드 선택(드래그 박스·Shift/⌘ 클릭). Two or more ids; a single pick always goes to selectedId so the inspector shows it.
+  const [multiIds, setMultiIds] = useState<string[]>([]);
+  // Latest selection, so several React Flow select batches in one tick build on each other.
+  const selection = useRef<string[]>([]);
+  selection.current = multiIds.length ? multiIds : selectedId ? [selectedId] : [];
   const [runs, setRuns] = useState<RunSummary[]>([]);
   const [saved, setSaved] = useState<{ id: string; name: string }[]>([]);
   const [locations, setLocations] = useState<Locations>({ projects: [], worktrees: [] });
@@ -183,6 +188,7 @@ function Workspace() {
   const dirty = fingerprint !== savedFingerprint;
   const selected = nodes.find((node) => node.id === selectedId);
   const selectedEdge = edges.find((edge) => edge.id === selectedEdgeId);
+  const multiSet = useMemo(() => new Set(multiIds.filter((id) => nodes.some((node) => node.id === id))), [multiIds, nodes]);
   const stale = !!snapshotError || (!!workflow.runId && !snapshot);
   const executions = useMemo(() => workflow.executions ?? [], [workflow.executions]);
   const executionStatuses = useMemo(() => executions.map((execution) => {
@@ -231,7 +237,7 @@ function Workspace() {
     const node = nodes.find((item) => item.id === selectedId);
     return node ? membershipOf({ nodes }, node) : { worktrees: [] as StageNode[] };
   }, [nodes, selectedId]);
-  const displayNodes = useMemo(() => orderNodes(projectNodes(nodes, snapshot, stale, executions, executionView, visibleIds).map((node) => ({ ...node, selected: node.id === selectedId,
+  const displayNodes = useMemo(() => orderNodes(projectNodes(nodes, snapshot, stale, executions, executionView, visibleIds).map((node) => ({ ...node, selected: node.id === selectedId || multiSet.has(node.id),
     data: { ...node.data,
       ...(createsWorktree(node) && !node.data.repoPath ? { inheritedRepo: worktreeRepo({ nodes }, node) } : {}),
       // The selected node shows where it belongs, and the groups it belongs to light up.
@@ -241,7 +247,7 @@ function Workspace() {
       ...(node.id === selectedMembership.project?.id || selectedMembership.worktrees.some((group) => group.id === node.id) ? { ancestor: true } : {}) },
     // Groups sit under every stage (deeper groups above shallower ones), including stages that only overlap them.
     // Memo groups sit under everything, groups included.
-    ...(isGroup(node) ? { zIndex: groupDepth(node) - maxGroupDepth - 2 } : isFrame(node) ? { zIndex: -maxGroupDepth - 4 } : {}) }))), [nodes, snapshot, stale, executions, executionView, visibleIds, selectedId, selectedMembership]);
+    ...(isGroup(node) ? { zIndex: groupDepth(node) - maxGroupDepth - 2 } : isFrame(node) ? { zIndex: -maxGroupDepth - 4 } : {}) }))), [nodes, snapshot, stale, executions, executionView, visibleIds, selectedId, multiSet, selectedMembership]);
   const displayEdges = useMemo(() => edges.map((edge) => {
     const target = displayNodes.find((node) => node.id === edge.target);
     const source = displayNodes.find((node) => node.id === edge.source);
@@ -458,7 +464,7 @@ function Workspace() {
   function applyWorkflow(graph: Workflow, persisted: boolean) {
     graph = { ...graph, nodes: normalizeNodes(graph.nodes) };
     setWorkflow(graph); setNodes(graph.nodes); setEdges(graph.edges); setView('all');
-    setSelectedId(graph.nodes[0]?.id ?? null); setSelectedEdgeId(null);
+    setSelectedId(graph.nodes[0]?.id ?? null); setSelectedEdgeId(null); setMultiIds([]);
     setSavedFingerprint(persisted ? JSON.stringify(serializableWorkflow(graph)) : '');
     setTimeout(() => { void fitView({ padding: 0.25, duration: 300 }); }, 80);
   }
@@ -504,30 +510,33 @@ function Workspace() {
     setNodes((items) => [{ id, type: 'frame', position, width: 560, height: 320, data: { label: kindNames.frame, description: '', kind: 'frame' } }, ...items]);
     setSelectedId(id); setSelectedEdgeId(null);
   }
-  // Dragging a memo group carries what lay inside it when the drag started.
+  // Dragging memo groups carries what lay inside them when the drag started (except nodes already moving with the selection).
   const frameDrag = useRef<{ id: string; start: { x: number; y: number }; items: Map<string, { x: number; y: number }> } | null>(null);
-  function startDrag(dragged: StageNode) {
+  function startDrag(grabbed: StageNode, dragged: StageNode[]) {
     frameDrag.current = null;
-    if (!isFrame(dragged)) return;
+    const frames = dragged.filter(isFrame);
+    if (!frames.length) return;
     const rects = new Map<string, Rect>();
     for (const node of nodes) {
       const internal = getInternalNode(node.id);
       if (internal) rects.set(node.id, { ...internal.internals.positionAbsolute, width: internal.measured.width ?? node.width ?? 0, height: internal.measured.height ?? node.height ?? 0 });
     }
-    const carried = new Set(frameContents(dragged.id, nodes, rects));
-    frameDrag.current = { id: dragged.id, start: { ...dragged.position },
+    const moving = new Set(dragged.map((node) => node.id));
+    const carried = new Set(frames.flatMap((frame) => frameContents(frame.id, nodes, rects)).filter((id) => !moving.has(id)));
+    frameDrag.current = { id: grabbed.id, start: { ...grabbed.position },
       items: new Map(nodes.filter((node) => carried.has(node.id)).map((node) => [node.id, { ...node.position }])) };
   }
-  function dragFrame(dragged: StageNode) {
+  function dragFrame(dragged: StageNode[]) {
     const drag = frameDrag.current;
-    if (!drag || drag.id !== dragged.id || !drag.items.size) return;
-    const dx = dragged.position.x - drag.start.x, dy = dragged.position.y - drag.start.y;
+    const grabbed = drag && dragged.find((node) => node.id === drag.id);
+    if (!drag || !grabbed || !drag.items.size) return;
+    const dx = grabbed.position.x - drag.start.x, dy = grabbed.position.y - drag.start.y;
     setNodes((items) => items.map((node) => { const origin = drag.items.get(node.id); return origin ? { ...node, position: { x: origin.x + dx, y: origin.y + dy } } : node; }));
   }
-  function stopDrag(dragged: StageNode) {
+  function stopDrag(dragged: StageNode[]) {
     const drag = frameDrag.current;
     frameDrag.current = null;
-    if (!isFrame(dragged)) { regroup(dragged.id); return; }
+    for (const node of dragged) if (!isFrame(node)) regroup(node.id);
     // Carried stages may have left (or entered) a project/worktree group; settle that once the moved positions are measured.
     if (drag?.items.size) requestAnimationFrame(() => { for (const id of drag.items.keys()) regroup(id); });
   }
@@ -562,8 +571,10 @@ function Workspace() {
       setNotice('Orca에서 실행 화면을 열었습니다.');
     } catch (error) { setNotice((error as Error).message); }
   }, [workflow.runId]);
-  function clickNode(id: string) {
-    setSelectedId(id); setSelectedEdgeId(null);
+  function clickNode(id: string, additive: boolean) {
+    // ⌘/Ctrl 클릭 toggles the node in the selection (already applied through handleNodesChange); it never opens a task.
+    if (additive) return;
+    setSelectedId(id); setSelectedEdgeId(null); setMultiIds([]);
     const node = displayNodes.find((item) => item.id === id);
     if (!node || !isExecutable(node)) return;
     if (node.data.activeTaskId && openableStatuses.includes(node.data.status ?? 'unbound')) { void openTask(node.data.activeTaskId); return; }
@@ -672,18 +683,39 @@ function Workspace() {
     return !!missing;
   }
   function removeSelected() {
-    if (selectedId) {
-      const removed = nodes.find((node) => node.id === selectedId);
-      const origin = removed && isGroup(removed) ? removed.position : undefined;
-      // Deleting a group keeps what was inside: it moves up to the group's own parent (or the canvas) at the same place.
-      setNodes((items) => items.filter((node) => node.id !== selectedId).map((node) => origin && node.parentId === selectedId
-        // Only worktree groups have a parent, and only stages sit in them, so one level up is always valid.
-        ? { ...node, parentId: removed?.parentId, position: { x: node.position.x + origin.x, y: node.position.y + origin.y } } : node));
-      setEdges((items) => items.filter((edge) => edge.source !== selectedId && edge.target !== selectedId));
-      setSelectedId(null);
+    const ids = new Set(multiSet.size ? multiSet : selectedId ? [selectedId] : []);
+    if (ids.size) {
+      const byId = new Map(nodes.map((node) => [node.id, node]));
+      // Deleting a group keeps what was inside: it moves up to the nearest surviving parent (or the canvas) at the same place.
+      setNodes((items) => items.filter((node) => !ids.has(node.id)).map((node) => {
+        let { parentId, position } = node;
+        for (let parent = parentId ? byId.get(parentId) : undefined; parent && ids.has(parent.id); parent = parentId ? byId.get(parentId) : undefined) {
+          position = { x: position.x + parent.position.x, y: position.y + parent.position.y };
+          parentId = parent.parentId;
+        }
+        return parentId === node.parentId ? node : { ...node, parentId, position };
+      }));
+      setEdges((items) => items.filter((edge) => !ids.has(edge.source) && !ids.has(edge.target)));
+      setSelectedId(null); setMultiIds([]);
+      if (ids.size > 1) setNotice(`노드 ${ids.size}개를 삭제했습니다.`);
     } else if (selectedEdgeId) {
       setEdges((items) => items.filter((edge) => edge.id !== selectedEdgeId)); setSelectedEdgeId(null);
     }
+  }
+  /** React Flow reports clicks, ⌘/Ctrl 클릭 and the drag box as select changes; they become our selection (one → inspector, more → multiIds). */
+  function handleNodesChange(changes: NodeChange<StageNode>[]) {
+    const picks = changes.filter((change) => change.type === 'select');
+    if (picks.length) {
+      const next = new Set(selection.current);
+      for (const change of picks) if (change.selected) next.add(change.id); else next.delete(change.id);
+      const ids = [...next];
+      if (ids.length !== selection.current.length || ids.some((id) => !selection.current.includes(id))) {
+        selection.current = ids;
+        if (ids.length > 1) { setSelectedId(null); setMultiIds(ids); } else { setSelectedId(ids[0] ?? null); setMultiIds([]); }
+        if (ids.length) setSelectedEdgeId(null);
+      }
+    }
+    onNodesChange(changes);
   }
   function changeRun(runId: string) {
     if (runId === workflow.runId) return;
@@ -723,7 +755,7 @@ function Workspace() {
     const row = (group: StageNode | undefined, scope: GroupScope) => {
       const Icon = scope === 'worktree' ? GitBranch : FolderGit2;
       return group
-        ? <button className={`member-row ${scope}`} title={`${group.data.path || group.data.repoPath || ''}`} onClick={() => { setSelectedId(group.id); setSelectedEdgeId(null); }}>
+        ? <button className={`member-row ${scope}`} title={`${group.data.path || group.data.repoPath || ''}`} onClick={() => { setSelectedId(group.id); setSelectedEdgeId(null); setMultiIds([]); }}>
             <Icon size={14} /><span className="member-kind">{scope === 'worktree' ? '워크트리' : '프로젝트'}</span><strong>{group.data.label || '이름 없는 그룹'}</strong><small>{describe(group)}</small></button>
         : <div className={`member-row empty ${scope}`}><Icon size={14} /><span className="member-kind">{scope === 'worktree' ? '워크트리' : '프로젝트'}</span><small>없음</small></div>;
     };
@@ -834,22 +866,28 @@ function Workspace() {
           </section>}
           <div className="canvas-mode"><span className={`status-dot ${workflow.runId && snapshot && !stale ? 'running' : ''}`} />{workflow.runId ? 'Orca 실시간 관찰' : '설계 모드'}
             {activeAutomations.length > 0 && <span className="automation-badge" title="이 자동화가 시작한 실행이 진행 중입니다"><Zap size={11} />자동화 {activeAutomations.map((item) => `「${item.name}」`).join(' ')} 진행 중</span>}</div>
-          <ReactFlow<StageNode> nodes={displayNodes} edges={displayEdges} nodeTypes={nodeTypes} onNodesChange={onNodesChange} onEdgesChange={onEdgesChange} onConnect={onConnect}
-            onNodeDragStart={(_event, node) => startDrag(node)} onNodeDrag={(_event, node) => dragFrame(node)} onNodeDragStop={(_event, node) => stopDrag(node)}
+          <ReactFlow<StageNode> nodes={displayNodes} edges={displayEdges} nodeTypes={nodeTypes} onNodesChange={handleNodesChange} onEdgesChange={onEdgesChange} onConnect={onConnect}
+            onNodeDragStart={(_event, node, dragged) => startDrag(node, dragged)} onNodeDrag={(_event, _node, dragged) => dragFrame(dragged)} onNodeDragStop={(_event, _node, dragged) => stopDrag(dragged)}
+            onSelectionDragStart={(_event, dragged) => dragged[0] && startDrag(dragged[0], dragged)} onSelectionDrag={(_event, dragged) => dragFrame(dragged)} onSelectionDragStop={(_event, dragged) => stopDrag(dragged)}
+            selectionOnDrag panOnDrag={[1, 2]} panOnScroll multiSelectionKeyCode={['Meta', 'Control']}
             onBeforeDelete={async () => { removeSelected(); return false; }}
-            onNodeClick={(_event, node) => clickNode(node.id)} onEdgeClick={(_event, edge) => { setSelectedEdgeId(edge.id); setSelectedId(null); }}
-            onPaneClick={() => { setSelectedId(null); setSelectedEdgeId(null); }} elevateNodesOnSelect={false} fitView fitViewOptions={{ padding: 0.25 }} minZoom={0.15} maxZoom={1.6} deleteKeyCode={['Backspace', 'Delete']} colorMode="dark" proOptions={{ hideAttribution: false }}>
+            onNodeClick={(event, node) => clickNode(node.id, event.metaKey || event.ctrlKey)} onEdgeClick={(_event, edge) => { setSelectedEdgeId(edge.id); setSelectedId(null); setMultiIds([]); }}
+            onPaneClick={() => { setSelectedId(null); setSelectedEdgeId(null); setMultiIds([]); }} elevateNodesOnSelect={false} fitView fitViewOptions={{ padding: 0.25 }} minZoom={0.15} maxZoom={1.6} deleteKeyCode={['Backspace', 'Delete']} colorMode="dark" proOptions={{ hideAttribution: false }}>
             <Background gap={22} size={1} color="#2c353d" />
             <Controls showInteractive={false} />
             <MiniMap<StageNode> nodeComponent={MiniMapNode} maskColor="rgba(16,20,25,.6)" pannable zoomable />
           </ReactFlow>
           {nodes.length === 0 && <div className="empty-canvas"><Network size={36} /><h2>첫 단계를 만들어 보세요</h2><p>워커를 추가하고, 프로젝트·워크트리 그룹으로 작업 위치를 묶을 수 있습니다.</p><div className="empty-actions"><button className="button primary" onClick={() => addNode('worker')}><Plus size={16} />워커 추가</button>
             <button className="button" onClick={() => { setGenerateForm((form) => ({ ...form, project: form.project || defaultProject() })); setGenerateDialog(true); }}><Sparkles size={16} />자연어로 만들기</button></div></div>}
-          <div className="canvas-hint">드래그로 이동 · 단계를 그룹 안에 놓아 작업 위치 지정 · 포트를 연결해 흐름 만들기 · Delete로 삭제</div>
+          <div className="canvas-hint">빈 곳 드래그로 여러 개 선택 · 휠/가운데 버튼·Space+드래그로 화면 이동 · 노드 드래그로 이동 · 단계를 그룹 안에 놓아 작업 위치 지정 · 포트를 연결해 흐름 만들기 · Delete로 삭제</div>
         </section>
 
-        <aside className="inspector"><div className="inspector-header"><span><Settings2 size={16} />{selectedEdge ? '연결 속성' : selectedGroup ? '그룹 속성' : selectedFrame ? '메모 그룹 속성' : '단계 속성'}</span><span className="inspector-counter">{selected ? `${nodes.findIndex((node) => node.id === selected.id) + 1} / ${nodes.length}` : '—'}</span></div>
-          {selectedGroup ? <div className="inspector-content"><div className="selected-kind">{selectedGroup.data.scope === 'worktree' ? <GitBranch size={21} /> : <FolderGit2 size={21} />}<div><span>{scopeNames[selectedGroup.data.scope ?? 'project']} 그룹</span><strong>{selectedGroup.data.label || '이름 없는 그룹'}</strong></div></div>
+        <aside className="inspector"><div className="inspector-header"><span><Settings2 size={16} />{multiSet.size > 1 ? '여러 노드 선택' : selectedEdge ? '연결 속성' : selectedGroup ? '그룹 속성' : selectedFrame ? '메모 그룹 속성' : '단계 속성'}</span><span className="inspector-counter">{selected ? `${nodes.findIndex((node) => node.id === selected.id) + 1} / ${nodes.length}` : '—'}</span></div>
+          {multiSet.size > 1 ? <div className="inspector-content"><div className="selected-kind"><Layers3 size={21} /><div><span>여러 노드</span><strong>{multiSet.size}개 선택됨</strong></div></div>
+            <ul className="multi-list">{nodes.filter((node) => multiSet.has(node.id)).map((node) => <li key={node.id}><span>{isGroup(node) ? `${scopeNames[node.data.scope ?? 'project']} 그룹` : kindNames[node.data.kind]}</span>{node.data.label || '이름 없음'}</li>)}</ul>
+            <div className="inspector-note"><Layers3 size={16} /><p>선택한 노드 하나를 끌면 함께 이동합니다. ⌘/Ctrl 클릭으로 하나씩 더하거나 빼고, Delete로 한 번에 지웁니다. 지운 그룹 안의 노드는 남습니다.</p></div>
+            <button className="button danger" onClick={removeSelected}><Trash2 size={14} />{multiSet.size}개 삭제</button>
+          </div> : selectedGroup ? <div className="inspector-content"><div className="selected-kind">{selectedGroup.data.scope === 'worktree' ? <GitBranch size={21} /> : <FolderGit2 size={21} />}<div><span>{scopeNames[selectedGroup.data.scope ?? 'project']} 그룹</span><strong>{selectedGroup.data.label || '이름 없는 그룹'}</strong></div></div>
             {selectedGroup.data.scope === 'worktree' && membership()}
             <label className="field-label" htmlFor="group-name">그룹 이름</label><input id="group-name" value={selectedGroup.data.label} maxLength={500} onChange={(event) => updateNode({ label: event.target.value })} />
             <label className="field-label" htmlFor="group-scope">대상 종류</label><select id="group-scope" value={selectedGroup.data.scope ?? 'project'} onChange={(event) => updateNode({ scope: event.target.value as GroupScope, path: '', ref: undefined, worktreeMode: undefined })}><option value="project" disabled={!!parentGroup}>Orca에 열린 프로젝트</option><option value="worktree">워크트리</option></select>
