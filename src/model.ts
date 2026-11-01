@@ -128,15 +128,19 @@ export const isFrame = (node: Pick<StageNode, 'data'>) => node.data.kind === 'fr
 export function orderNodes<T extends Pick<StageNode, 'id' | 'data' | 'parentId'>>(nodes: T[]): T[] {
   const byId = new Map(nodes.map((node) => [node.id, node]));
   const depth = (node: T) => { let d = 0; for (let p = node.parentId; p && d < maxGroupDepth + 1; p = byId.get(p)?.parentId) d += 1; return d; };
-  // Memo groups first (they sit under everything), then groups by nesting depth, then stages; stable within each rank.
-  const rank = (node: T) => isFrame(node) ? -1 : isGroup(node) ? depth(node) : maxGroupDepth + 2;
+  // Top-level memo groups first (they sit under everything), then groups by nesting depth — a memo group inside a group right
+  // after its group's level, so it draws over that group but under the groups nested beside it — then stages.
+  const rank = (node: T) => isFrame(node) ? (node.parentId ? depth(node) - 0.5 : -1) : isGroup(node) ? depth(node) : maxGroupDepth + 2;
   return nodes.map((node, index) => ({ node, index, rank: rank(node) })).sort((a, b) => a.rank - b.rank || a.index - b.index).map(({ node }) => node);
 }
 /** Project group + up to this many worktree groups nested inside one another. */
 export const maxGroupDepth = 4;
-/** Where a group may sit: a project nowhere; a worktree in a project or in another worktree (it becomes a child worktree). */
+/**
+ * What may sit in a group: stages and memo groups in any group; a worktree group in a project or another worktree (it becomes a
+ * child worktree); a project group nowhere. Memo groups never hold anything themselves.
+ */
 export function canNest(child: Pick<StageNode, 'data'>, parent: Pick<StageNode, 'data'>): boolean {
-  if (!isGroup(parent) || isFrame(child)) return false;
+  if (!isGroup(parent)) return false;
   if (!isGroup(child)) return true;
   return child.data.scope === 'worktree';
 }

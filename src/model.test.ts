@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { pendingDecisions, frameContents, orderNodes, decisionError, skippedStages, topologicalOrder, waves, nodeExecutionStatus, type FlowStage, type StageNode, membershipOf, nodeLocation, aggregateStatus, executionFinished, taskStatus, projectNodes, serializableWorkflow, newWorkflow, fromSnapshot, type TaskSummary, type WorkerSummary, type RunSnapshot, executionRun, inputsKey, mergeSnapshots, workflowRuns, variableRefs, substituteVariables, resolveVariables, applyDecision, loopBody, stageRound, loggedExecutions, type Execution } from './model.ts';
+import { pendingDecisions, frameContents, orderNodes, decisionError, skippedStages, topologicalOrder, waves, nodeExecutionStatus, type FlowStage, type StageNode, membershipOf, nodeLocation, aggregateStatus, executionFinished, taskStatus, projectNodes, serializableWorkflow, newWorkflow, fromSnapshot, type TaskSummary, type WorkerSummary, type RunSnapshot, executionRun, inputsKey, mergeSnapshots, workflowRuns, variableRefs, substituteVariables, resolveVariables, applyDecision, canNest, loopBody, stageRound, loggedExecutions, type Execution } from './model.ts';
 
 const task = (status: string): TaskSummary => ({ id: 'task-a', title: 'A', spec: 'A', status, deps: [] });
 const worker = (liveness: string): WorkerSummary => ({ dispatchId: 'dispatch-a', taskId: 'task-a', liveness, stage: 'working', provider: 'claude', model: 'example-model', outcome: '' });
@@ -368,4 +368,16 @@ test('a loop edge runs its body again: archived passes, cleared decisions, the e
   assert.equal(loggedExecutions([third.execution])[0].tasks.length, 11); // every pass's Tasks stay in the log
   const [projected] = projectNodes([{ id: 'impl', type: 'stage', position: { x: 0, y: 0 }, data: { label: 'impl', description: '', kind: 'worker' } }], null, false, [third.execution], 'e');
   assert.equal(projected.data.round, 3);
+});
+test('a memo group may sit in any group: it saves its parent and draws over that group but under groups nested beside it', () => {
+  const node = (id: string, kind: StageNode['data']['kind'], parentId?: string, scope?: 'project' | 'worktree'): StageNode => ({ id, type: kind === 'group' ? 'group' : kind === 'frame' ? 'frame' : 'stage',
+    position: { x: 0, y: 0 }, ...(parentId ? { parentId } : {}), ...(kind === 'group' || kind === 'frame' ? { width: 400, height: 300 } : {}),
+    data: { label: id, description: '', kind, ...(scope ? { scope, path: '' } : {}) } });
+  const nodes = [node('stage', 'worker', 'wt'), node('memo-in-wt', 'frame', 'wt'), node('wt', 'group', 'project', 'worktree'),
+    node('memo-in-project', 'frame', 'project'), node('memo-top', 'frame'), node('project', 'group', undefined, 'project')];
+  assert.ok(canNest(nodes[1], nodes[2]), 'a memo group goes in a worktree group');
+  assert.ok(!canNest(nodes[0], nodes[4]), 'nothing goes inside a memo group');
+  const saved = serializableWorkflow({ ...newWorkflow(), nodes, edges: [] });
+  assert.deepEqual(saved.nodes.map((item) => [item.id, item.parentId]), [
+    ['memo-top', undefined], ['project', undefined], ['memo-in-project', 'project'], ['wt', 'project'], ['memo-in-wt', 'wt'], ['stage', 'wt']]);
 });

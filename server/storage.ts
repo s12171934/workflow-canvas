@@ -54,10 +54,9 @@ export function validateWorkflow(value: unknown): Workflow {
       || (node.height !== undefined && !(Number.isFinite(node.height) && node.height > 0 && node.height < 20000)))) {
       throw new Error('그룹 노드의 대상(프로젝트·워크트리)과 경로가 올바르지 않습니다.');
     }
-    if (frame && (node.parentId !== undefined
-      || (node.width !== undefined && !(Number.isFinite(node.width) && node.width > 0 && node.width < 20000))
+    if (frame && ((node.width !== undefined && !(Number.isFinite(node.width) && node.width > 0 && node.width < 20000))
       || (node.height !== undefined && !(Number.isFinite(node.height) && node.height > 0 && node.height < 20000)))) {
-      throw new Error('메모 그룹은 다른 그룹 안에 넣을 수 없고, 크기가 올바라야 합니다.');
+      throw new Error('메모 그룹의 크기가 올바르지 않습니다.');
     }
     if (node.data.join !== undefined && !['all', 'any'].includes(node.data.join)) throw new Error('합류 방식은 all 또는 any 여야 합니다.');
     if (node.data.kind === 'branch') {

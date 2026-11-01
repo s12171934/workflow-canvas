@@ -318,7 +318,8 @@ function Workspace() {
       ...(node.id === selectedMembership.project?.id || selectedMembership.worktrees.some((group) => group.id === node.id) ? { ancestor: true } : {}) },
     // Groups sit under every stage (deeper groups above shallower ones), including stages that only overlap them.
     // Memo groups sit under everything, groups included.
-    ...(isGroup(node) ? { zIndex: groupDepth(node) - maxGroupDepth - 2 } : isFrame(node) ? { zIndex: -maxGroupDepth - 4 } : {}) }))), [nodes, observed, stale, executions, executionView, visibleIds, selectedId, multiSet, selectedMembership]);
+    // A memo group inside a group shares its group's layer (it is ordered right after it): over that group, under groups nested beside it.
+    ...(isGroup(node) ? { zIndex: groupDepth(node) - maxGroupDepth - 2 } : isFrame(node) ? { zIndex: node.parentId ? groupDepth(node) - 1 - maxGroupDepth - 2 : -maxGroupDepth - 4 } : {}) }))), [nodes, observed, stale, executions, executionView, visibleIds, selectedId, multiSet, selectedMembership]);
   const displayEdges = useMemo(() => edges.map((edge) => {
     const target = displayNodes.find((node) => node.id === edge.target);
     const source = displayNodes.find((node) => node.id === edge.source);
@@ -657,22 +658,22 @@ function Workspace() {
   function stopDrag(dragged: StageNode[]) {
     const drag = frameDrag.current;
     frameDrag.current = null;
-    for (const node of dragged) if (!isFrame(node)) regroup(node.id);
+    for (const node of dragged) regroup(node.id);
     // Carried stages may have left (or entered) a project/worktree group; settle that once the moved positions are measured.
     if (drag?.items.size) requestAnimationFrame(() => { for (const id of drag.items.keys()) regroup(id); });
   }
-  /** Dropping a stage inside a group puts it in that group; dropping it outside takes it out. */
+  /** Dropping a stage or a memo group inside a group puts it in that group; dropping it outside takes it out. */
   function regroup(id: string) {
     const dragged = getInternalNode(id);
-    if (!dragged || isFrame(dragged)) return;
+    if (!dragged) return;
     // A project group never goes inside anything; a worktree group goes in a project or another worktree.
     if (isGroup(dragged) && dragged.data.scope !== 'worktree') return;
     const absolute = dragged.internals.positionAbsolute;
     const center = { x: absolute.x + (dragged.measured.width ?? 254) / 2, y: absolute.y + (dragged.measured.height ?? 150) / 2 };
     const inside = (node: StageNode) => { for (let p = groupOf({ nodes }, node), d = 0; p && d <= maxGroupDepth; p = groupOf({ nodes }, p), d += 1) if (p.id === id) return true; return false; };
     const candidates = nodes.filter((node) => isGroup(node) && node.id !== id && canNest(dragged, node) && !inside(node)
-      // Never exceed the nesting limit (a dragged group brings its own depth along).
-      && groupDepth(node) + 1 <= maxGroupDepth)
+      // Never exceed the nesting limit (a dragged group brings its own depth along); a memo group adds no level.
+      && (isFrame(dragged) || groupDepth(node) + 1 <= maxGroupDepth))
       // Innermost first: the deepest group under the pointer wins.
       .sort((a, b) => groupDepth(b) - groupDepth(a));
     const target = candidates.map((group) => getInternalNode(group.id)).find((group) => {

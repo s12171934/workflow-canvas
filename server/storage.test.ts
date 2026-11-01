@@ -136,3 +136,12 @@ test('only workflow links take a link mode, and only a known one', () => {
   assert.throws(() => validateWorkflow({ ...graph, nodes: [{ ...graph.nodes[0], data: { ...graph.nodes[0].data, linkMode: 'later' as never } }] }));
   assert.throws(() => validateWorkflow({ ...graph, nodes: [{ ...graph.nodes[0], data: { ...graph.nodes[0].data, kind: 'worker' as const } }] }));
 });
+test('memo groups go in any group, but nothing goes in a memo group', () => {
+  const graph = newWorkflow();
+  const project = { id: 'p', type: 'group', position: { x: 0, y: 0 }, width: 800, height: 600, data: { label: 'P', description: '', kind: 'group', scope: 'project', path: '' } };
+  const worktree = { id: 'w', type: 'group', parentId: 'p', position: { x: 10, y: 10 }, width: 600, height: 400, data: { label: 'W', description: '', kind: 'group', scope: 'worktree', path: '' } };
+  const frame = { id: 'f', type: 'frame', parentId: 'w', position: { x: 10, y: 10 }, width: 300, height: 200, data: { label: '묶음', description: '', kind: 'frame' } };
+  const stored = validateWorkflow({ ...graph, nodes: [project, worktree, frame, ...graph.nodes] });
+  assert.equal(stored.nodes.find((node) => node.id === 'f')!.parentId, 'w');
+  assert.throws(() => validateWorkflow({ ...graph, nodes: [project, worktree, frame, ...graph.nodes.map((node, index) => index ? node : { ...node, parentId: 'f' })] }), /그룹 노드 안에만/);
+});
