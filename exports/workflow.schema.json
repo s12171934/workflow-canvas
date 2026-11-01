@@ -566,6 +566,55 @@
             "additionalProperties": {
               "type": "string"
             }
+          },
+          "values": {
+            "type": "object",
+            "description": "이 자동화가 매번 쓰는 설정값(입력한 값만. 비운 키는 실행 때의 기본값).",
+            "propertyNames": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9_]{0,39}$"
+            },
+            "additionalProperties": {
+              "type": "string",
+              "maxLength": 2000
+            }
+          }
+        }
+      }
+    },
+    "variables": {
+      "type": "array",
+      "maxItems": 30,
+      "description": "워크플로 설정값(환경변수). 실행 창에서 입력받고 자동화는 값을 고정한다. 단계 지침의 {{키}} 가 그 값으로 바뀌고, 링크한 워크플로(펼침·항목마다 따로 실행)에도 같은 키로 전달된다. 지침에 선언하지 않은 {{키}} 가 있으면 실행 전에 거부한다. 비밀값은 넣지 않는다.",
+      "items": {
+        "type": "object",
+        "required": [
+          "key",
+          "label"
+        ],
+        "properties": {
+          "key": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]{0,39}$",
+            "description": "지침에 {{키}} 로 쓰는 이름. 워크플로 안에서 겹치지 않는다."
+          },
+          "label": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          },
+          "description": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "default": {
+            "type": "string",
+            "maxLength": 2000,
+            "description": "값을 주지 않았을 때 쓰는 값"
+          },
+          "required": {
+            "type": "boolean",
+            "description": "값도 기본값도 없으면 실행하지 않는다"
           }
         }
       }

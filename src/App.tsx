@@ -12,7 +12,7 @@ import {
 } from 'lucide-react';
 import {
   aggregateStatus, executionFinished, executionRun, executionStatuses as computeExecutionStatuses, mergeSnapshots, workflowRuns, openableStatuses, fromSnapshot, newWorkflow, projectNodes, serializableWorkflow, statusLabels,
-  asksAtRun, defaultWorkerModel, effortLevels, frameContents, isFrame, launchesWorker, workerModels, type Effort, type Rect, joinNames, pendingDecisions, gateAskerNames, type GateAsker, linkModeNames, maxSpawnItems, type LinkMode, type FlowStage, type PendingDecision, branchJudgeNames, branchModeNames, isBranch, maxBranchOutputs, type BranchJudge, type BranchMode, type BranchOutput, defaultCleanup, triggerNames, worktreeNamePattern, type AutomationConfig, type AutomationState, type Cleanup, canNest, maxGroupDepth, nameSourceNames, safeWorktreeName, type NameSource, createsWorktree, groupOf, membershipOf, orderNodes, worktreeRepo, isExecutable, isGroup, kindNames, normalizeNodes, scopeNames,
+  asksAtRun, defaultWorkerModel, effortLevels, frameContents, isFrame, launchesWorker, workerModels, type Effort, type Rect, joinNames, pendingDecisions, gateAskerNames, type GateAsker, linkModeNames, maxSpawnItems, type LinkMode, variableKeyPattern, variableRefs, maxVariables, maxVariableValue, type WorkflowVariable, type FlowStage, type PendingDecision, branchJudgeNames, branchModeNames, isBranch, maxBranchOutputs, type BranchJudge, type BranchMode, type BranchOutput, defaultCleanup, triggerNames, worktreeNamePattern, type AutomationConfig, type AutomationState, type Cleanup, canNest, maxGroupDepth, nameSourceNames, safeWorktreeName, type NameSource, createsWorktree, groupOf, membershipOf, orderNodes, worktreeRepo, isExecutable, isGroup, kindNames, normalizeNodes, scopeNames,
   type Workflow, type Execution, type StageNode, type StageKind, type NodeKind, type GroupScope, type StageStatus, type RunSummary, type RunSnapshot, type Locations,
 } from './model';
 import { RunLogDialog } from './RunLog';
@@ -135,7 +135,30 @@ type PointerMode = 'select' | 'pan';
 const pointerModeKey = 'workflow-canvas:pointer-mode';
 function storedPointerMode(): PointerMode { try { return localStorage.getItem(pointerModeKey) === 'pan' ? 'pan' : 'select'; } catch { return 'select'; } }
 function lastProject(): string | null { try { return localStorage.getItem(lastProjectKey); } catch { return null; } }
-type RunForm = { mode: 'now' | 'schedule'; project: string; count: number; inputs: Record<string, string>; cleanup: Cleanup;
+/** The workflow's settings (like environment variables): asked in the run dialog, fixed per automation, used as {{key}}. */
+function VariablesEditor({ variables, nodes, onChange }: { variables: WorkflowVariable[]; nodes: StageNode[]; onChange: (variables: WorkflowVariable[]) => void }) {
+  const used = new Set(nodes.filter(isExecutable).flatMap((node) => variableRefs(node.data.description)));
+  const update = (index: number, patch: Partial<WorkflowVariable>) => onChange(variables.map((item, at) => at === index ? { ...item, ...patch } : item));
+  const nextKey = () => { let n = variables.length + 1; while (variables.some((item) => item.key === `value_${n}`)) n += 1; return `value_${n}`; };
+  return <section className="variables-editor" aria-label="워크플로 설정값">
+    <div className="field-label">워크플로 설정값</div>
+    <p className="field-help">실행 창과 자동화에서 입력받는 값입니다(예: 에픽 티켓 링크, 스프레드시트 주소). 단계 지침에 {'{{키}}'} 로 쓰면 그 값으로 바뀌고, 링크한 워크플로에도 같은 키로 전달됩니다. 비밀값은 넣지 마세요.</p>
+    {variables.map((item, index) => {
+      const keyError = !variableKeyPattern.test(item.key) ? '영문 소문자로 시작하는 소문자·숫자·_' : variables.some((other, at) => at !== index && other.key === item.key) ? '겹치는 키' : '';
+      return <div key={index} className="variable-row">
+        <div className="variable-line"><input aria-label="키" className={`variable-key-input ${keyError ? 'invalid' : ''}`} value={item.key} maxLength={40} title={keyError || '지침에 {{키}} 로 씁니다'}
+          onChange={(event) => update(index, { key: event.target.value.toLowerCase().replace(/[^a-z0-9_]/g, '_') })} />
+          <input aria-label="이름" value={item.label} maxLength={100} placeholder="이름 (예: 에픽 티켓 링크)" onChange={(event) => update(index, { label: event.target.value })} />
+          <button className="icon-button" aria-label={`${item.label || item.key} 삭제`} title="삭제" onClick={() => onChange(variables.filter((_, at) => at !== index))}><Trash2 size={13} /></button></div>
+        <input aria-label="기본값" value={item.default ?? ''} maxLength={maxVariableValue} placeholder="기본값 (선택)" onChange={(event) => update(index, { default: event.target.value || undefined })} />
+        <input aria-label="설명" value={item.description ?? ''} maxLength={500} placeholder="실행 창에 보일 설명 (선택)" onChange={(event) => update(index, { description: event.target.value || undefined })} />
+        <label className="check-row"><input type="checkbox" checked={!!item.required} onChange={(event) => update(index, { required: event.target.checked || undefined })} />필수 — 값도 기본값도 없으면 실행하지 않음</label>
+        {keyError ? <p className="field-help warning">키: {keyError}</p> : !used.has(item.key) && <p className="field-help">아직 어느 단계 지침에도 {`{{${item.key}}}`} 가 없습니다.</p>}
+      </div>; })}
+    <button className="button small" disabled={variables.length >= maxVariables} onClick={() => onChange([...variables, { key: nextKey(), label: '' }])}><Plus size={13} />설정값 추가</button>
+  </section>;
+}
+type RunForm = { mode: 'now' | 'schedule'; project: string; count: number; inputs: Record<string, string>; cleanup: Cleanup; values: Record<string, string>;
   name: string; trigger: string; cron: string; time: string; day: number };
 /** "매일 09:00", "매주 월 09:00", or the cron text. */
 function scheduleText(config: Pick<AutomationConfig, 'trigger' | 'time' | 'day'>) {
@@ -198,7 +221,7 @@ function Workspace() {
   const [view, setView] = useState<string>('all');
   const [runDialog, setRunDialog] = useState(false);
   const [logOpen, setLogOpen] = useState(false);
-  const [runForm, setRunForm] = useState<RunForm>({ mode: 'now', project: '', count: 1, inputs: {}, cleanup: defaultCleanup,
+  const [runForm, setRunForm] = useState<RunForm>({ mode: 'now', project: '', count: 1, inputs: {}, cleanup: defaultCleanup, values: {},
     name: '', trigger: 'daily', cron: '0 9 * * 1-5', time: '09:00', day: 1 });
   const [watchUntil, setWatchUntil] = useState(0);
   const importRef = useRef<HTMLInputElement>(null);
@@ -648,6 +671,7 @@ function Workspace() {
     const preferred = [workflow.workspace, remembered].find((path) => path && locations.projects.some((item) => item.path === path)) ?? '';
     setRunForm((form) => ({ ...form, project: preferred, cleanup: workflow.cleanup ?? defaultCleanup,
       inputs: Object.fromEntries(nodes.filter(asksAtRun).map((node) => [node.id, form.inputs[node.id] ?? ''])),
+      values: Object.fromEntries((workflow.variables ?? []).map((item) => [item.key, form.values[item.key] ?? ''])),
       name: form.name || '정기 실행' }));
     setRunDialog(true);
   }
@@ -656,6 +680,9 @@ function Workspace() {
     if (!form.project) { setNotice('실행할 프로젝트를 고르세요.'); return; }
     const badInput = Object.entries(form.inputs).find(([, value]) => value && !worktreeNamePattern.test(value));
     if (badInput) { setNotice('워크트리 이름은 영문·숫자·. _ - 만 쓸 수 있고 -로 시작할 수 없습니다.'); return; }
+    const missingValue = (workflow.variables ?? []).find((item) => item.required && !form.values[item.key]?.trim() && !item.default?.trim());
+    if (missingValue) { setNotice(`필수 설정값 「${missingValue.label}」을(를) 입력하세요.`); return; }
+    const values = Object.fromEntries(Object.entries(form.values).map(([key, value]) => [key, value.trim()]).filter(([, value]) => value));
     // The chosen clean-up becomes this workflow's default; save first so the server runs exactly what is on screen.
     const doc = serializableWorkflow({ ...current, cleanup: form.cleanup });
     if (JSON.stringify(doc) !== savedFingerprint) { setWorkflow((value) => ({ ...value, cleanup: form.cleanup })); if (!(await save(doc))) return; }
@@ -664,14 +691,14 @@ function Workspace() {
     setBusy(true);
     try {
       if (form.mode === 'now') {
-        await api(`/api/workflows/${doc.id}/execute`, { method: 'POST', body: JSON.stringify({ count: form.count, project: form.project, inputs, cleanup: form.cleanup }) });
+        await api(`/api/workflows/${doc.id}/execute`, { method: 'POST', body: JSON.stringify({ count: form.count, project: form.project, inputs, values, cleanup: form.cleanup }) });
         setWatchUntil(Date.now() + 5 * 60_000);
         setNotice(`코디네이터를 띄웠습니다. ${form.count}회 실행이 등록되면 그래프에 표시됩니다.`);
       } else {
         const trigger = form.trigger === 'cron' ? form.cron.trim() : form.trigger;
         const result = await api<Workflow>(`/api/workflows/${doc.id}/automations`, { method: 'POST', body: JSON.stringify({
           name: form.name, trigger, ...(['daily', 'weekdays', 'weekly'].includes(form.trigger) ? { time: form.time } : {}),
-          ...(form.trigger === 'weekly' ? { day: form.day } : {}), count: form.count, project: form.project, inputs, cleanup: form.cleanup }) });
+          ...(form.trigger === 'weekly' ? { day: form.day } : {}), count: form.count, project: form.project, inputs, values, cleanup: form.cleanup }) });
         setWorkflow((value) => ({ ...value, automations: result.automations }));
         setSavedFingerprint(JSON.stringify(serializableWorkflow({ ...doc, automations: result.automations })));
         setNotice(`자동화 「${form.name}」을(를) Orca에 등록했습니다.`);
@@ -851,6 +878,8 @@ function Workspace() {
               <button className="icon-button" title="지금 실행" aria-label={`${config.name} 지금 실행`} disabled={!config.orcaId || state === null} onClick={() => void automationAction(config, 'run')}><Play size={13} /></button>
               <button className="icon-button" title="자동화 삭제" aria-label={`${config.name} 삭제`} onClick={() => void automationAction(config, 'remove')}><Trash2 size={13} /></button></div>
             <small>{scheduleText(config)} · ×{config.count} · {shortPath(config.project)}</small>
+            {config.values && Object.keys(config.values).length > 0 && <small className="automation-values" title={Object.entries(config.values).map(([key, value]) => `${key} = ${value}`).join('\n')}>
+              {Object.entries(config.values).map(([key, value]) => `${(workflow.variables ?? []).find((item) => item.key === key)?.label ?? key}: ${value}`).join(' · ')}</small>}
             <small>{state === null ? 'Orca에서 찾을 수 없음' : state === undefined ? '상태 확인 중' : !state.enabled ? '꺼짐'
               : `다음 ${state.nextRunAt ? new Date(state.nextRunAt).toLocaleString('ko-KR', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '—'}${state.lastRunAt ? ` · 마지막 ${new Date(state.lastRunAt).toLocaleString('ko-KR', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}` : ''}`}</small>
           </div>; })}
@@ -1076,6 +1105,13 @@ function Workspace() {
               <p className="field-help">어느 쪽이든 실제로 진행 중인 앞 단계가 모두 끝난 뒤에 시작합니다.</p></>}
             <label className="field-label" htmlFor="stage-description">{selected.data.kind === 'note' ? '메모 내용' : selected.data.kind === 'gate' ? '사용자에게 물을 내용' : selected.data.kind === 'branch' ? '판정 지침' : selected.data.kind === 'workflow' ? '추가 지침' : '작업 지침'}</label><textarea id="stage-description" rows={5} value={selected.data.description} maxLength={20000} placeholder={selected.data.kind === 'note' ? '실행에 쓰이지 않는 설명입니다.' : selected.data.kind === 'branch' ? '무엇을 근거로 어느 출력을 고를지 적으세요.' : selected.data.kind === 'gate' ? '무엇을 확인하고 통과·거절을 정할지 적으세요.' : '목표, 작업 범위, 완료 조건을 적으세요.'} onChange={(event) => updateNode({ description: event.target.value })} />
             {selected.data.kind !== 'note' && (() => {
+              const declared = new Set((workflow.variables ?? []).map((item) => item.key));
+              const unknown = variableRefs(selected.data.description).filter((key) => !declared.has(key));
+              if (unknown.length) return <p className="field-help warning">{unknown.map((key) => `{{${key}}}`).join(', ')} 은(는) 워크플로 설정값에 없습니다. 빈 곳을 눌러 설정값을 추가하세요 — 이대로면 실행 전에 거부됩니다.</p>;
+              if (declared.size) return <p className="field-help">설정값 {[...declared].map((key) => `{{${key}}}`).join(' ')} 를 지침에 쓰면 실행할 때 값으로 바뀝니다.</p>;
+              return null;
+            })()}
+            {selected.data.kind !== 'note' && (() => {
               if (generations.some((item) => item.kind === 'brief' && item.nodeId === selected.id && item.status === 'pending')) {
                 return <p className="field-help generating"><LoaderCircle size={12} className="spin" />Orca에서 지침을 생성하는 중입니다. 에이전트 탭에서 진행을 볼 수 있습니다.</p>;
               }
@@ -1134,7 +1170,8 @@ function Workspace() {
               return output ? <p className="field-help">분기 「{source!.data.label}」의 출력 <code>{output.id}</code>({output.label || '조건 없음'})에서 나온 연결입니다. 분기가 이 출력을 고를 때만 이어지고, 고르지 않으면 뒤 단계는 건너뜁니다.</p>
                 : <p className="field-help">일반 연결은 병렬입니다. 앞 단계가 끝나면 바로 이어지고, 한 단계에 여러 연결이 들어오면 건너뛰지 않은 앞 단계가 모두 끝날 때까지 기다립니다. 연결 설명은 참고용이며 진행 여부를 바꾸지 않습니다. 골라서 진행하려면 분기 노드를 쓰세요.</p>;
             })()}<button className="button danger" onClick={removeSelected}><Trash2 size={14} />연결 삭제</button></div>
-            : <div className="inspector-empty"><Settings2 size={28} /><p>단계나 연결을 선택해<br />속성을 편집하세요.</p></div>}
+            : <div className="inspector-content"><div className="inspector-empty compact"><Settings2 size={22} /><p>단계나 연결을 선택해 속성을 편집하세요.</p></div>
+              <VariablesEditor variables={workflow.variables ?? []} nodes={nodes} onChange={(variables) => setWorkflow((value) => ({ ...value, variables: variables.length ? variables : undefined }))} /></div>}
         </aside>
       </div>
       <footer className="statusbar"><span><Circle size={10} />{dirty ? '저장하지 않은 변경 사항' : '로컬 저장 완료'}</span><span>{workflow.runId ? `3초 간격 조회 · ${snapshot && !stale ? new Date(snapshot.observedAt).toLocaleTimeString('ko-KR') : '상태 확인 중'}` : 'Orca Run을 연결하면 실제 실행 상태가 표시됩니다.'}</span><span>JSON v1</span></footer>
@@ -1161,6 +1198,12 @@ function Workspace() {
               onChange={(event) => setRunForm((form) => ({ ...form, inputs: { ...form.inputs, [group.id]: safeWorktreeName(event.target.value) } }))} />
 </div>)}
           <p className="field-help">비워 둔 칸은 실행 중에 코디네이터가 터미널에서 묻습니다. 같은 이름의 워크트리가 이미 있으면 재사용합니다.</p></fieldset>}
+        {(workflow.variables ?? []).length > 0 && <fieldset className="modal-section"><legend>설정값</legend>
+          {workflow.variables!.map((item) => <div key={item.key}><label className="field-label" htmlFor={`run-value-${item.key}`}>{item.label}{item.required && !item.default ? ' *' : ''} <code className="variable-key">{`{{${item.key}}}`}</code></label>
+            <input id={`run-value-${item.key}`} value={runForm.values[item.key] ?? ''} maxLength={maxVariableValue} placeholder={item.default ? `비우면 기본값: ${item.default}` : item.required ? '필수' : '비우면 주지 않음'}
+              onChange={(event) => setRunForm((form) => ({ ...form, values: { ...form.values, [item.key]: event.target.value } }))} />
+            {item.description && <p className="field-help">{item.description}</p>}</div>)}
+          <p className="field-help">{runForm.mode === 'schedule' ? '자동화는 입력한 값을 고정해 매번 씁니다. ' : ''}단계 지침의 {'{{키}}'} 가 이 값으로 바뀌고, 링크한 워크플로에도 같은 키로 전달됩니다. 토큰·비밀번호 같은 비밀값은 넣지 마세요(워크플로 파일과 브리프에 그대로 남습니다).</p></fieldset>}
         {runForm.mode === 'schedule' && <fieldset className="modal-section"><legend>자동화 일정</legend>
           <label className="field-label" htmlFor="run-auto-name">자동화 이름</label>
           <input id="run-auto-name" required value={runForm.name} maxLength={100} onChange={(event) => setRunForm((form) => ({ ...form, name: event.target.value }))} />

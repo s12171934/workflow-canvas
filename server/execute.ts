@@ -1,4 +1,4 @@
-import { asksAtRun, spawnsRuns, maxSpawnItems, createsWorktree, gateOutputs, defaultWorkerModel, launchesWorker, isBranch, isExecutable, isGroup, membershipOf, newWorktreeToken, orderNodes, parentWorktree, topologicalOrder, waves, worktreeRepo, type FlowStage, type StageNode, type Workflow, type Cleanup, defaultCleanup } from '../src/model.ts';
+import { asksAtRun, spawnsRuns, maxSpawnItems, resolveVariables, substituteVariables, variableRefs, createsWorktree, gateOutputs, defaultWorkerModel, launchesWorker, isBranch, isExecutable, isGroup, membershipOf, newWorktreeToken, orderNodes, parentWorktree, topologicalOrder, waves, worktreeRepo, type FlowStage, type StageNode, type Workflow, type Cleanup, defaultCleanup } from '../src/model.ts';
 
 export type BriefInput = {
   graph: Workflow;
@@ -19,6 +19,8 @@ export type BriefInput = {
   logUrl?: string;
   /** Execution-log id of this 실행 request: the coordinator names it when registering, since requests may overlap. */
   launchId?: string;
+  /** Setting values of this run (defaults applied): they replace {{key}} in instructions, here and in linked workflows. */
+  values?: Record<string, string>;
 };
 
 /** How deep workflow links may nest; deeper links are refused before a coordinator starts. */
@@ -85,6 +87,18 @@ export function checkSpawns(workflows: Workflow[], linked: Map<string, Workflow>
   }
 }
 
+/** Refuses {{key}} in instructions that the workflow does not declare as a setting (each workflow declares what it uses). */
+export function checkVariables(workflows: Workflow[]) {
+  for (const workflow of workflows) {
+    const where = workflows.length > 1 ? `'${workflow.name}'의 ` : '';
+    const declared = new Set((workflow.variables ?? []).map((item) => item.key));
+    for (const node of workflow.nodes.filter(isExecutable)) {
+      const unknown = variableRefs(node.data.description).filter((key) => !declared.has(key));
+      if (unknown.length) throw new Error(`${where}'${node.data.label || '단계'}' 지침의 ${unknown.map((key) => `{{${key}}}`).join(', ')} 이(가) 워크플로 설정값에 없습니다. 설정값을 추가하거나 지침을 고치세요.`);
+    }
+  }
+}
+
 type WorktreeSpec = {
   location: string; group: string; mode: 'existing' | 'create'; repo: string; parent?: string;
   existing?: { path: string; name?: string; branch?: string };
@@ -144,7 +158,9 @@ type BriefStage = {
   reportsItems?: string[];
 };
 
-type BriefContext = { linked: Map<string, Workflow>; project: string; inputs: Record<string, string>; worktrees: WorktreeSpec[] };
+type BriefContext = { linked: Map<string, Workflow>; project: string; inputs: Record<string, string>; worktrees: WorktreeSpec[];
+  /** Setting values for this level: the run's, with a linked workflow's own defaults filling keys the run does not set. */
+  values: Record<string, string> };
 
 /** Location key of a group in the brief: a token for groups created at run time, else the picked path. */
 function groupLocation(group: StageNode, prefix: string) {
@@ -185,7 +201,7 @@ function stagesOf(graph: Workflow, ctx: BriefContext, fallback: string, prefix =
     const spawnTarget = spawnsRuns(node) ? target : undefined;
     const feeds = stageEdges.filter((edge) => edge.source === node.id).map((edge) => byId.get(edge.target)!).filter(spawnsRuns);
     return {
-      nodeId: `${prefix}${node.id}`, label: node.data.label, kind: node.data.kind, instructions: node.data.description, location,
+      nodeId: `${prefix}${node.id}`, label: node.data.label, kind: node.data.kind, instructions: substituteVariables(node.data.description, ctx.values), location,
       wave: wave.get(node.id) ?? 0,
       after: stageEdges.filter((edge) => edge.target === node.id).map((edge) => {
         const source = byId.get(edge.source)!;
@@ -209,7 +225,7 @@ function stagesOf(graph: Workflow, ctx: BriefContext, fallback: string, prefix =
       })(),
       ...(namers.has(node.id) ? { namesWorktree: namers.get(node.id) } : {}),
       ...(launchesWorker(node) ? { model: node.data.workerModel || defaultWorkerModel, ...(node.data.effort ? { effort: node.data.effort } : {}) } : {}),
-      ...(sub ? { workflow: { id: sub.id, name: sub.name, wait: node.data.linkMode !== 'start', stages: stagesOf(sub, ctx, location, `${prefix}${node.id}.`) } } : {}),
+      ...(sub ? { workflow: { id: sub.id, name: sub.name, wait: node.data.linkMode !== 'start', stages: stagesOf(sub, { ...ctx, values: { ...resolveVariables(sub.variables).values, ...ctx.values } }, location, `${prefix}${node.id}.`) } } : {}),
       ...(spawnTarget ? { spawn: { workflowId: spawnTarget.id, name: spawnTarget.name, input: spawnTarget.nodes.find(asksAtRun)?.id ?? '' } } : {}),
       ...(feeds.length ? { reportsItems: feeds.map((item) => `${prefix}${item.id}`) } : {}),
     };
@@ -240,7 +256,7 @@ function flatten(stages: BriefStage[]): FlowStage[] {
 }
 /** The executable graph of a run, links expanded, with brief stage ids (the keys of decisions and skipped). */
 export function flowOf(graph: Workflow, linked: Map<string, Workflow>): FlowStage[] {
-  return flatten(stagesOf(graph, { linked, project: '', inputs: {}, worktrees: [] }, ''));
+  return flatten(stagesOf(graph, { linked, project: '', inputs: {}, worktrees: [], values: resolveVariables(graph.variables).values }, ''));
 }
 
 /**
@@ -249,9 +265,10 @@ export function flowOf(graph: Workflow, linked: Map<string, Workflow>): FlowStag
  * judges the natural-language conditions in node instructions, and reports bindings back
  * through the canvas API so the graph can observe the executions.
  */
-export function buildBrief({ graph, linked = new Map(), count, apiBase, workspace, artifactDir, logUrl, launchId, inputs = {}, cleanup = defaultCleanup, automation }: BriefInput): string {
+export function buildBrief({ graph, linked = new Map(), count, apiBase, workspace, artifactDir, logUrl, launchId, inputs = {}, cleanup = defaultCleanup, automation, values }: BriefInput): string {
   const automationJson = automation ? `,"automation":${JSON.stringify(automation)}` : '';
-  const ctx: BriefContext = { linked, project: workspace, inputs, worktrees: [] };
+  const settings = values ?? resolveVariables(graph.variables).values;
+  const ctx: BriefContext = { linked, project: workspace, inputs, worktrees: [], values: settings };
   const stages = stagesOf(graph, ctx, workspace);
   const worktrees = ctx.worktrees;
   const worktreeSection = worktrees.length ? `
@@ -287,7 +304,9 @@ ${JSON.stringify(worktrees, null, 2)}
 ## 그래프
 - 워크플로: ${graph.name} (id \`${graph.id}\`)
 - 실행 프로젝트: \`${workspace}\` (사용자가 실행할 때 고른 프로젝트. 그룹 밖 단계는 여기서 작업한다)
-- 단계 목록(JSON). 위상 순서로 나열되어 있다. \`after\` 는 선행 단계, \`wave\` 는 단계 깊이(같은 wave 는 동시에 돌 수 있다), \`location\` 은 그 단계의 워커가 작업할 경로다(그룹 노드가 정한 Orca 프로젝트·워크트리). \`model\`·\`effort\` 는 그 단계 워커를 띄울 때 쓸 모델과 추론 수준이다(\`effort\` 가 없으면 모델 기본값). \`condition\` 은 연결 설명으로 **참고 정보일 뿐 진행 여부를 바꾸지 않는다.**
+${graph.variables?.length ? `- 실행 설정값: 이 실행에 주어진 값이다. 단계 지침의 \`{{키}}\` 는 이미 이 값으로 바뀌어 있다. 워커 spec 에는 지침을 그대로 쓰면 되고, 값을 바꾸거나 추측해 채우지 않는다. 값이 "(없음)" 인 설정은 주어지지 않은 것이다.
+${graph.variables.map((item) => `  - \`${item.key}\` ${item.label}: ${settings[item.key] ? `\`${settings[item.key].replace(/`/g, "'")}\`` : '(없음)'}`).join('\n')}
+` : ''}- 단계 목록(JSON). 위상 순서로 나열되어 있다. \`after\` 는 선행 단계, \`wave\` 는 단계 깊이(같은 wave 는 동시에 돌 수 있다), \`location\` 은 그 단계의 워커가 작업할 경로다(그룹 노드가 정한 Orca 프로젝트·워크트리). \`model\`·\`effort\` 는 그 단계 워커를 띄울 때 쓸 모델과 추론 수준이다(\`effort\` 가 없으면 모델 기본값). \`condition\` 은 연결 설명으로 **참고 정보일 뿐 진행 여부를 바꾸지 않는다.**
 - 단계 종류(\`kind\`):
   - \`worker\`: 워커 하나가 지침을 수행한다.
   - 들어오는 연결이 여럿인 단계: 기본은 **모두 필요**다. 앞 경로 중 하나라도 건너뛰어지면(고르지 않은 분기 출력, 건너뛴 단계) 이 단계도 건너뛴다. \`join: any\` 인 단계는 분기에서 갈라진 경로가 다시 모이는 곳이라 하나라도 오면 진행한다. 어느 쪽이든 건너뜀 계산은 캔버스가 하고, 너는 건너뛰지 않은 선행이 모두 끝났을 때 띄운다.

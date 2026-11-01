@@ -2,7 +2,7 @@ import { mkdir, readFile, readdir, rename, stat, writeFile, unlink } from 'node:
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { Workflow } from '../src/model.ts';
-import { effortLevels, linkModes, maxBranchOutputs, maxSpawnItems, maxGroupDepth, workerModelPattern, serializableWorkflow, topologicalOrder, validTrigger, worktreeNamePattern } from '../src/model.ts';
+import { effortLevels, linkModes, maxBranchOutputs, maxSpawnItems, maxVariables, validVariableValue, variableKeyPattern, maxGroupDepth, workerModelPattern, serializableWorkflow, topologicalOrder, validTrigger, worktreeNamePattern } from '../src/model.ts';
 
 export function validId(id: string): boolean { return /^[a-zA-Z0-9_-]{1,128}$/.test(id); }
 
@@ -116,6 +116,18 @@ export function validateWorkflow(value: unknown): Workflow {
     && (['coordinator', 'worktrees', 'sessions'] as const).every((key) => typeof (value as Record<string, unknown>)[key] === 'boolean');
   const validInputs = (value: unknown) => value === undefined || (!!value && typeof value === 'object' && !Array.isArray(value)
     && Object.entries(value).every(([key, name]) => validId(key) && typeof name === 'string' && (name === '' || worktreeNamePattern.test(name))));
+  if (graph.variables !== undefined) {
+    const keys = new Set<string>();
+    if (!Array.isArray(graph.variables) || graph.variables.length > maxVariables || graph.variables.some((item) => !item
+      || typeof item.key !== 'string' || !variableKeyPattern.test(item.key) || keys.has(item.key) || !keys.add(item.key)
+      || typeof item.label !== 'string' || !item.label.trim() || item.label.length > 100
+      || (item.description !== undefined && (typeof item.description !== 'string' || item.description.length > 500))
+      || (item.default !== undefined && !validVariableValue(item.default))
+      || (item.required !== undefined && typeof item.required !== 'boolean'))) {
+      throw new Error(`설정값은 ${maxVariables}개까지, 키는 영문 소문자로 시작하는 소문자·숫자·_ 40자 이하로 겹치지 않게, 이름은 100자 이하로 적으세요.`);
+    }
+  }
+  const declared = new Set((graph.variables ?? []).map((item) => item.key));
   if (graph.automations !== undefined) {
     const automationIds = new Set<string>();
     if (!Array.isArray(graph.automations) || graph.automations.length > 20 || graph.automations.some((item) => !item || !validId(item.id)
@@ -125,7 +137,9 @@ export function validateWorkflow(value: unknown): Workflow {
       || !validTrigger(item.trigger) || (item.time !== undefined && !/^([01]\d|2[0-3]):[0-5]\d$/.test(item.time))
       || (item.day !== undefined && !(Number.isInteger(item.day) && item.day >= 0 && item.day <= 6))
       || !validPath(item.project, false) || !(Number.isInteger(item.count) && item.count >= 1 && item.count <= 20)
-      || !validCleanup(item.cleanup) || !validInputs(item.inputs))) {
+      || !validCleanup(item.cleanup) || !validInputs(item.inputs)
+      || (item.values !== undefined && (!item.values || typeof item.values !== 'object' || Array.isArray(item.values)
+        || Object.entries(item.values).some(([key, value]) => !declared.has(key) || !validVariableValue(value)))))) {
       throw new Error('자동화 설정이 올바르지 않습니다.');
     }
   }

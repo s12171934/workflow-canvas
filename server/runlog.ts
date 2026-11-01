@@ -209,6 +209,12 @@ export function createRunLog(root: string) {
       return () => { stopped = true; clearTimeout(timer); };
     },
     async meta(id: string) { return readMeta(id); },
+    /** meta.json of the launch that owns a Run, if any. */
+    async metaOfRun(runId: string) {
+      await index();
+      const id = runId ? runLaunch.get(runId) : undefined;
+      return id ? readMeta(id) : undefined;
+    },
     async list(workflowId: string): Promise<RunLogSummary[]> {
       const ids = (await launches(workflowId)).slice(0, maxListed);
       return Promise.all(ids.map(async (id) => {

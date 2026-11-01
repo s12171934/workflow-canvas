@@ -680,3 +680,69 @@ test('a spawn link starts one separate execution of its target per reported item
     await rm(directory, { recursive: true, force: true });
   }
 });
+test('workflow settings: asked per run, fixed per automation, written into instructions, and passed on by spawn links', async () => {
+  await mkdir('.local', { recursive: true });
+  const directory = await mkdtemp(join(resolve('.local'), 'api-values-test-'));
+  const bridge = createOrcaBridge(async (args) => {
+    const place = places(args); if (place) return place;
+    if (args[0] === 'agent') return { terminal: { handle: 'term_x' } };
+    if (args[0] === 'automations' && args[1] === 'create') return { automation: { id: 'orca-auto-1' } };
+    if (args[0] === 'automations' && args[1] === 'list') return { automations: [] };
+    return {};
+  });
+  const json = { 'Content-Type': 'application/json' };
+  const variables = [{ key: 'epic', label: '에픽', required: true }, { key: 'sheet', label: 'TC 시트', default: 'https://example.com/sheet' }];
+  const stage = (id: string, description: string, extra = {}) => ({ id, type: 'stage' as const, position: { x: 0, y: 0 }, data: { label: id, description, kind: 'worker' as const, ...extra } });
+  const target = { version: 1 as const, id: 'per-ticket', name: '티켓 처리', description: '', runId: '', edges: [], variables: [{ key: 'epic', label: '에픽' }, { key: 'other', label: '다른 값' }], nodes: [
+    { id: 'wt', type: 'group' as const, position: { x: 0, y: 0 }, width: 400, height: 300,
+      data: { label: '티켓', description: '', kind: 'group' as const, scope: 'worktree' as const, path: '', worktreeMode: 'create' as const, nameSource: 'input' as const } },
+    { ...stage('fix', '{{epic}} 의 티켓을 고친다'), parentId: 'wt' },
+  ] };
+  const master = { version: 1 as const, id: 'master', name: '선별', description: '', runId: '', variables,
+    nodes: [stage('pick', '에픽 {{epic}} 를 보고 시트 {{sheet}} 를 갱신한다'), { ...stage('fan', '', { kind: 'workflow', workflowId: 'per-ticket', linkMode: 'spawn' }) }],
+    edges: [{ id: 'e1', source: 'pick', target: 'fan' }] };
+  const server = createApp(directory, bridge).listen(0, '127.0.0.1');
+  await new Promise<void>((resolve) => server.once('listening', resolve));
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const put = (graph: unknown) => fetch(`${base}/api/workflows/${(graph as { id: string }).id}`, { method: 'PUT', headers: json, body: JSON.stringify(graph) });
+  const execute = (id: string, values: unknown) => fetch(`${base}/api/workflows/${id}/execute`, { method: 'POST', headers: json, body: JSON.stringify({ count: 1, project: '/example/repo', values }) });
+  try {
+    assert.equal((await put({ ...master, variables: [...variables, { key: 'Bad-Key', label: 'x' }] })).status, 400);
+    assert.equal((await put(target)).status, 200);
+    assert.equal((await put(master)).status, 200);
+    assert.match((await (await execute('master', {})).json()).error, /필수 설정값.*「에픽」/);
+    assert.match((await (await execute('master', { epic: 'ABC-100', nope: 'x' })).json()).error, /없는 설정값.*nope/);
+    assert.match((await (await execute('master', { epic: 'two\nlines' })).json()).error, /한 줄/);
+    assert.equal((await execute('master', { epic: ' ABC-100 ' })).status, 200);
+    const [log] = await (await fetch(`${base}/api/workflows/master/logs`)).json();
+    assert.deepEqual(log.values, { epic: 'ABC-100', sheet: 'https://example.com/sheet' }); // the default fills what was not given
+    const brief = (await (await fetch(`${base}/api/workflows/master/logs/${log.id}/files/brief.md`)).json()).text as string;
+    assert.match(brief, /에픽 ABC-100 를 보고 시트 https:\/\/example\.com\/sheet 를 갱신한다/);
+    assert.match(brief, /`epic` 에픽: `ABC-100`/);
+
+    // A {{key}} the workflow does not declare is refused before anything starts.
+    assert.equal((await put({ ...master, id: 'typo', nodes: [stage('pick', '{{epik}} 를 본다')], edges: [] })).status, 200);
+    assert.match((await (await execute('typo', { epic: 'ABC-100' })).json()).error, /\{\{epik\}\}.*설정값에 없습니다/);
+
+    // An automation keeps what was typed (not the defaults) and runs with it.
+    const created = await (await fetch(`${base}/api/workflows/master/automations`, { method: 'POST', headers: json,
+      body: JSON.stringify({ name: '주기', trigger: 'hourly', project: '/example/repo', count: 1, values: { epic: 'ABC-200' }, cleanup: { coordinator: true, worktrees: false, sessions: true } }) })).json();
+    const config = created.automations[0];
+    assert.deepEqual(config.values, { epic: 'ABC-200' });
+
+    // The spawn link passes the run's values on, for the keys the target declares.
+    assert.equal((await fetch(`${base}/api/workflows/master/executions`, { method: 'PUT', headers: json,
+      body: JSON.stringify({ runId: 'run-m', launch: log.id, executions: [{ id: 'run-m-1', label: '#1', bindings: { pick: 't1', fan: 't2' } }] }) })).status, 200);
+    const spawned = await (await fetch(`${base}/api/workflows/master/executions/run-m-1/spawn`, { method: 'POST', headers: json,
+      body: JSON.stringify({ node: 'fan', project: '/example/repo', items: ['ABC-1'] }) })).json();
+    assert.equal(spawned.results[0].status, 'requested');
+    const child = await (await fetch(`${base}/api/workflows/per-ticket/logs/${spawned.results[0].launch}`)).json();
+    assert.deepEqual(child.meta.values, { epic: 'ABC-100' });
+    const childBrief = (await (await fetch(`${base}/api/workflows/per-ticket/logs/${spawned.results[0].launch}/files/brief.md`)).json()).text as string;
+    assert.match(childBrief, /ABC-100 의 티켓을 고친다/);
+    assert.match(childBrief, /`other` 다른 값: \(없음\)/);
+  } finally {
+    await new Promise<void>((resolve, reject) => { server.close((error) => error ? reject(error) : resolve()); server.closeAllConnections(); });
+    await rm(directory, { recursive: true, force: true });
+  }
+});

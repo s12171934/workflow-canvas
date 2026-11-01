@@ -161,7 +161,41 @@ export type Workflow = {
   cleanup?: Cleanup;
   /** Orca automations that run this workflow on a schedule. */
   automations?: AutomationConfig[];
+  /** Settings the run dialog and automations ask for (an epic link, a sheet URL…); stage instructions use them as {{key}}. */
+  variables?: WorkflowVariable[];
 };
+/**
+ * One setting of a workflow, like an environment variable: given per 실행 or fixed per automation, written into the brief,
+ * and replacing {{key}} in stage instructions. Linked workflows (expanded or spawned) receive the same key's value.
+ */
+export type WorkflowVariable = { key: string; label: string; description?: string; default?: string; required?: boolean };
+export const variableKeyPattern = /^[a-z][a-z0-9_]{0,39}$/;
+export const maxVariables = 30;
+export const maxVariableValue = 2000;
+/** A value is one line of text: no control characters. */
+export const validVariableValue = (value: unknown): value is string => typeof value === 'string' && value.length <= maxVariableValue && !/[\u0000-\u001f\u007f]/.test(value);
+const variableRef = /\{\{\s*([a-z][a-z0-9_]{0,39})\s*\}\}/g;
+/** Keys a text refers to as {{key}}. */
+export function variableRefs(text: string): string[] {
+  return [...new Set([...text.matchAll(variableRef)].map((match) => match[1]))];
+}
+/** Replaces {{key}} with its value; keys without a value stay as written. */
+export function substituteVariables(text: string, values: Record<string, string>): string {
+  return text.replace(variableRef, (whole, key: string) => Object.prototype.hasOwnProperty.call(values, key) ? values[key] : whole);
+}
+/**
+ * The values a run uses: what was given (declared keys only), else the default. Returns the required keys left empty too.
+ */
+export function resolveVariables(variables: WorkflowVariable[] | undefined, given: Record<string, string> = {}): { values: Record<string, string>; missing: WorkflowVariable[] } {
+  const values: Record<string, string> = {};
+  const missing: WorkflowVariable[] = [];
+  for (const variable of variables ?? []) {
+    const value = (given[variable.key] ?? '').trim() || (variable.default ?? '').trim();
+    if (value) values[variable.key] = value;
+    else if (variable.required) missing.push(variable);
+  }
+  return { values, missing };
+}
 /**
  * One execution of the graph: maps node IDs to the Task that ran that node in the bound Run.
  * `links` maps a workflow-link node ID to the Tasks of its expanded sub-graph (sub-node path → Task ID).
@@ -205,6 +239,8 @@ export function validTrigger(value: unknown): value is string {
 export type AutomationConfig = {
   id: string; orcaId?: string; name: string; trigger: string; time?: string; day?: number;
   project: string; count: number; cleanup: Cleanup; inputs?: Record<string, string>;
+  /** Setting values fixed for every run of this automation (declared keys only). */
+  values?: Record<string, string>;
 };
 /** What Orca reports about an automation right now. */
 export type AutomationState = { orcaId: string; name: string; enabled: boolean; nextRunAt?: number; lastRunAt?: number; rrule?: string };
@@ -364,9 +400,11 @@ export function serializableWorkflow(workflow: Workflow): Workflow {
       ...(execution.spawned && Object.keys(execution.spawned).some((nodeId) => nodeIds.has(nodeId))
         ? { spawned: Object.fromEntries(Object.entries(execution.spawned).filter(([nodeId]) => nodeIds.has(nodeId))) } : {}) };
   });
-  const { executions: _omit, workspace, cleanup, automations, ...rest } = workflow;
+  const { executions: _omit, workspace, cleanup, automations, variables, ...rest } = workflow;
   const ordered = orderNodes(workflow.nodes);
   return { ...rest, ...(workspace ? { workspace } : {}),
+    ...(variables?.length ? { variables: variables.map((item) => ({ key: item.key, label: item.label.trim() || item.key,
+      ...(item.description ? { description: item.description } : {}), ...(item.default ? { default: item.default } : {}), ...(item.required ? { required: true } : {}) })) } : {}),
     ...(cleanup ? { cleanup: { coordinator: !!cleanup.coordinator, worktrees: !!cleanup.worktrees, sessions: !!cleanup.sessions } } : {}),
     ...(automations?.length ? { automations } : {}), ...(executions?.length ? { executions } : {}), nodes: ordered.map((node) => {
     const group = isGroup(node);
@@ -528,6 +566,8 @@ export type RunLogMeta = {
   automation?: { id: string; name: string };
   /** Run-time worktree names this request was started with (group id → name). */
   inputs?: Record<string, string>;
+  /** Setting values this request ran with (defaults applied). Spawn links pass them on to the executions they start. */
+  values?: Record<string, string>;
   runId?: string;
   /** Executions as the coordinator registered them: each one's Task ids, so results survive a later run replacing the workflow's list. */
   executions?: LoggedExecution[];

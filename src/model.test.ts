@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { pendingDecisions, frameContents, orderNodes, decisionError, skippedStages, topologicalOrder, waves, nodeExecutionStatus, type FlowStage, type StageNode, membershipOf, nodeLocation, aggregateStatus, executionFinished, taskStatus, projectNodes, serializableWorkflow, newWorkflow, fromSnapshot, type TaskSummary, type WorkerSummary, type RunSnapshot, executionRun, inputsKey, mergeSnapshots, workflowRuns } from './model.ts';
+import { pendingDecisions, frameContents, orderNodes, decisionError, skippedStages, topologicalOrder, waves, nodeExecutionStatus, type FlowStage, type StageNode, membershipOf, nodeLocation, aggregateStatus, executionFinished, taskStatus, projectNodes, serializableWorkflow, newWorkflow, fromSnapshot, type TaskSummary, type WorkerSummary, type RunSnapshot, executionRun, inputsKey, mergeSnapshots, workflowRuns, variableRefs, substituteVariables, resolveVariables } from './model.ts';
 
 const task = (status: string): TaskSummary => ({ id: 'task-a', title: 'A', spec: 'A', status, deps: [] });
 const worker = (liveness: string): WorkerSummary => ({ dispatchId: 'dispatch-a', taskId: 'task-a', liveness, stage: 'working', provider: 'claude', model: 'example-model', outcome: '' });
@@ -327,4 +327,14 @@ test('a spawn link reads its own Task and shows the items it requested; saving k
   assert.equal(saved.nodes.find((node) => node.id === 'fan')!.data.linkMode, 'spawn');
   assert.equal(saved.nodes.find((node) => node.id === 'fan')!.data.spawned, undefined);
   assert.equal(saved.executions![0].spawned!.fan.length, 2);
+});
+test('settings: {{key}} references, substitution, defaults and required keys; saving keeps the declarations', () => {
+  assert.deepEqual(variableRefs('{{epic}} · {{ sheet }} · {{epic}} · {{Bad}} · {epic}'), ['epic', 'sheet']);
+  assert.equal(substituteVariables('{{epic}} / {{ sheet }} / {{none}}', { epic: 'ABC-1', sheet: 'S' }), 'ABC-1 / S / {{none}}');
+  const variables = [{ key: 'epic', label: '에픽', required: true }, { key: 'sheet', label: '시트', default: 'S' }, { key: 'note', label: '메모' }];
+  assert.deepEqual(resolveVariables(variables, { epic: ' ABC-1 ' }), { values: { epic: 'ABC-1', sheet: 'S' }, missing: [] });
+  assert.deepEqual(resolveVariables(variables, {}).missing.map((item) => item.key), ['epic']);
+  const graph = { ...newWorkflow(), variables: [{ key: 'epic', label: '  ', required: true, description: '' }] };
+  assert.deepEqual(serializableWorkflow(graph).variables, [{ key: 'epic', label: 'epic', required: true }]);
+  assert.equal(serializableWorkflow(newWorkflow()).variables, undefined);
 });

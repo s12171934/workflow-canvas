@@ -5,10 +5,10 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { createStorage, validId, validateWorkflow } from './storage.ts';
-import { buildBrief, checkBranches, checkGroups, checkSpawns, flowOf, linkedWorkflows } from './execute.ts';
+import { buildBrief, checkBranches, checkGroups, checkSpawns, checkVariables, flowOf, linkedWorkflows } from './execute.ts';
 import { briefPrompt, generatedWorkflow, generationTimeoutMs, maxPromptLength, workflowPrompt, type Generation } from './generate.ts';
 import { coordinatorEventTypes, createRunLog, launchDirName } from './runlog.ts';
-import { decisionError, executionResults, executionRun, maxSpawnItems, spawnsRuns, type SpawnResult, executionTasks, inputsKey, loggedExecutions, skippedStages, type Execution, type RunLogDetail } from '../src/model.ts';
+import { decisionError, executionResults, executionRun, maxSpawnItems, resolveVariables, validVariableValue, spawnsRuns, type SpawnResult, executionTasks, inputsKey, loggedExecutions, skippedStages, type Execution, type RunLogDetail } from '../src/model.ts';
 import { defaultCleanup, type AutomationConfig, type AutomationState, type Cleanup, asksAtRun, executionFinished, executionStatuses, isExecutable, worktreeNamePattern, type RunSnapshot, type Workflow } from '../src/model.ts';
 
 /** Minimum gap between two 실행 requests for the same workflow, so a double click cannot start two coordinators. */
@@ -173,6 +173,10 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
     res.json({ decisions: updated.decisions, skipped: updated.skipped, skippedTasks: executionTasks(updated, updated.skipped) });
   });
   type RunSettings = { count: number; project: string; inputs: Record<string, string>; cleanup: Cleanup; automation?: { id: string; name: string };
+    /** Setting values as given (declared keys, non-empty): what an automation keeps. */
+    given: Record<string, string>;
+    /** Setting values the run uses: given, else the declared default. */
+    values: Record<string, string>;
     /** Set when another workflow's spawn link asked for this run: shown in the execution log. */
     origin?: string };
   class RunError extends Error { constructor(readonly status: number, message: string) { super(message); } }
@@ -198,7 +202,17 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
     if (!rawCleanup || typeof rawCleanup !== 'object' || (['coordinator', 'worktrees', 'sessions'] as const).some((key) => typeof rawCleanup[key] !== 'boolean')) {
       throw new RunError(400, '완료 시 정리 설정이 올바르지 않습니다.');
     }
-    return { count, project, inputs: rawInputs as Record<string, string>,
+    const rawValues = body.values ?? {};
+    const declared = new Map((graph.variables ?? []).map((item) => [item.key, item]));
+    if (!rawValues || typeof rawValues !== 'object' || Array.isArray(rawValues)) throw new RunError(400, '설정값은 {"<키>":"<값>"} 형식이어야 합니다.');
+    const strange = Object.keys(rawValues).find((key) => !declared.has(key));
+    if (strange) throw new RunError(400, `「${graph.name}」에 없는 설정값입니다: ${strange}`);
+    const badValue = Object.entries(rawValues).find(([, value]) => !validVariableValue(value));
+    if (badValue) throw new RunError(400, `「${declared.get(badValue[0])!.label}」 값은 한 줄, 2000자 이하여야 합니다.`);
+    const given = Object.fromEntries(Object.entries(rawValues as Record<string, string>).map(([key, value]) => [key, value.trim()]).filter(([, value]) => value));
+    const { values, missing } = resolveVariables(graph.variables, given);
+    if (missing.length) throw new RunError(400, `필수 설정값을 입력하세요: ${missing.map((item) => `「${item.label}」`).join(', ')}`);
+    return { count, project, inputs: rawInputs as Record<string, string>, given, values,
       cleanup: { coordinator: !!rawCleanup.coordinator, worktrees: !!rawCleanup.worktrees, sessions: !!rawCleanup.sessions } };
   }
 
@@ -206,7 +220,7 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
   async function prepareRun(id: string, graph: Workflow, settings: RunSettings, apiBase: string): Promise<{ briefPath: string; logId: string; launchKey: string }> {
     if (!graph.nodes.some(isExecutable)) throw new RunError(400, '실행할 단계가 없습니다.');
     let linked: Map<string, Workflow>;
-    try { linked = await linkedWorkflows(graph, (linkId) => storage.load(linkId)); checkGroups([graph, ...linked.values()]); checkBranches([graph, ...linked.values()]); checkSpawns([graph, ...linked.values()], linked); }
+    try { linked = await linkedWorkflows(graph, (linkId) => storage.load(linkId)); checkGroups([graph, ...linked.values()]); checkBranches([graph, ...linked.values()]); checkSpawns([graph, ...linked.values()], linked); checkVariables([graph, ...linked.values()]); }
     catch (error) { throw new RunError(400, (error as Error).message); }
     // Requests with different run-time inputs (one per ticket, say) run side by side; the same inputs never overlap.
     const inputs = inputsKey(settings.inputs);
@@ -236,12 +250,13 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
       const artifactDir = join(runlog.root, logId);
       await runlog.start(logId, { workflowId: id, workflowName: graph.name, startedAt: startedAt.toISOString(), count: settings.count,
         project: settings.project, ...(settings.automation ? { automation: settings.automation } : {}),
-        ...(inputs !== '[]' ? { inputs: Object.fromEntries(Object.entries(settings.inputs).filter(([, value]) => value)) } : {}) });
+        ...(inputs !== '[]' ? { inputs: Object.fromEntries(Object.entries(settings.inputs).filter(([, value]) => value)) } : {}),
+        ...(Object.keys(settings.values).length ? { values: settings.values } : {}) });
       await runlog.append(logId, { type: 'requested', message: `${settings.origin ?? (settings.automation ? `자동화 「${settings.automation.name}」` : '실행 버튼')} · ${settings.count}회 · ${settings.project}`
         + (Object.values(settings.inputs).some(Boolean) ? ` · 입력 ${Object.values(settings.inputs).filter(Boolean).join('·')}` : '') });
       const briefPath = join(artifactDir, 'brief.md');
       await writeFile(briefPath, buildBrief({ graph, linked, count: settings.count, apiBase, workspace: settings.project, artifactDir,
-        logUrl: `${apiBase}/api/workflows/${id}/logs/${logId}/events`, launchId: logId,
+        logUrl: `${apiBase}/api/workflows/${id}/logs/${logId}/events`, launchId: logId, values: settings.values,
         inputs: settings.inputs, cleanup: settings.cleanup, automation: settings.automation }), { mode: 0o600 });
       await runlog.append(logId, { type: 'brief', message: '코디네이터 브리프 작성' });
       return { briefPath, logId, launchKey };
@@ -298,13 +313,16 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
     const inputGroups = target.nodes.filter(asksAtRun);
     if (inputGroups.length !== 1) { res.status(400).json({ error: `'${target.name}'에는 항목을 받을 「실행 시 입력」 워크트리 그룹이 정확히 하나 있어야 합니다.` }); return; }
     const requested = new Set((execution.spawned?.[node] ?? []).filter((result) => !result.error).map((result) => result.item));
+    // The settings this run was started with go on to the target, for the keys the target declares.
+    const master = (await runlog.metaOfRun(executionRun(graph, execution)).catch(() => undefined))?.values ?? {};
+    const passed = Object.fromEntries((target.variables ?? []).filter((item) => master[item.key]).map((item) => [item.key, master[item.key]]));
     const origin = `「${graph.name}」 ${execution.label} 의 ${link.data.label || '링크'}`;
     const results: (SpawnResult & { status: 'requested' | 'already' | 'failed' })[] = [];
     for (const item of [...new Set(items as string[])]) {
       const at = new Date().toISOString();
       if (requested.has(item)) { results.push({ item, at, workflowId: target.id, status: 'already' }); continue; }
       try {
-        const settings = await settingsFor(target, { count: 1, project, inputs: { [inputGroups[0].id]: item }, cleanup: target.cleanup ?? defaultCleanup });
+        const settings = await settingsFor(target, { count: 1, project, inputs: { [inputGroups[0].id]: item }, cleanup: target.cleanup ?? defaultCleanup, values: passed });
         const launch = await startRun(target.id, target, { ...settings, origin }, `http://${req.get('host')}`);
         results.push({ item, at, workflowId: target.id, launch, status: 'requested' });
       } catch (error) {
@@ -341,7 +359,8 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
       const name = typeof body.name === 'string' ? body.name.trim() : '';
       const config: AutomationConfig = { id: randomUUID(), name, trigger: typeof body.trigger === 'string' ? body.trigger.trim() : '',
         ...(typeof body.time === 'string' && body.time ? { time: body.time } : {}), ...(body.day !== undefined && body.day !== null && body.day !== '' ? { day: Number(body.day) } : {}),
-        project: settings.project, count: settings.count, cleanup: settings.cleanup, ...(Object.keys(settings.inputs).length ? { inputs: settings.inputs } : {}) };
+        project: settings.project, count: settings.count, cleanup: settings.cleanup, ...(Object.keys(settings.inputs).length ? { inputs: settings.inputs } : {}),
+        ...(Object.keys(settings.given).length ? { values: settings.given } : {}) };
       // Validate the whole document with the new entry before anything is created in Orca.
       try { validateWorkflow({ ...graph, automations: [...(graph.automations ?? []), config] }); }
       catch (error) { throw new RunError(400, (error as Error).message); }
@@ -379,7 +398,7 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
     const config = graph.automations?.find((item) => item.id === req.params.aid);
     if (!config) { res.status(404).json({ error: '이 워크플로에 등록된 자동화가 아닙니다.' }); return; }
     try {
-      const settings = await settingsFor(graph, { count: config.count, project: config.project, inputs: config.inputs ?? {}, cleanup: config.cleanup });
+      const settings = await settingsFor(graph, { count: config.count, project: config.project, inputs: config.inputs ?? {}, cleanup: config.cleanup, values: config.values ?? {} });
       const { briefPath, logId } = await prepareRun(graph.id, graph, { ...settings, automation: { id: config.id, name: config.name } }, `http://${req.get('host')}`);
       await runlog.append(logId, { type: 'coordinator', message: '자동화 에이전트가 브리프를 받아 코디네이터로 시작' }).catch(() => {});
       res.json({ briefPath });

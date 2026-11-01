@@ -81,6 +81,8 @@ export function RunLogDialog({ workflowId, workflowName, onClose }: { workflowId
               <div><dt>프로젝트</dt><dd title={meta.project}>{meta.project ?? '—'}</dd></div>
               <div><dt>횟수</dt><dd>{meta.count ?? '—'}</dd></div>
               <div><dt>Run</dt><dd>{meta.runId ?? '등록 전'}</dd></div>
+              {meta.inputs && Object.keys(meta.inputs).length > 0 && <div><dt>입력</dt><dd>{Object.values(meta.inputs).join(' · ')}</dd></div>}
+              {meta.values && Object.keys(meta.values).length > 0 && <div><dt>설정값</dt><dd>{Object.entries(meta.values).map(([key, value]) => `${key} = ${value}`).join(' · ')}</dd></div>}
             </dl>
             <div className="log-section-label">실행 결과 <span className={`outcome ${detail.outcome}`}>{outcomeNames[detail.outcome]}</span></div>
             {detail.results ? <table className="log-results"><tbody>{detail.results.map((result) => <tr key={result.id}>
