@@ -7,7 +7,7 @@ import {
 import {
   Activity, ArrowDownToLine, History, ArrowUpFromLine, Bot, Check, ChevronRight, Circle,
   CircleHelp, Clock3, ExternalLink, FileJson2, FolderGit2, GitBranch, Group, Hand, Layers3, LayoutDashboard, Link2,
-  LoaderCircle, Menu, Move, MousePointer2, Network, Play, Plus, Save, Settings2, SkipForward, Sparkles, Split, SquareDashed, StickyNote,
+  Eye, LoaderCircle, Lock, Menu, Move, PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen, MousePointer2, Network, Play, Plus, Save, Settings2, SkipForward, Sparkles, Split, SquareDashed, StickyNote,
   Trash2, Unplug, Workflow as WorkflowIcon, X, XCircle, Zap,
 } from 'lucide-react';
 import {
@@ -26,8 +26,8 @@ async function api<T>(url: string, options?: RequestInit): Promise<T> {
 
 const statusIcons = { unbound: Unplug, pending: Clock3, running: LoaderCircle, completed: Check, failed: XCircle, blocked: CircleHelp, unknown: CircleHelp, skipped: SkipForward };
 // Lets node cards open a worker's terminal and name linked workflows without threading callbacks through node data.
-const CanvasContext = createContext<{ openTask: (taskId: string) => void; workflowName: (id?: string) => string | undefined }>({
-  openTask: () => {}, workflowName: () => undefined });
+const CanvasContext = createContext<{ openTask: (taskId: string) => void; workflowName: (id?: string) => string | undefined; viewOnly: boolean }>({
+  openTask: () => {}, workflowName: () => undefined, viewOnly: false });
 const kindIcons: Record<NodeKind, typeof Bot> = { worker: Bot, gate: Hand, branch: Split, note: StickyNote, workflow: WorkflowIcon, group: SquareDashed, frame: Group };
 /** Minimap marks a node by kind with the card's accent colour and icon; a corner dot carries run status. */
 const accentColors: Record<StageKind, string> = { worker: '#7fb0f5', gate: '#e3b45f', branch: '#e3b45f', workflow: '#62d0c0', note: '#b4b67e' };
@@ -107,16 +107,18 @@ function GroupCard({ data, selected }: NodeProps<StageNode>) {
   const naming = data.nameSource === 'agent' ? '에이전트가 이름 결정' : data.nameSource === 'input' ? '실행 시 입력' : data.worktreeName || '새로 생성';
   const repo = data.repoPath || data.inheritedRepo;
   const target = create ? `${naming}${data.perExecution ? ' · 실행마다' : ''}${repo ? ` · ${shortPath(repo)}` : ''}` : data.path ? shortPath(data.path) : '';
+  const { viewOnly } = useContext(CanvasContext);
   return <section className={`group-card ${scope} ${create ? 'create' : ''} ${selected ? 'selected' : ''} ${data.ancestor ? 'ancestor' : ''}`} aria-label={`${scopeNames[scope]} 그룹, ${data.label}`}>
-    <NodeResizer isVisible={selected} minWidth={300} minHeight={200} color={scope === 'worktree' ? '#b996f2' : '#8cc97a'} handleClassName="group-resize-handle" />
+    <NodeResizer isVisible={selected && !viewOnly} minWidth={300} minHeight={200} color={scope === 'worktree' ? '#b996f2' : '#8cc97a'} handleClassName="group-resize-handle" />
     <header className="group-header"><ScopeIcon size={14} /><span className="group-scope">{scopeNames[scope]}</span>
       <strong>{data.label || '이름 없는 그룹'}</strong><span className={`group-path ${target ? '' : 'missing'}`} title={create ? data.repoPath : data.path}>{target || '대상을 고르세요'}</span></header>
   </section>;
 }
 /** Memo group: only gathers nodes visually. Moving it moves what lies inside; it never sets where anything runs. */
 function FrameCard({ data, selected }: NodeProps<StageNode>) {
+  const { viewOnly } = useContext(CanvasContext);
   return <section className={`frame-card ${selected ? 'selected' : ''}`} aria-label={`메모 그룹, ${data.label}`}>
-    <NodeResizer isVisible={selected} minWidth={200} minHeight={120} color="#b4b67e" handleClassName="group-resize-handle" />
+    <NodeResizer isVisible={selected && !viewOnly} minWidth={200} minHeight={120} color="#b4b67e" handleClassName="group-resize-handle" />
     <header className="frame-header"><Group size={13} /><strong>{data.label || '메모 그룹'}</strong><span className="note-badge">실행 안 함</span></header>
     {data.description && <p className="frame-body">{data.description}</p>}
   </section>;
@@ -134,6 +136,17 @@ function rememberProject(path: string) { try { localStorage.setItem(lastProjectK
 type PointerMode = 'select' | 'pan';
 const pointerModeKey = 'workflow-canvas:pointer-mode';
 function storedPointerMode(): PointerMode { try { return localStorage.getItem(pointerModeKey) === 'pan' ? 'pan' : 'select'; } catch { return 'select'; } }
+/** 떠 있는 패널(왼쪽 사이드바·오른쪽 속성)의 펼침 상태와 보기 전용 여부. Remembered per browser. */
+type Panels = { left: boolean; right: boolean };
+const panelsKey = 'workflow-canvas:panels';
+const narrow = (width: number) => typeof window !== 'undefined' && window.matchMedia(`(max-width:${width}px)`).matches;
+function storedPanels(): Panels {
+  const fallback = { left: !narrow(900), right: !narrow(620) };
+  try { const value = JSON.parse(localStorage.getItem(panelsKey) ?? 'null'); return narrow(900) ? { ...fallback, right: value?.right ?? fallback.right }
+    : { left: typeof value?.left === 'boolean' ? value.left : fallback.left, right: typeof value?.right === 'boolean' ? value.right : fallback.right }; } catch { return fallback; }
+}
+const viewOnlyKey = 'workflow-canvas:view-only';
+function storedViewOnly(): boolean { try { return localStorage.getItem(viewOnlyKey) === '1'; } catch { return false; } }
 function lastProject(): string | null { try { return localStorage.getItem(lastProjectKey); } catch { return null; } }
 /** The workflow's settings (like environment variables): asked in the run dialog, fixed per automation, used as {{key}}. */
 function VariablesEditor({ variables, nodes, onChange }: { variables: WorkflowVariable[]; nodes: StageNode[]; onChange: (variables: WorkflowVariable[]) => void }) {
@@ -189,6 +202,14 @@ function Workspace() {
   // 여러 노드 선택(드래그 박스·Shift/⌘ 클릭). Two or more ids; a single pick always goes to selectedId so the inspector shows it.
   const [multiIds, setMultiIds] = useState<string[]>([]);
   const [pointerMode, setPointerMode] = useState<PointerMode>(storedPointerMode);
+  const [panels, setPanels] = useState<Panels>(storedPanels);
+  // On narrow screens the sidebar opens as a drawer each time, so only the inspector's state is kept there.
+  useEffect(() => { try { localStorage.setItem(panelsKey, JSON.stringify(narrow(900) ? { ...JSON.parse(localStorage.getItem(panelsKey) ?? '{}'), right: panels.right } : panels)); } catch { /* per-browser convenience only */ } }, [panels]);
+  // 보기 전용: 노드 이동·연결·삭제·추가와 속성 편집을 막고 화면 이동·선택·관찰만 허용한다.
+  const [viewOnly, setViewOnly] = useState(storedViewOnly);
+  useEffect(() => { try { localStorage.setItem(viewOnlyKey, viewOnly ? '1' : '0'); } catch { /* per-browser convenience only */ } }, [viewOnly]);
+  // Picking something from the sidebar closes it only where it covers the canvas as a drawer.
+  const closeDrawer = useCallback(() => { if (narrow(900)) setPanels((value) => ({ ...value, left: false })); }, []);
   useEffect(() => { try { localStorage.setItem(pointerModeKey, pointerMode); } catch { /* per-browser convenience only */ } }, [pointerMode]);
   // V / H switch the mode, as in drawing tools; ignored while typing.
   useEffect(() => {
@@ -197,6 +218,9 @@ function Workspace() {
       if (event.metaKey || event.ctrlKey || event.altKey || target?.closest('input, textarea, select, [contenteditable="true"]')) return;
       if (event.key === 'v' || event.key === 'V') setPointerMode('select');
       else if (event.key === 'h' || event.key === 'H') setPointerMode('pan');
+      else if (event.key === 'l' || event.key === 'L') setViewOnly((value) => !value);
+      else if (event.key === '[') setPanels((value) => ({ ...value, left: !value.left }));
+      else if (event.key === ']') setPanels((value) => ({ ...value, right: !value.right }));
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
@@ -215,7 +239,6 @@ function Workspace() {
   const [connectionError, setConnectionError] = useState('');
   const [notice, setNotice] = useState('');
   const [busy, setBusy] = useState(false);
-  const [sidebarOpen, setSidebarOpen] = useState(false);
   const [savedFingerprint, setSavedFingerprint] = useState('');
   // 'all' = 모아 보기(실행별 칩), otherwise the selected execution id (실행 선택).
   const [view, setView] = useState<string>('all');
@@ -559,7 +582,7 @@ function Workspace() {
   async function load(id: string) {
     if (!confirmReplace()) return;
     setBusy(true);
-    try { applyWorkflow(await api<Workflow>(`/api/workflows/${id}`), true); rememberWorkflow(id); setSidebarOpen(false); }
+    try { applyWorkflow(await api<Workflow>(`/api/workflows/${id}`), true); rememberWorkflow(id); closeDrawer(); }
     catch (error) { setNotice((error as Error).message); }
     finally { setBusy(false); }
   }
@@ -828,7 +851,7 @@ function Workspace() {
     } catch (error) { setNotice((error as Error).message); }
   }
 
-  const canvasContext = useMemo(() => ({ openTask, workflowName }), [openTask, workflowName]);
+  const canvasContext = useMemo(() => ({ openTask, workflowName, viewOnly }), [openTask, workflowName, viewOnly]);
   /** 소속: the project and worktree groups of the selected node; clicking one selects that group. */
   function membership() {
     const { project, worktrees } = selectedMembership;
@@ -850,59 +873,22 @@ function Workspace() {
       {!project && !worktrees.length && selected && !isGroup(selected) && <p className="field-help">어느 그룹에도 속하지 않아 실행할 때 고른 프로젝트에서 작업합니다.</p>}</div>;
   }
   return <CanvasContext.Provider value={canvasContext}><div className="workspace">
-    <aside className={`sidebar ${sidebarOpen ? 'open' : ''}`}>
-      <a className="brand" href="/" onClick={(event) => event.preventDefault()}><span className="brand-mark"><Network size={23} /></span><span>workflow<span className="brand-sub">canvas</span></span><span className="version">0.1</span></a>
-      <div className="workspace-label"><span className="workspace-avatar">W</span><div>로컬 워크스페이스<small>Orca orchestration</small></div><ChevronRight size={14} /></div>
-      <div className="sidebar-section-title">워크플로<span>{saved.length}</span></div>
-      <button className="sidebar-item active" onClick={() => setSidebarOpen(false)}><GitBranch size={17} /><span title={workflow.name}>{workflow.name}</span><span className="tiny-dot" /></button>
-      {saved.filter((item) => item.id !== workflow.id).map((item) => <div className="sidebar-row" key={item.id}><button className="sidebar-item" onClick={() => void load(item.id)}><FileJson2 size={16} /><span>{item.name}</span></button>
-        <button className="icon-button row-delete" title="워크플로 삭제" aria-label={`${item.name} 삭제`} onClick={() => void removeWorkflow(item.id, item.name)}><Trash2 size={14} /></button></div>)}
-      <button className="sidebar-item subtle" onClick={() => { if (confirmReplace()) applyWorkflow(blankWorkflow(), false); }}><Plus size={16} /><span>새 워크플로</span></button>
-      <button className="sidebar-item subtle" onClick={() => { setGenerateForm((form) => ({ ...form, project: form.project || defaultProject() })); setGenerateDialog(true); setSidebarOpen(false); }}>
-        <Sparkles size={16} /><span>자연어로 만들기</span>{generations.some((item) => item.kind === 'workflow' && item.status === 'pending') && <LoaderCircle size={13} className="spin" />}</button>
-      <div className="sidebar-divider" />
-      <div className="sidebar-section-title">ORCA 연결 <Activity size={13} /></div>
-      <label className="field-label run-label" htmlFor="run-selector">관찰할 Run</label>
-      <select id="run-selector" value={workflow.runId} onChange={(event) => changeRun(event.target.value)}>
-        <option value="">Run 선택</option>
-        {workflow.runId && !runs.some((run) => run.id === workflow.runId) && <option value={workflow.runId}>{workflow.runId}</option>}
-        {runs.map((run) => <option key={run.id} value={run.id}>{run.objective}</option>)}
-      </select>
-      {workflow.runId && <div className="run-card"><div className="eyebrow">선택한 RUN</div><strong>{snapshot?.run.objective || runs.find((run) => run.id === workflow.runId)?.objective || workflow.runId}</strong><span>{snapshot?.tasks.length ?? '—'} tasks · {snapshot?.workers.length ?? '—'} attempts</span>
-        <button className="button small" onClick={importRun} disabled={!snapshot || !!snapshotError}><ArrowDownToLine size={14} />Task로 그래프 만들기</button>
-      </div>}
-      {saved.some((item) => item.id === workflow.id) && <><div className="sidebar-section-title">자동화<span>{workflow.automations?.length ?? 0}</span></div>
-        {(workflow.automations ?? []).map((config) => { const state = automationStates[config.id];
-          return <div key={config.id} className={`automation-item ${state?.enabled ? 'on' : state === null ? 'missing' : ''}`}>
-            <div className="automation-head"><Zap size={13} /><strong title={config.name}>{config.name}</strong>
-              <button className="icon-button" title="지금 실행" aria-label={`${config.name} 지금 실행`} disabled={!config.orcaId || state === null} onClick={() => void automationAction(config, 'run')}><Play size={13} /></button>
-              <button className="icon-button" title="자동화 삭제" aria-label={`${config.name} 삭제`} onClick={() => void automationAction(config, 'remove')}><Trash2 size={13} /></button></div>
-            <small>{scheduleText(config)} · ×{config.count} · {shortPath(config.project)}</small>
-            {config.values && Object.keys(config.values).length > 0 && <small className="automation-values" title={Object.entries(config.values).map(([key, value]) => `${key} = ${value}`).join('\n')}>
-              {Object.entries(config.values).map(([key, value]) => `${(workflow.variables ?? []).find((item) => item.key === key)?.label ?? key}: ${value}`).join(' · ')}</small>}
-            <small>{state === null ? 'Orca에서 찾을 수 없음' : state === undefined ? '상태 확인 중' : !state.enabled ? '꺼짐'
-              : `다음 ${state.nextRunAt ? new Date(state.nextRunAt).toLocaleString('ko-KR', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '—'}${state.lastRunAt ? ` · 마지막 ${new Date(state.lastRunAt).toLocaleString('ko-KR', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}` : ''}`}</small>
-          </div>; })}
-        {!workflow.automations?.length && <p className="sidebar-empty">실행 버튼에서 「자동화로 예약」을 고르면 여기에 표시됩니다.</p>}</>}
-      <div className="sidebar-bottom"><div className={`connection ${connection.connected && !connectionError ? 'connected' : ''}`}><span className="status-dot" /><span>{connection.connected && !connectionError ? 'Orca 연결됨' : 'Orca 연결 확인 필요'}</span><span className="version">{connection.version || 'local'}</span></div><p>그래프는 설계하고,<br />실행 상태는 Orca에서 확인합니다.</p></div>
-    </aside>
-
     <main className="main">
-      <header className="topbar"><div className="breadcrumbs"><button className="icon-button mobile-menu" aria-label="메뉴 열기" onClick={() => setSidebarOpen(!sidebarOpen)}><Menu size={20} /></button><Layers3 size={16} /><span>워크플로</span><ChevronRight size={14} /><strong>캔버스</strong></div>
+      <header className="topbar"><div className="topbar-title"><button className="icon-button mobile-menu" aria-label="메뉴 열기" aria-expanded={panels.left} onClick={() => setPanels((value) => ({ ...value, left: !value.left }))}><Menu size={20} /></button>
+          <div className="title-block"><input className="workflow-name" aria-label="워크플로 이름" value={workflow.name} maxLength={500} disabled={viewOnly} onChange={(event) => setWorkflow((value) => ({ ...value, name: event.target.value }))} />
+            <p title={workflow.description}>{workflow.description || '단계를 연결해 작업의 흐름을 만드세요.'}</p></div>
+          <div className="heading-stats"><span><i className="status-dot running" />실행 {counts.running ?? 0}</span><span><Check size={14} />완료 {counts.completed ?? 0}</span><span className="total">{stageCount} 단계</span></div></div>
         <div className="toolbar-actions"><input ref={importRef} type="file" accept="application/json,.json" hidden onChange={(event) => { void importFile(event.target.files?.[0]); event.target.value = ''; }} />
-          <button className="button ghost" onClick={() => importRef.current?.click()} title="JSON 가져오기"><ArrowUpFromLine size={15} /><span>가져오기</span></button>
-          <button className="button ghost" onClick={download} title="JSON 내보내기"><ArrowDownToLine size={15} /><span>내보내기</span></button>
+          <button className="button ghost file-action" onClick={() => importRef.current?.click()} title="JSON 가져오기"><ArrowUpFromLine size={15} /><span>가져오기</span></button>
+          <button className="button ghost file-action" onClick={download} title="JSON 내보내기"><ArrowDownToLine size={15} /><span>내보내기</span></button>
           {saved.some((item) => item.id === workflow.id) && <button className="button ghost" onClick={() => setLogOpen(true)} title="실행 요청별 이벤트·산출물·보고"><History size={15} /><span>실행 로그</span></button>}
           <button className="button run" onClick={openRunDialog} disabled={busy || watchUntil > 0} title="프로젝트를 고르고 지금 실행하거나 자동화로 예약합니다"><Play size={15} />{watchUntil > 0 ? '등록 대기' : '실행'}</button>
           {saved.some((item) => item.id === workflow.id) && <button className="icon-button" title="이 워크플로 삭제" aria-label="이 워크플로 삭제" onClick={() => void removeWorkflow(workflow.id, workflow.name)} disabled={busy}><Trash2 size={16} /></button>}
           <button className="button primary" onClick={() => void save()} disabled={busy}><Save size={15} />{busy ? '저장 중' : '저장'}{dirty && <span className="unsaved-dot" />}</button>
         </div>
       </header>
-      <section className="canvas-heading"><div><div className="eyebrow">WORKFLOW EDITOR <span className="local-badge">LOCAL</span></div><input className="workflow-name" aria-label="워크플로 이름" value={workflow.name} maxLength={500} onChange={(event) => setWorkflow((value) => ({ ...value, name: event.target.value }))} /><p>{workflow.description || '단계를 연결해 작업의 흐름을 만드세요.'}</p></div>
-        <div className="heading-stats"><span><i className="status-dot running" />실행 {counts.running ?? 0}</span><span><Check size={14} />완료 {counts.completed ?? 0}</span><span className="total">{stageCount} 단계</span></div>
-      </section>
       {(snapshotError || connectionError) && <div className="error-banner" role="alert"><CircleHelp size={15} />{snapshotError || connectionError}</div>}
-      <div className="editor-body">
+      <div className={`editor-body ${panels.left ? 'left-open' : 'left-closed'} ${panels.right ? 'right-open' : 'right-closed'} ${viewOnly ? 'view-only' : ''}`}>
         <section className="canvas" aria-label="워크플로 그래프 캔버스">
           <div className="canvas-tools" role="toolbar" aria-label="추가">
             <span className="tool-group-label">조작</span>
@@ -910,7 +896,9 @@ function Workspace() {
               ['pan', Move, '화면 이동 (H)', '드래그로 화면 이동. Shift+드래그로 여러 노드 선택']] as const).map(([mode, Icon, name, tip]) =>
               <button key={mode} className={`tool-button mode-button ${pointerMode === mode ? 'active' : ''}`} aria-label={name} aria-pressed={pointerMode === mode} onClick={() => setPointerMode(mode)}>
                 <Icon size={17} /><span className="tool-tip" role="tooltip"><strong>{name}</strong>{tip}</span></button>)}
-            <span className="tool-divider" /><span className="tool-group-label">노드</span>
+            <button className={`tool-button mode-button ${viewOnly ? 'active locked' : ''}`} aria-label="보기 전용 (L)" aria-pressed={viewOnly} onClick={() => setViewOnly((value) => !value)}>
+              {viewOnly ? <Lock size={17} /> : <Eye size={17} />}<span className="tool-tip" role="tooltip"><strong>보기 전용 (L)</strong>{viewOnly ? '켜짐: 이동·연결·삭제·편집이 막혀 있습니다. 눌러서 편집으로 돌아가기' : '노드 이동·연결·삭제·추가와 속성 편집을 막고 보기만 합니다'}</span></button>
+            {!viewOnly && <><span className="tool-divider" /><span className="tool-group-label">노드</span>
             {([['worker', Bot, '워커', '에이전트 하나가 지침을 수행'], ['gate', Hand, '사용자 개입 게이트', '사용자가 통과·거절을 결정'],
               ['branch', Split, '분기', '판정 결과에 따라 출력 하나(또는 여럿)로만 진행. 일반 연결은 모두 병렬'],
               ['workflow', WorkflowIcon, '워크플로 링크', '저장된 다른 워크플로를 펼쳐 실행'], ['note', StickyNote, '메모', '실행과 무관한 설명']] as const).map(([kind, Icon, name, tip]) =>
@@ -922,7 +910,7 @@ function Workspace() {
               <button key={scope} className={`tool-button kind-${scope}`} aria-label={`${name} 추가`} onClick={() => addGroup(scope)}>
                 <Icon size={17} /><span className="tool-tip" role="tooltip"><strong>{name}</strong>{tip}</span></button>)}
             <button className="tool-button kind-frame" aria-label="메모 그룹 추가" onClick={addFrame}>
-              <Group size={17} /><span className="tool-tip" role="tooltip"><strong>메모 그룹</strong>노드를 묶어 보여 주기만 함. 옮기면 안의 노드가 함께 움직이고, 실행·작업 위치와는 무관</span></button>
+              <Group size={17} /><span className="tool-tip" role="tooltip"><strong>메모 그룹</strong>노드를 묶어 보여 주기만 함. 옮기면 안의 노드가 함께 움직이고, 실행·작업 위치와는 무관</span></button></>}
             <span className="tool-divider" />
             <button className="tool-button" aria-label="전체 보기" onClick={() => void fitView({ padding: 0.25, duration: 300 })}><LayoutDashboard size={17} /><span className="tool-tip" role="tooltip"><strong>전체 보기</strong>모든 노드가 보이게 맞춤</span></button></div>
           {executions.length > 0 && <div className="execution-bar" role="toolbar" aria-label="실행 보기">
@@ -959,20 +947,62 @@ function Workspace() {
           <ReactFlow<StageNode> nodes={displayNodes} edges={displayEdges} nodeTypes={nodeTypes} onNodesChange={handleNodesChange} onEdgesChange={onEdgesChange} onConnect={onConnect}
             onNodeDragStart={(_event, node, dragged) => startDrag(node, dragged)} onNodeDrag={(_event, _node, dragged) => dragFrame(dragged)} onNodeDragStop={(_event, _node, dragged) => stopDrag(dragged)}
             onSelectionDragStart={(_event, dragged) => dragged[0] && startDrag(dragged[0], dragged)} onSelectionDrag={(_event, dragged) => dragFrame(dragged)} onSelectionDragStop={(_event, dragged) => stopDrag(dragged)}
-            selectionOnDrag={pointerMode === 'select'} panOnDrag={pointerMode === 'select' ? [1, 2] : true} panOnScroll multiSelectionKeyCode={['Meta', 'Control']}
-            onBeforeDelete={async () => { removeSelected(); return false; }}
+            nodesDraggable={!viewOnly} nodesConnectable={!viewOnly} edgesReconnectable={!viewOnly}
+            selectionOnDrag={pointerMode === 'select' && !viewOnly} panOnDrag={pointerMode === 'select' && !viewOnly ? [1, 2] : true} panOnScroll multiSelectionKeyCode={['Meta', 'Control']}
+            onBeforeDelete={async () => { if (!viewOnly) removeSelected(); return false; }}
             onNodeClick={(event, node) => clickNode(node.id, event.metaKey || event.ctrlKey)} onEdgeClick={(_event, edge) => { setSelectedEdgeId(edge.id); setSelectedId(null); setMultiIds([]); }}
-            onPaneClick={() => { setSelectedId(null); setSelectedEdgeId(null); setMultiIds([]); }} elevateNodesOnSelect={false} fitView fitViewOptions={{ padding: 0.25 }} minZoom={0.15} maxZoom={1.6} deleteKeyCode={['Backspace', 'Delete']} colorMode="dark" proOptions={{ hideAttribution: false }}>
+            onPaneClick={() => { setSelectedId(null); setSelectedEdgeId(null); setMultiIds([]); }} elevateNodesOnSelect={false} fitView fitViewOptions={{ padding: 0.25 }} minZoom={0.15} maxZoom={1.6} deleteKeyCode={viewOnly ? null : ['Backspace', 'Delete']} colorMode="dark" proOptions={{ hideAttribution: false }}>
             <Background gap={22} size={1} color="#2c353d" />
             <Controls showInteractive={false} />
             <MiniMap<StageNode> nodeComponent={MiniMapNode} maskColor="rgba(16,20,25,.6)" pannable zoomable />
           </ReactFlow>
-          {nodes.length === 0 && <div className="empty-canvas"><Network size={36} /><h2>첫 단계를 만들어 보세요</h2><p>워커를 추가하고, 프로젝트·워크트리 그룹으로 작업 위치를 묶을 수 있습니다.</p><div className="empty-actions"><button className="button primary" onClick={() => addNode('worker')}><Plus size={16} />워커 추가</button>
+          {nodes.length === 0 && !viewOnly && <div className="empty-canvas"><Network size={36} /><h2>첫 단계를 만들어 보세요</h2><p>워커를 추가하고, 프로젝트·워크트리 그룹으로 작업 위치를 묶을 수 있습니다.</p><div className="empty-actions"><button className="button primary" onClick={() => addNode('worker')}><Plus size={16} />워커 추가</button>
             <button className="button" onClick={() => { setGenerateForm((form) => ({ ...form, project: form.project || defaultProject() })); setGenerateDialog(true); }}><Sparkles size={16} />자연어로 만들기</button></div></div>}
-          <div className="canvas-hint">{pointerMode === 'select' ? '선택 모드: 빈 곳 드래그로 여러 개 선택 · 스크롤/가운데 버튼·Space+드래그로 화면 이동' : '이동 모드: 드래그로 화면 이동 · Shift+드래그로 여러 개 선택'} · V/H로 모드 전환 · 노드 드래그로 이동 · 단계를 그룹 안에 놓아 작업 위치 지정 · 포트를 연결해 흐름 만들기 · Delete로 삭제</div>
+          <div className="canvas-hint">{viewOnly ? '보기 전용: 드래그·스크롤로 화면 이동, 클릭으로 선택만 됩니다 · L로 편집 모드 · [ / ]로 패널 접기' : pointerMode === 'select' ? '선택 모드: 빈 곳 드래그로 여러 개 선택 · 스크롤/가운데 버튼·Space+드래그로 화면 이동' : '이동 모드: 드래그로 화면 이동 · Shift+드래그로 여러 개 선택'} · V/H로 모드 전환 · 노드 드래그로 이동 · 단계를 그룹 안에 놓아 작업 위치 지정 · 포트를 연결해 흐름 만들기 · Delete로 삭제 · L 보기 전용 · [ / ]로 패널 접기</div>
         </section>
+        <aside className="sidebar floating-panel" hidden={!panels.left} aria-label="워크플로 목록">
+          <div className="sidebar-head"><a className="brand" href="/" onClick={(event) => event.preventDefault()}><span className="brand-mark"><Network size={23} /></span><span>workflow<span className="brand-sub">canvas</span></span><span className="version">0.1</span></a><button className="icon-button panel-collapse" title="사이드바 접기 ([)" aria-label="사이드바 접기" onClick={() => setPanels((value) => ({ ...value, left: false }))}><PanelLeftClose size={16} /></button></div>
+          <div className="workspace-label"><span className="workspace-avatar">W</span><div>로컬 워크스페이스<small>Orca orchestration</small></div><ChevronRight size={14} /></div>
+          <div className="sidebar-section-title">워크플로<span>{saved.length}</span></div>
+          <button className="sidebar-item active" onClick={closeDrawer}><GitBranch size={17} /><span title={workflow.name}>{workflow.name}</span><span className="tiny-dot" /></button>
+          {saved.filter((item) => item.id !== workflow.id).map((item) => <div className="sidebar-row" key={item.id}><button className="sidebar-item" onClick={() => void load(item.id)}><FileJson2 size={16} /><span>{item.name}</span></button>
+            <button className="icon-button row-delete" title="워크플로 삭제" aria-label={`${item.name} 삭제`} onClick={() => void removeWorkflow(item.id, item.name)}><Trash2 size={14} /></button></div>)}
+          <button className="sidebar-item subtle" onClick={() => { if (confirmReplace()) applyWorkflow(blankWorkflow(), false); }}><Plus size={16} /><span>새 워크플로</span></button>
+          <button className="sidebar-item subtle" onClick={() => { setGenerateForm((form) => ({ ...form, project: form.project || defaultProject() })); setGenerateDialog(true); closeDrawer(); }}>
+            <Sparkles size={16} /><span>자연어로 만들기</span>{generations.some((item) => item.kind === 'workflow' && item.status === 'pending') && <LoaderCircle size={13} className="spin" />}</button>
+          <div className="sidebar-divider" />
+          <div className="sidebar-section-title">ORCA 연결 <Activity size={13} /></div>
+          <label className="field-label run-label" htmlFor="run-selector">관찰할 Run</label>
+          <select id="run-selector" value={workflow.runId} onChange={(event) => changeRun(event.target.value)}>
+            <option value="">Run 선택</option>
+            {workflow.runId && !runs.some((run) => run.id === workflow.runId) && <option value={workflow.runId}>{workflow.runId}</option>}
+            {runs.map((run) => <option key={run.id} value={run.id}>{run.objective}</option>)}
+          </select>
+          {workflow.runId && <div className="run-card"><div className="eyebrow">선택한 RUN</div><strong>{snapshot?.run.objective || runs.find((run) => run.id === workflow.runId)?.objective || workflow.runId}</strong><span>{snapshot?.tasks.length ?? '—'} tasks · {snapshot?.workers.length ?? '—'} attempts</span>
+            <button className="button small" onClick={importRun} disabled={!snapshot || !!snapshotError}><ArrowDownToLine size={14} />Task로 그래프 만들기</button>
+          </div>}
+          {saved.some((item) => item.id === workflow.id) && <><div className="sidebar-section-title">자동화<span>{workflow.automations?.length ?? 0}</span></div>
+            {(workflow.automations ?? []).map((config) => { const state = automationStates[config.id];
+              return <div key={config.id} className={`automation-item ${state?.enabled ? 'on' : state === null ? 'missing' : ''}`}>
+                <div className="automation-head"><Zap size={13} /><strong title={config.name}>{config.name}</strong>
+                  <button className="icon-button" title="지금 실행" aria-label={`${config.name} 지금 실행`} disabled={!config.orcaId || state === null} onClick={() => void automationAction(config, 'run')}><Play size={13} /></button>
+                  <button className="icon-button" title="자동화 삭제" aria-label={`${config.name} 삭제`} onClick={() => void automationAction(config, 'remove')}><Trash2 size={13} /></button></div>
+                <small>{scheduleText(config)} · ×{config.count} · {shortPath(config.project)}</small>
+                {config.values && Object.keys(config.values).length > 0 && <small className="automation-values" title={Object.entries(config.values).map(([key, value]) => `${key} = ${value}`).join('\n')}>
+                  {Object.entries(config.values).map(([key, value]) => `${(workflow.variables ?? []).find((item) => item.key === key)?.label ?? key}: ${value}`).join(' · ')}</small>}
+                <small>{state === null ? 'Orca에서 찾을 수 없음' : state === undefined ? '상태 확인 중' : !state.enabled ? '꺼짐'
+                  : `다음 ${state.nextRunAt ? new Date(state.nextRunAt).toLocaleString('ko-KR', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '—'}${state.lastRunAt ? ` · 마지막 ${new Date(state.lastRunAt).toLocaleString('ko-KR', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}` : ''}`}</small>
+              </div>; })}
+            {!workflow.automations?.length && <p className="sidebar-empty">실행 버튼에서 「자동화로 예약」을 고르면 여기에 표시됩니다.</p>}</>}
+          <div className="sidebar-bottom"><div className={`connection ${connection.connected && !connectionError ? 'connected' : ''}`}><span className="status-dot" /><span>{connection.connected && !connectionError ? 'Orca 연결됨' : 'Orca 연결 확인 필요'}</span><span className="version">{connection.version || 'local'}</span></div><p>그래프는 설계하고,<br />실행 상태는 Orca에서 확인합니다.</p></div>
+        </aside>
+        {!panels.left && <button className="panel-toggle left" title="사이드바 펼치기 ([)" aria-label="사이드바 펼치기" onClick={() => setPanels((value) => ({ ...value, left: true }))}><PanelLeftOpen size={16} /></button>}
 
-        <aside className="inspector"><div className="inspector-header"><span><Settings2 size={16} />{multiSet.size > 1 ? '여러 노드 선택' : selectedEdge ? '연결 속성' : selectedGroup ? '그룹 속성' : selectedFrame ? '메모 그룹 속성' : '단계 속성'}</span><span className="inspector-counter">{selected ? `${nodes.findIndex((node) => node.id === selected.id) + 1} / ${nodes.length}` : '—'}</span></div>
+        {!panels.right && <button className="panel-toggle right" title="속성 패널 펼치기 (])" aria-label="속성 패널 펼치기" onClick={() => setPanels((value) => ({ ...value, right: true }))}>
+          <Settings2 size={15} /><span>속성</span>{(selected || selectedEdge || multiSet.size > 1) && <i className="selection-dot" />}<PanelRightOpen size={16} /></button>}
+        <aside className="inspector floating-panel" hidden={!panels.right} aria-label="속성"><div className="inspector-header"><span><Settings2 size={16} />{multiSet.size > 1 ? '여러 노드 선택' : selectedEdge ? '연결 속성' : selectedGroup ? '그룹 속성' : selectedFrame ? '메모 그룹 속성' : '단계 속성'}</span><span className="inspector-counter">{viewOnly && <span className="view-only-badge"><Lock size={10} />보기 전용</span>}{selected ? `${nodes.findIndex((node) => node.id === selected.id) + 1} / ${nodes.length}` : '—'}
+            <button className="icon-button panel-collapse" title="속성 패널 접기 (])" aria-label="속성 패널 접기" onClick={() => setPanels((value) => ({ ...value, right: false }))}><PanelRightClose size={15} /></button></span></div>
+          <fieldset className="inspector-fields" disabled={viewOnly}>
           {multiSet.size > 1 ? <div className="inspector-content"><div className="selected-kind"><Layers3 size={21} /><div><span>여러 노드</span><strong>{multiSet.size}개 선택됨</strong></div></div>
             <ul className="multi-list">{nodes.filter((node) => multiSet.has(node.id)).map((node) => <li key={node.id}><span>{isGroup(node) ? `${scopeNames[node.data.scope ?? 'project']} 그룹` : kindNames[node.data.kind]}</span>{node.data.label || '이름 없음'}</li>)}</ul>
             <div className="inspector-note"><Layers3 size={16} /><p>선택한 노드 하나를 끌면 함께 이동합니다. ⌘/Ctrl 클릭으로 하나씩 더하거나 빼고, Delete로 한 번에 지웁니다. 지운 그룹 안의 노드는 남습니다.</p></div>
@@ -1172,6 +1202,7 @@ function Workspace() {
             })()}<button className="button danger" onClick={removeSelected}><Trash2 size={14} />연결 삭제</button></div>
             : <div className="inspector-content"><div className="inspector-empty compact"><Settings2 size={22} /><p>단계나 연결을 선택해 속성을 편집하세요.</p></div>
               <VariablesEditor variables={workflow.variables ?? []} nodes={nodes} onChange={(variables) => setWorkflow((value) => ({ ...value, variables: variables.length ? variables : undefined }))} /></div>}
+          </fieldset>
         </aside>
       </div>
       <footer className="statusbar"><span><Circle size={10} />{dirty ? '저장하지 않은 변경 사항' : '로컬 저장 완료'}</span><span>{workflow.runId ? `3초 간격 조회 · ${snapshot && !stale ? new Date(snapshot.observedAt).toLocaleTimeString('ko-KR') : '상태 확인 중'}` : 'Orca Run을 연결하면 실제 실행 상태가 표시됩니다.'}</span><span>JSON v1</span></footer>
@@ -1243,6 +1274,6 @@ function Workspace() {
           <button type="submit" className="button primary" disabled={!generateForm.prompt.trim() || !generateForm.project}><Sparkles size={14} />생성</button></footer>
       </form></div>}
     {notice && <div className="toast" role="status"><span>{notice}</span><button className="icon-button" aria-label="알림 닫기" onClick={() => setNotice('')}><X size={15} /></button></div>}
-    {sidebarOpen && <button className="sidebar-scrim" aria-label="메뉴 닫기" onClick={() => setSidebarOpen(false)} />}
+    {panels.left && <button className="sidebar-scrim" aria-label="메뉴 닫기" onClick={() => setPanels((value) => ({ ...value, left: false }))} />}
   </div></CanvasContext.Provider>;
 }
