@@ -17,6 +17,8 @@ export type BriefInput = {
   artifactDir: string;
   /** Where the coordinator appends execution-log events (POST). */
   logUrl?: string;
+  /** Execution-log id of this 실행 request: the coordinator names it when registering, since requests may overlap. */
+  launchId?: string;
 };
 
 /** How deep workflow links may nest; deeper links are refused before a coordinator starts. */
@@ -217,7 +219,7 @@ export function flowOf(graph: Workflow, linked: Map<string, Workflow>): FlowStag
  * judges the natural-language conditions in node instructions, and reports bindings back
  * through the canvas API so the graph can observe the executions.
  */
-export function buildBrief({ graph, linked = new Map(), count, apiBase, workspace, artifactDir, logUrl, inputs = {}, cleanup = defaultCleanup, automation }: BriefInput): string {
+export function buildBrief({ graph, linked = new Map(), count, apiBase, workspace, artifactDir, logUrl, launchId, inputs = {}, cleanup = defaultCleanup, automation }: BriefInput): string {
   const automationJson = automation ? `,"automation":${JSON.stringify(automation)}` : '';
   const ctx: BriefContext = { linked, project: workspace, inputs, worktrees: [] };
   const stages = stagesOf(graph, ctx, workspace);
@@ -277,9 +279,11 @@ ${worktreeSection}
 3. Task 를 모두 만들면 **워커를 띄우기 전에** 캔버스에 실행 목록을 등록한다(한 번만):
    \`\`\`sh
    curl -s -X PUT -H 'Content-Type: application/json' ${apiBase}/api/workflows/${graph.id}/executions \\
-     --data '{"runId":"<run_id>","executions":[{"id":"exec-1","label":"#1","bindings":{"<nodeId>":"<task_id>", ...},"links":{"<링크 nodeId>":{"<하위 경로>":"<task_id>", ...}}${automationJson.replace(/'/g, '')}}, ...]}'
+     --data '{"runId":"<run_id>",${launchId ? `"launch":"${launchId}",` : ''}"executions":[{"id":"<run_id>-1","label":"#1","bindings":{"<nodeId>":"<task_id>", ...},"links":{"<링크 nodeId>":{"<하위 경로>":"<task_id>", ...}}${automationJson.replace(/'/g, '')}}, ...]}'
    \`\`\`
    - \`bindings\` 에는 최상위 \`worker\`·\`gate\`·\`branch\` 단계만 넣는다. 링크 아래 펼친 단계는 \`links\` 에 **최상위 링크 nodeId** 를 키로, 그 아래 \`nodeId\` 에서 링크 접두사를 뗀 경로(예: \`sub\`, 중첩이면 \`sub.inner\`)를 키로 넣는다. 링크가 없으면 \`links\` 는 생략한다.
+   - 실행 id 는 \`<run_id>-<n>\` 이다(같은 워크플로의 다른 요청이 동시에 돌 수 있어 Run 마다 달라야 한다). 아래 \`<실행 id>\` 는 이 값이다.${launchId ? `
+   - \`launch\` 는 이 실행 요청의 실행 로그 ID 다. 그대로 보낸다.` : ''}
    응답이 200 이 아니면 오류 메시지를 읽고 고쳐서 다시 보낸다.
 4. 각 실행에서 선행 단계가 없는 단계부터 \`worker-start --task <task_id> --worktree path:<그 단계의 location> --agent claude --model <그 단계의 model> [--effort <그 단계의 effort>]\` 로 띄운다. \`effort\` 가 없으면 \`--effort\` 를 빼고, 단계마다 정해진 값을 바꾸지 않는다. 모든 실행의 첫 물결을 먼저 띄운 뒤 기다린다. 띄우자마자 탭 이름을 "${graph.name.slice(0, 30)} #<n> · <단계 이름>" 으로 바꾼다.
 5. \`check --wait --timeout-ms 30000\` 을 반복하며 각 \`worker_done\` 을 처리한다. 진행 규칙은 정해져 있다. 네가 조건을 해석해 바꾸지 않는다.

@@ -151,7 +151,9 @@ export function validateWorkflow(value: unknown): Workflow {
         || (execution.skipped !== undefined && (!Array.isArray(execution.skipped) || execution.skipped.length > 2000
           || execution.skipped.some((path) => typeof path !== 'string' || !/^[a-zA-Z0-9_.-]{1,400}$/.test(path))))
         || (execution.automation !== undefined && (!execution.automation || !validId(execution.automation.id)
-          || typeof execution.automation.name !== 'string' || execution.automation.name.length > 100))) {
+          || typeof execution.automation.name !== 'string' || execution.automation.name.length > 100))
+        || (execution.runId !== undefined && (typeof execution.runId !== 'string' || !validId(execution.runId)))
+        || !validInputs(execution.inputs)) {
         throw new Error('실행 ID·이름·Task 연결이 올바르지 않습니다.');
       }
       executionIds.add(execution.id);

@@ -539,3 +539,75 @@ test('natural-language generation: Orca launches an agent, its results are valid
     await rm(directory, { recursive: true, force: true });
   }
 });
+test('one workflow runs side by side for different run-time inputs; the same inputs never overlap', async () => {
+  await mkdir('.local', { recursive: true });
+  const directory = await mkdtemp(join(resolve('.local'), 'api-inputs-test-'));
+  const calls: string[][] = [];
+  const bridge = createOrcaBridge(async (args) => {
+    calls.push(args);
+    const place = places(args); if (place) return place;
+    if (args[0] === 'agent') return { terminal: { handle: `term_${calls.length}` } };
+    const run = args[args.indexOf(args[1] === 'run-show' ? '--id' : '--run') + 1];
+    if (args[1] === 'run-show') return { run: { id: run, objective: run } };
+    if (args[1] === 'task-list') return { tasks: [{ id: `task-${run}`, status: 'running', deps: [] }] };
+    if (args[1] === 'worker-list') return { workers: [], page: { hasMore: false } };
+    return {};
+  });
+  const json = { 'Content-Type': 'application/json' };
+  const graph = { version: 1 as const, id: 'per-ticket', name: '티켓 처리', description: '', runId: '', edges: [], nodes: [
+    { id: 'wt', type: 'group' as const, position: { x: 0, y: 0 }, width: 400, height: 300,
+      data: { label: '티켓', description: '', kind: 'group' as const, scope: 'worktree' as const, path: '', worktreeMode: 'create' as const, nameSource: 'input' as const } },
+    { id: 'fix', type: 'stage' as const, parentId: 'wt', position: { x: 20, y: 40 }, data: { label: '수정', description: '고친다', kind: 'worker' as const } },
+  ] };
+  const start = (base: string, ticket: string) => fetch(`${base}/api/workflows/per-ticket/execute`, { method: 'POST', headers: json,
+    body: JSON.stringify({ count: 1, project: '/example/repo', inputs: { wt: ticket } }) });
+  const register = (base: string, body: unknown) => fetch(`${base}/api/workflows/per-ticket/executions`, { method: 'PUT', headers: json, body: JSON.stringify(body) });
+  let server = createApp(directory, bridge).listen(0, '127.0.0.1');
+  await new Promise<void>((resolve) => server.once('listening', resolve));
+  let base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const close = () => new Promise<void>((resolve, reject) => { server.close((error) => error ? reject(error) : resolve()); server.closeAllConnections(); });
+  try {
+    assert.equal((await fetch(`${base}/api/workflows/per-ticket`, { method: 'PUT', headers: json, body: JSON.stringify(graph) })).status, 200);
+    assert.equal((await start(base, 'ABC-1')).status, 200);
+    assert.equal((await start(base, 'ABC-1')).status, 409); // same ticket within the cooldown
+    assert.equal((await start(base, 'ABC-2')).status, 200); // another ticket starts its own coordinator
+    assert.equal(calls.filter((args) => args[0] === 'agent').length, 2);
+    const logs = await (await fetch(`${base}/api/workflows/per-ticket/logs`)).json() as { id: string; inputs?: Record<string, string> }[];
+    const first = logs.find((entry) => entry.inputs?.wt === 'ABC-1')!;
+    const second = logs.find((entry) => entry.inputs?.wt === 'ABC-2')!;
+    const brief = (await (await fetch(`${base}/api/workflows/per-ticket/logs/${first.id}/files/brief.md`)).json()).text as string;
+    assert.match(brief, new RegExp(`"launch":"${first.id}"`));
+    assert.match(brief, /"id":"<run_id>-1"/);
+
+    // The older request registers after the newer one started: it still lands on its own launch, not the newest.
+    assert.equal((await register(base, { runId: 'run-a', launch: first.id, executions: [{ id: 'run-a-1', label: '#1', bindings: { fix: 'task-run-a' } }] })).status, 200);
+    assert.equal((await register(base, { runId: 'run-b', launch: second.id, executions: [{ id: 'run-b-1', label: '#1', bindings: { fix: 'task-run-b' } }] })).status, 200);
+    const stored = await (await fetch(`${base}/api/workflows/per-ticket`)).json();
+    assert.equal(stored.runId, 'run-b');
+    assert.deepEqual(stored.executions.map((item: { id: string; label: string; runId: string; inputs: Record<string, string> }) => [item.id, item.label, item.runId, item.inputs.wt]),
+      [['run-a-1', 'ABC-1 #1', 'run-a', 'ABC-1'], ['run-b-1', 'ABC-2 #1', 'run-b', 'ABC-2']]);
+    assert.equal((await (await fetch(`${base}/api/workflows/per-ticket/logs/${first.id}`)).json()).meta.runId, 'run-a');
+    assert.equal((await (await fetch(`${base}/api/workflows/per-ticket/logs/${second.id}`)).json()).meta.runId, 'run-b');
+    // An execution id another Run already uses is refused with a hint; re-registering a Run replaces only its own.
+    const clash = await register(base, { runId: 'run-c', executions: [{ id: 'run-a-1', label: '#1', bindings: { fix: 'task-run-c' } }] });
+    assert.equal(clash.status, 400);
+    assert.match((await clash.json()).error, /run-c-<n>/);
+    assert.equal((await register(base, { runId: 'run-a', launch: first.id, executions: [{ id: 'run-a-1', label: '#1', bindings: { fix: 'task-run-a' } }] })).status, 200);
+    assert.equal((await (await fetch(`${base}/api/workflows/per-ticket`)).json()).executions.length, 2);
+    // A decision on one ticket's execution leaves the other ticket's untouched.
+    assert.equal((await (await fetch(`${base}/api/workflows/per-ticket/executions/run-b-1/decisions`)).json()).skipped.length, 0);
+
+    // After the cooldown (a fresh server), a ticket still in progress is refused; a new ticket is not.
+    await close();
+    server = createApp(directory, bridge).listen(0, '127.0.0.1');
+    await new Promise<void>((resolve) => server.once('listening', resolve));
+    base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const busy = await start(base, 'ABC-1');
+    assert.equal(busy.status, 409);
+    assert.match((await busy.json()).error, /같은 입력/);
+    assert.equal((await start(base, 'ABC-3')).status, 200);
+  } finally {
+    await close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});

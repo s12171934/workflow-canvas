@@ -36,7 +36,8 @@
         {
           "$ref": "#/$defs/id"
         }
-      ]
+      ],
+      "description": "가장 최근에 등록된(또는 사이드바에서 고른) Run. 실행별 Run 은 executions[].runId."
     },
     "nodes": {
       "type": "array",
@@ -287,7 +288,7 @@
     "executions": {
       "type": "array",
       "maxItems": 100,
-      "description": "같은 Run 안에서 그래프를 여러 번 실행한 기록. bindings는 노드 ID → Task ID.",
+      "description": "그래프를 실행한 기록. bindings는 노드 ID → Task ID. 실행 요청마다 Run 이 따로 생기므로 실행마다 runId 를 가진다(없으면 문서의 runId). 실행 시 입력이 다른 요청은 동시에 진행할 수 있다.",
       "items": {
         "type": "object",
         "required": [
@@ -372,6 +373,21 @@
             "items": {
               "type": "string",
               "pattern": "^[a-zA-Z0-9_.-]{1,400}$"
+            }
+          },
+          "runId": {
+            "$ref": "#/$defs/id",
+            "description": "이 실행의 Task 가 든 Orca Run. 없으면 문서의 runId(이전 문서)."
+          },
+          "inputs": {
+            "type": "object",
+            "description": "이 실행을 시작한 요청의 실행 시 입력 워크트리 이름(그룹 ID → 이름). 같은 입력의 실행은 겹쳐 시작하지 않는다.",
+            "propertyNames": {
+              "$ref": "#/$defs/id"
+            },
+            "additionalProperties": {
+              "type": "string",
+              "pattern": "^$|^(?!-)(?!.*\\.\\.)[A-Za-z0-9._-]{1,80}$"
             }
           }
         }

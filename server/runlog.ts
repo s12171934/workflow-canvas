@@ -148,10 +148,15 @@ export function createRunLog(root: string) {
       const id = runLaunch.get(runId);
       if (id) await append(id, event);
     },
-    /** Ties a Run to the newest launch of this workflow that has no Run yet (or already has this one), with its executions. */
-    async register(workflowId: string, runId: string, executions: LoggedExecution[]) {
+    /**
+     * Ties a Run to a launch with its executions: the launch the coordinator names (several requests of one workflow may be
+     * running at once), else the launch that already owns this Run, else the newest launch of this workflow without a Run.
+     */
+    async register(workflowId: string, runId: string, executions: LoggedExecution[], launch?: string) {
       await index();
-      for (const id of await launches(workflowId)) {
+      const named = launch && validLaunch(workflowId, launch) ? [launch] : undefined;
+      const owner = runLaunch.has(runId) ? [runLaunch.get(runId)!] : [];
+      for (const id of named ?? [...owner, ...await launches(workflowId)]) {
         const meta = await readMeta(id);
         if (!meta || (meta.runId && meta.runId !== runId)) continue;
         await writeMeta(id, { ...meta, runId, executions });

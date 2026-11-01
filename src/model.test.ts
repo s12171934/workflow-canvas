@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { pendingDecisions, frameContents, orderNodes, decisionError, skippedStages, topologicalOrder, waves, nodeExecutionStatus, type FlowStage, type StageNode, membershipOf, nodeLocation, aggregateStatus, executionFinished, taskStatus, projectNodes, serializableWorkflow, newWorkflow, fromSnapshot, type TaskSummary, type WorkerSummary, type RunSnapshot } from './model.ts';
+import { pendingDecisions, frameContents, orderNodes, decisionError, skippedStages, topologicalOrder, waves, nodeExecutionStatus, type FlowStage, type StageNode, membershipOf, nodeLocation, aggregateStatus, executionFinished, taskStatus, projectNodes, serializableWorkflow, newWorkflow, fromSnapshot, type TaskSummary, type WorkerSummary, type RunSnapshot, executionRun, inputsKey, mergeSnapshots, workflowRuns } from './model.ts';
 
 const task = (status: string): TaskSummary => ({ id: 'task-a', title: 'A', spec: 'A', status, deps: [] });
 const worker = (liveness: string): WorkerSummary => ({ dispatchId: 'dispatch-a', taskId: 'task-a', liveness, stage: 'working', provider: 'claude', model: 'example-model', outcome: '' });
@@ -288,4 +288,27 @@ test('a gate asked in the worker before it opens a card only while that worker w
   assert.deepEqual(pendingDecisions(stages, { ...execution, decisions: { gate: ['approve'] } }, snapshot('waiting_for_input')), []);
   // A non-gate branch judged by the previous worker is never a user decision.
   assert.deepEqual(pendingDecisions([stages[0], { ...stages[1], veto: undefined }], execution, snapshot('waiting_for_input')), []);
+});
+test('executions of several Runs: each keeps its Run and inputs, and one merged snapshot resolves them all', () => {
+  const graph = newWorkflow();
+  const stage = graph.nodes.find((node) => node.data.kind === 'worker')!;
+  graph.runId = 'run-b';
+  graph.executions = [
+    { id: 'old-1', label: '#1', bindings: { [stage.id]: 'task-old' } }, // from before executions carried a Run
+    { id: 'run-a-1', label: 'ABC-1 #1', bindings: { [stage.id]: 'task-a' }, runId: 'run-a', inputs: { wt: 'ABC-1' } },
+  ];
+  assert.deepEqual(workflowRuns(graph), ['run-b', 'run-a']);
+  assert.equal(executionRun(graph, graph.executions[0]), 'run-b');
+  const saved = serializableWorkflow(graph).executions!;
+  assert.deepEqual([saved[1].runId, saved[1].inputs], ['run-a', { wt: 'ABC-1' }]);
+  assert.equal(saved[0].runId, undefined);
+  assert.equal(inputsKey({ wt: 'ABC-1', other: '' }), inputsKey({ wt: 'ABC-1' }));
+  assert.notEqual(inputsKey({ wt: 'ABC-1' }), inputsKey({ wt: 'ABC-2' }));
+  const snap = (run: string, task: string, status: string) => ({ run: { id: run, objective: run, updatedAt: '' }, observedAt: `2026-01-0${run === 'run-a' ? 1 : 2}`,
+    tasks: [{ id: task, title: task, spec: task, status, deps: [] }], workers: [] }) as RunSnapshot;
+  const merged = mergeSnapshots([snap('run-b', 'task-old', 'completed'), snap('run-a', 'task-a', 'running')])!;
+  assert.equal(merged.run.id, 'run-b');
+  assert.equal(merged.observedAt, '2026-01-01');
+  assert.deepEqual(graph.executions.map((execution) => nodeExecutionStatus(stage, execution, merged, false)), ['completed', 'running']);
+  assert.equal(mergeSnapshots([]), null);
 });

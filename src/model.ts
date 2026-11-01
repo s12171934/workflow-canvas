@@ -159,7 +159,27 @@ export type Execution = { id: string; label: string; bindings: Record<string, st
   /** Stage paths (link-prefixed) no taken path reaches, computed by the server from `decisions`. */
   skipped?: string[];
   /** Set when an Orca automation started this execution. */
-  automation?: { id: string; name: string } };
+  automation?: { id: string; name: string };
+  /** The Run that holds this execution's Tasks. Absent in older documents: the workflow's `runId`. */
+  runId?: string;
+  /** Run-time worktree names of the 실행 request that started it (group id → name). Runs with the same inputs never overlap. */
+  inputs?: Record<string, string> };
+/** Run of an execution: its own, or the workflow's for documents from before executions carried one. */
+export const executionRun = (workflow: Pick<Workflow, 'runId'>, execution: Pick<Execution, 'runId'>) => execution.runId || workflow.runId;
+/** Every Run the workflow observes: its current Run first, then the Runs of its executions. */
+export function workflowRuns(workflow: Pick<Workflow, 'runId' | 'executions'>): string[] {
+  return [...new Set([workflow.runId, ...(workflow.executions ?? []).map((execution) => executionRun(workflow, execution))].filter(Boolean))];
+}
+/** Comparable form of run-time inputs: empty names are dropped (they are asked during the run). */
+export function inputsKey(inputs: Record<string, string> | undefined): string {
+  return JSON.stringify(Object.entries(inputs ?? {}).filter(([, value]) => value).sort(([a], [b]) => a.localeCompare(b)));
+}
+/** One snapshot over several Runs: Task and worker ids are unique across Runs, so statuses resolve as for one Run. */
+export function mergeSnapshots(snapshots: RunSnapshot[]): RunSnapshot | null {
+  if (!snapshots.length) return null;
+  return { run: snapshots[0].run, tasks: snapshots.flatMap((item) => item.tasks), workers: snapshots.flatMap((item) => item.workers),
+    observedAt: snapshots.map((item) => item.observedAt).sort()[0] };
+}
 /** Schedule presets `orca automations create --trigger` accepts; anything else must be a 5-field cron. */
 export const triggerPresets = ['hourly', 'daily', 'weekdays', 'weekly'] as const;
 export const triggerNames: Record<string, string> = { hourly: '매시간', daily: '매일', weekdays: '평일', weekly: '매주' };
@@ -320,7 +340,9 @@ export function serializableWorkflow(workflow: Workflow): Workflow {
       ...(Object.keys(links).length ? { links } : {}),
       ...(execution.decisions && Object.keys(execution.decisions).length ? { decisions: execution.decisions } : {}),
       ...(execution.skipped?.length ? { skipped: execution.skipped } : {}),
-      ...(execution.automation ? { automation: { id: execution.automation.id, name: execution.automation.name } } : {}) };
+      ...(execution.automation ? { automation: { id: execution.automation.id, name: execution.automation.name } } : {}),
+      ...(execution.runId ? { runId: execution.runId } : {}),
+      ...(execution.inputs && Object.keys(execution.inputs).length ? { inputs: execution.inputs } : {}) };
   });
   const { executions: _omit, workspace, cleanup, automations, ...rest } = workflow;
   const ordered = orderNodes(workflow.nodes);
@@ -484,6 +506,8 @@ export type RunLogMeta = {
   count?: number;
   project?: string;
   automation?: { id: string; name: string };
+  /** Run-time worktree names this request was started with (group id → name). */
+  inputs?: Record<string, string>;
   runId?: string;
   /** Executions as the coordinator registered them: each one's Task ids, so results survive a later run replacing the workflow's list. */
   executions?: LoggedExecution[];

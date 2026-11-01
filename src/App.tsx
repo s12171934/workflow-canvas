@@ -11,7 +11,7 @@ import {
   Trash2, Unplug, Workflow as WorkflowIcon, X, XCircle, Zap,
 } from 'lucide-react';
 import {
-  aggregateStatus, executionFinished, executionStatuses as computeExecutionStatuses, openableStatuses, fromSnapshot, newWorkflow, projectNodes, serializableWorkflow, statusLabels,
+  aggregateStatus, executionFinished, executionRun, executionStatuses as computeExecutionStatuses, mergeSnapshots, workflowRuns, openableStatuses, fromSnapshot, newWorkflow, projectNodes, serializableWorkflow, statusLabels,
   asksAtRun, defaultWorkerModel, effortLevels, frameContents, isFrame, launchesWorker, workerModels, type Effort, type Rect, joinNames, pendingDecisions, gateAskerNames, type GateAsker, linkModeNames, type LinkMode, type FlowStage, type PendingDecision, branchJudgeNames, branchModeNames, isBranch, maxBranchOutputs, type BranchJudge, type BranchMode, type BranchOutput, defaultCleanup, triggerNames, worktreeNamePattern, type AutomationConfig, type AutomationState, type Cleanup, canNest, maxGroupDepth, nameSourceNames, safeWorktreeName, type NameSource, createsWorktree, groupOf, membershipOf, orderNodes, worktreeRepo, isExecutable, isGroup, kindNames, normalizeNodes, scopeNames,
   type Workflow, type Execution, type StageNode, type StageKind, type NodeKind, type GroupScope, type StageStatus, type RunSummary, type RunSnapshot, type Locations,
 } from './model';
@@ -183,6 +183,8 @@ function Workspace() {
   const [saved, setSaved] = useState<{ id: string; name: string }[]>([]);
   const [locations, setLocations] = useState<Locations>({ projects: [], worktrees: [] });
   const [snapshot, setSnapshot] = useState<RunSnapshot | null>(null);
+  // Runs of executions started by other 실행 requests (one per ticket, say); the selected Run is `snapshot`.
+  const [otherSnapshots, setOtherSnapshots] = useState<Record<string, RunSnapshot>>({});
   const [connection, setConnection] = useState<{ connected: boolean; version?: string }>({ connected: false });
   const [snapshotError, setSnapshotError] = useState('');
   const [connectionError, setConnectionError] = useState('');
@@ -208,10 +210,13 @@ function Workspace() {
   const multiSet = useMemo(() => new Set(multiIds.filter((id) => nodes.some((node) => node.id === id))), [multiIds, nodes]);
   const stale = !!snapshotError || (!!workflow.runId && !snapshot);
   const executions = useMemo(() => workflow.executions ?? [], [workflow.executions]);
+  // Statuses read every observed Run at once: Task ids never repeat across Runs.
+  const observed = useMemo(() => mergeSnapshots([snapshot, ...Object.values(otherSnapshots)].filter((item): item is RunSnapshot => !!item)),
+    [snapshot, otherSnapshots]);
   const executionStatuses = useMemo(() => executions.map((execution) => {
-    const statuses = computeExecutionStatuses(nodes, execution, snapshot, stale);
+    const statuses = computeExecutionStatuses(nodes, execution, observed, stale);
     return { ...execution, status: aggregateStatus(statuses), finished: executionFinished(statuses) };
-  }), [executions, nodes, snapshot, stale]);
+  }), [executions, nodes, observed, stale]);
   // Finished executions are always hidden; the canvas focuses on work still in progress.
   const visibleExecutions = useMemo(() => executionStatuses.filter((execution) => !execution.finished), [executionStatuses]);
   // Automations whose executions are still open: shown so it is clear the canvas is watching a scheduled run.
@@ -230,8 +235,8 @@ function Workspace() {
     api<FlowStage[]>(`/api/workflows/${workflow.id}/flow`).then((value) => { if (!cancelled) setFlow(value); }).catch(() => { if (!cancelled) setFlow([]); });
     return () => { cancelled = true; };
   }, [workflow.id, isSaved, savedFingerprint, executions.length]);
-  const pending = useMemo(() => stale ? [] : visibleExecutions.flatMap((execution) => pendingDecisions(flow, execution, snapshot)),
-    [flow, visibleExecutions, snapshot, stale]);
+  const pending = useMemo(() => stale ? [] : visibleExecutions.flatMap((execution) => pendingDecisions(flow, execution, observed)),
+    [flow, visibleExecutions, observed, stale]);
   const [picks, setPicks] = useState<Record<string, string[]>>({});
   const [sent, setSent] = useState<Set<string>>(new Set());
   async function decide(item: PendingDecision, outputs: string[]) {
@@ -254,7 +259,7 @@ function Workspace() {
     const node = nodes.find((item) => item.id === selectedId);
     return node ? membershipOf({ nodes }, node) : { worktrees: [] as StageNode[] };
   }, [nodes, selectedId]);
-  const displayNodes = useMemo(() => orderNodes(projectNodes(nodes, snapshot, stale, executions, executionView, visibleIds).map((node) => ({ ...node, selected: node.id === selectedId || multiSet.has(node.id),
+  const displayNodes = useMemo(() => orderNodes(projectNodes(nodes, observed, stale, executions, executionView, visibleIds).map((node) => ({ ...node, selected: node.id === selectedId || multiSet.has(node.id),
     data: { ...node.data,
       ...(createsWorktree(node) && !node.data.repoPath ? { inheritedRepo: worktreeRepo({ nodes }, node) } : {}),
       // The selected node shows where it belongs, and the groups it belongs to light up.
@@ -264,7 +269,7 @@ function Workspace() {
       ...(node.id === selectedMembership.project?.id || selectedMembership.worktrees.some((group) => group.id === node.id) ? { ancestor: true } : {}) },
     // Groups sit under every stage (deeper groups above shallower ones), including stages that only overlap them.
     // Memo groups sit under everything, groups included.
-    ...(isGroup(node) ? { zIndex: groupDepth(node) - maxGroupDepth - 2 } : isFrame(node) ? { zIndex: -maxGroupDepth - 4 } : {}) }))), [nodes, snapshot, stale, executions, executionView, visibleIds, selectedId, multiSet, selectedMembership]);
+    ...(isGroup(node) ? { zIndex: groupDepth(node) - maxGroupDepth - 2 } : isFrame(node) ? { zIndex: -maxGroupDepth - 4 } : {}) }))), [nodes, observed, stale, executions, executionView, visibleIds, selectedId, multiSet, selectedMembership]);
   const displayEdges = useMemo(() => edges.map((edge) => {
     const target = displayNodes.find((node) => node.id === edge.target);
     const source = displayNodes.find((node) => node.id === edge.source);
@@ -359,6 +364,36 @@ function Workspace() {
     return () => { cancelled = true; controller.abort(); clearTimeout(timer); };
   }, [workflow.runId]);
 
+  // The other Runs: polled like the selected one until every execution in them has finished, then left as last seen.
+  const executionsRef = useRef(executions);
+  executionsRef.current = executions;
+  const nodesRef = useRef(nodes);
+  nodesRef.current = nodes;
+  const otherRuns = workflowRuns(workflow).filter((runId) => runId !== workflow.runId).join(',');
+  useEffect(() => {
+    const runIds = otherRuns ? otherRuns.split(',') : [];
+    setOtherSnapshots((value) => Object.fromEntries(Object.entries(value).filter(([runId]) => runIds.includes(runId))));
+    if (!runIds.length) return;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const controller = new AbortController();
+    const settled = new Set<string>();
+    async function refresh() {
+      await Promise.all(runIds.filter((runId) => !settled.has(runId)).map(async (runId) => {
+        try {
+          const result = await api<RunSnapshot>(`/api/runs/${encodeURIComponent(runId)}`, { signal: controller.signal });
+          if (cancelled) return;
+          setOtherSnapshots((value) => ({ ...value, [runId]: result }));
+          const mine = executionsRef.current.filter((execution) => execution.runId === runId);
+          if (mine.every((execution) => executionFinished(computeExecutionStatuses(nodesRef.current, execution, result, false)))) settled.add(runId);
+        } catch { /* keep the last snapshot; Tasks never seen read as 상태 미확인 */ }
+      }));
+      if (!cancelled && settled.size < runIds.length) timer = setTimeout(refresh, 3000);
+    }
+    void refresh();
+    return () => { cancelled = true; controller.abort(); clearTimeout(timer); };
+  }, [otherRuns]);
+
   // Pick up what the coordinator (or an automation's coordinator) registers — Run, executions — and automation changes,
   // without touching local graph edits. Fast right after 실행, slower otherwise.
   const currentRef = useRef(current);
@@ -412,8 +447,6 @@ function Workspace() {
     return () => { cancelled = true; clearTimeout(timer); };
   }, [workflow.id, automationKey]);
 
-  const nodesRef = useRef(nodes);
-  nodesRef.current = nodes;
   const onConnect = useCallback((connection: Connection) => {
     if (connection.source === connection.target) { setNotice('다른 단계에 연결하세요.'); return; }
     if (nodesRef.current.some((node) => node.id === connection.source && isBranch(node)) && !connection.sourceHandle) { setNotice('분기의 출력에서 연결을 시작하세요.'); return; }
@@ -582,12 +615,16 @@ function Workspace() {
       ? { ...node, parentId: target?.id, position: { x: absolute.x - origin.x, y: absolute.y - origin.y } } : node));
   }
   const openTask = useCallback(async (taskId: string) => {
-    if (!workflow.runId) return;
+    // A Task belongs to the Run of the execution that bound it; node.data.taskId bindings use the selected Run.
+    const owner = executions.find((execution) => Object.values(execution.bindings).includes(taskId)
+      || Object.values(execution.links ?? {}).some((tasks) => Object.values(tasks).includes(taskId)));
+    const runId = owner ? executionRun(workflow, owner) : workflow.runId;
+    if (!runId) return;
     try {
-      await api(`/api/runs/${encodeURIComponent(workflow.runId)}/tasks/${encodeURIComponent(taskId)}/open`, { method: 'POST' });
+      await api(`/api/runs/${encodeURIComponent(runId)}/tasks/${encodeURIComponent(taskId)}/open`, { method: 'POST' });
       setNotice('Orca에서 실행 화면을 열었습니다.');
     } catch (error) { setNotice((error as Error).message); }
-  }, [workflow.runId]);
+  }, [workflow, executions]);
   function clickNode(id: string, additive: boolean) {
     // ⌘/Ctrl 클릭 toggles the node in the selection (already applied through handleNodesChange); it never opens a task.
     if (additive) return;
