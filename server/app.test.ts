@@ -445,3 +445,36 @@ test('brief gives each launching stage its model (default when unset) and effort
   assert.match(brief, /--model <그 단계의 model> \[--effort <그 단계의 effort>\]/);
   assert.match(brief, /`location`·`model`·`effort` 가 모두 직전 단계와 같으면/);
 });
+test('a gate can be asked in the terminal of the one worker before it', async () => {
+  const { buildBrief, checkBranches } = await import('./execute.ts');
+  const stage = (id: string, kind = 'worker', extra = {}) => ({ id, type: 'stage' as const, position: { x: 0, y: 0 }, data: { label: id, description: `${id} 지침`, kind, ...extra } });
+  const edge = (source: string, target: string) => ({ id: `${source}-${target}`, source, target });
+  const graph = { ...newWorkflow(), id: 'wf-ask', nodes: [stage('impl'), stage('review', 'gate', { asker: 'previous', description: '머지해도 될까요?' }), stage('merge')],
+    edges: [edge('impl', 'review'), edge('review', 'merge')] } as never as Parameters<typeof buildBrief>[0]['graph'];
+  checkBranches([graph]);
+  const brief = buildBrief({ graph, count: 1, apiBase: 'http://127.0.0.1:1', workspace: '/example/repo', artifactDir: '/tmp/x' });
+  const stages = JSON.parse(brief.match(/```json\n(\[[\s\S]*?\])\n```/)![1]) as { nodeId: string; branch?: { judge: string }; decides?: { nodeId: string; ask?: string }[] }[];
+  assert.deepEqual(stages[0].decides, [{ nodeId: 'review', mode: 'exclusive', outputs: [{ id: 'approve', label: '통과' }, { id: 'reject', label: '거절' }], ask: '머지해도 될까요?' }]);
+  assert.equal(stages[1].branch?.judge, 'previous');
+  assert.match(brief, /워커에서 묻는 게이트/);
+  assert.match(brief, /worker_done 을 보내기 전에 이 터미널에서 사용자에게/);
+  // The asking worker must be the only stage in front of the gate.
+  const twoInFront = { ...graph, nodes: [...graph.nodes, stage('docs')], edges: [...graph.edges, edge('docs', 'review')] } as never as typeof graph;
+  assert.throws(() => checkBranches([twoInFront]), /앞에 워커 하나만/);
+  const coordinator = { ...twoInFront, nodes: twoInFront.nodes.map((node) => node.id === 'review' ? stage('review', 'gate') : node) } as never as typeof graph;
+  checkBranches([coordinator]);
+});
+test('a link that only starts lets what follows it go on without waiting for its sub-graph', async () => {
+  const { flowOf, buildBrief } = await import('./execute.ts');
+  const stage = (id: string, kind = 'worker', extra = {}) => ({ id, type: 'stage' as const, position: { x: 0, y: 0 }, data: { label: id, description: id, kind, ...extra } });
+  const edge = (source: string, target: string) => ({ id: `${source}-${target}`, source, target });
+  const child = { ...newWorkflow(), id: 'wf-child', name: '배포', nodes: [stage('build'), stage('deploy')], edges: [edge('build', 'deploy')] } as never as Parameters<typeof flowOf>[0];
+  const parent = (linkMode?: string) => ({ ...newWorkflow(), id: 'wf-parent', name: '부모', nodes: [stage('prep'), stage('link', 'workflow', { workflowId: 'wf-child', ...(linkMode ? { linkMode } : {}) }), stage('next')],
+    edges: [edge('prep', 'link'), edge('link', 'next')] } as never as Parameters<typeof flowOf>[0]);
+  const linked = new Map([['wf-child', child]]);
+  const after = (graph: Parameters<typeof flowOf>[0]) => Object.fromEntries(flowOf(graph, linked).map((item) => [item.id, item.after.map((dep) => dep.id)]));
+  assert.deepEqual(after(parent()), { prep: [], 'link.build': ['prep'], 'link.deploy': ['link.build'], next: ['link.deploy'] });
+  assert.deepEqual(after(parent('start')), { prep: [], 'link.build': ['prep'], 'link.deploy': ['link.build'], next: ['prep'] });
+  const brief = buildBrief({ graph: parent('start'), linked, count: 1, apiBase: 'http://127.0.0.1:1', workspace: '/example/repo', artifactDir: '/tmp/x' });
+  assert.match(brief, /"wait": false/);
+});

@@ -32,6 +32,8 @@ export function validateWorkflow(value: unknown): Workflow {
       || !['worker', 'gate', 'branch', 'note', 'workflow', 'group', 'frame'].includes(node.data.kind)
       || (node.data.workerModel !== undefined && (typeof node.data.workerModel !== 'string' || !workerModelPattern.test(node.data.workerModel)))
       || (node.data.effort !== undefined && !(effortLevels as readonly string[]).includes(node.data.effort))
+      || (node.data.linkMode !== undefined && (node.data.kind !== 'workflow' || !['wait', 'start'].includes(node.data.linkMode)))
+      || (node.data.asker !== undefined && (node.data.kind !== 'gate' || !['coordinator', 'previous'].includes(node.data.asker)))
       || (node.data.taskId !== undefined && node.data.taskId !== '' && (typeof node.data.taskId !== 'string' || !validId(node.data.taskId)))
       || (node.data.workflowId !== undefined && node.data.workflowId !== '' && (typeof node.data.workflowId !== 'string' || !validId(node.data.workflowId)))) {
       throw new Error('노드 ID·위치·속성이 올바르지 않습니다.');

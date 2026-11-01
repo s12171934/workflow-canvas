@@ -85,6 +85,13 @@ export function checkBranches(workflows: Workflow[]) {
         throw new Error(`${name} 분기를 직전 단계 워커가 판정하려면 앞에 워커 하나만 연결해야 합니다.`);
       }
     }
+    // A gate asked in the worker before it needs exactly that one worker in front.
+    for (const node of workflow.nodes.filter((item) => item.data.kind === 'gate' && item.data.asker === 'previous')) {
+      const sources = workflow.edges.filter((edge) => edge.target === node.id && executable.has(edge.source)).map((edge) => executable.get(edge.source)!);
+      if (sources.length !== 1 || sources[0].data.kind !== 'worker') {
+        throw new Error(`${where}'${node.data.label || '게이트'}' 게이트를 직전 워커 터미널에서 물으려면 앞에 워커 하나만 연결해야 합니다.`);
+      }
+    }
   }
 }
 
@@ -98,13 +105,16 @@ type BriefStage = {
   /** 'any': paths that split at a branch meet here; the stage runs if at least one arrives. Absent: every path is needed. */
   join?: 'any';
   /** This worker also decides these branches (judge 'previous'): it reports `decision: <output id>`. */
-  decides?: { nodeId: string; mode: string; outputs: { id: string; label: string }[] }[];
+  decides?: { nodeId: string; mode: string; outputs: { id: string; label: string }[];
+    /** A gate asked in this worker's terminal: what to ask the user (the gate's instructions). */
+    ask?: string }[];
   /** This stage's agent decides (or creates) the worktree used at this location. */
   namesWorktree?: string[];
   /** Stages that start a worker: the model (always set; the default when the node names none) and effort (omitted = model default). */
   model?: string;
   effort?: string;
-  workflow?: { id: string; name: string; stages: BriefStage[] };
+  /** `wait: false`: stages after this link do not wait for its sub-graph; they follow the link's own predecessors. */
+  workflow?: { id: string; name: string; wait: boolean; stages: BriefStage[] };
 };
 
 type BriefContext = { linked: Map<string, Workflow>; project: string; inputs: Record<string, string>; worktrees: WorktreeSpec[] };
@@ -157,34 +167,38 @@ function stagesOf(graph: Workflow, ctx: BriefContext, fallback: string, prefix =
       }),
       ...(isBranch(node) ? { branch: { mode: node.data.mode ?? 'exclusive', judge: node.data.judge ?? 'previous',
         outputs: (node.data.outputs ?? []).map((output) => ({ id: output.id, label: output.label })) } } : {}),
-      ...(node.data.kind === 'gate' ? { branch: { mode: 'exclusive', judge: 'user', outputs: gateOutputs } } : {}),
+      ...(node.data.kind === 'gate' ? { branch: { mode: 'exclusive', judge: node.data.asker === 'previous' ? 'previous' : 'user', outputs: gateOutputs } } : {}),
       ...(node.data.join === 'any' ? { join: 'any' as const } : {}),
       ...(() => {
         const decides = stageEdges.filter((edge) => edge.source === node.id).map((edge) => byId.get(edge.target)!)
-          .filter((target) => isBranch(target) && (target.data.judge ?? 'previous') === 'previous')
-          .map((target) => ({ nodeId: `${prefix}${target.id}`, mode: target.data.mode ?? 'exclusive', outputs: (target.data.outputs ?? []).map((output) => ({ id: output.id, label: output.label })) }));
+          .filter((target) => (isBranch(target) && (target.data.judge ?? 'previous') === 'previous') || (target.data.kind === 'gate' && target.data.asker === 'previous'))
+          .map((target) => target.data.kind === 'gate'
+            ? { nodeId: `${prefix}${target.id}`, mode: 'exclusive', outputs: gateOutputs, ask: target.data.description || target.data.label || '진행해도 될까요?' }
+            : { nodeId: `${prefix}${target.id}`, mode: target.data.mode ?? 'exclusive', outputs: (target.data.outputs ?? []).map((output) => ({ id: output.id, label: output.label })) });
         return decides.length ? { decides } : {};
       })(),
       ...(namers.has(node.id) ? { namesWorktree: namers.get(node.id) } : {}),
       ...(launchesWorker(node) ? { model: node.data.workerModel || defaultWorkerModel, ...(node.data.effort ? { effort: node.data.effort } : {}) } : {}),
-      ...(sub ? { workflow: { id: sub.id, name: sub.name, stages: stagesOf(sub, ctx, location, `${prefix}${node.id}.`) } } : {}),
+      ...(sub ? { workflow: { id: sub.id, name: sub.name, wait: node.data.linkMode !== 'start', stages: stagesOf(sub, ctx, location, `${prefix}${node.id}.`) } } : {}),
     };
   });
 }
 
 /** Expands workflow links into one graph of brief stage ids: a link's first stages follow the link's predecessors, its successors follow its last stages. */
 function flatten(stages: BriefStage[]): FlowStage[] {
-  const sinks = new Map<string, string[]>();
+  // What a stage after a link really follows: the link's last stages, or (a link that only starts) the link's own predecessors.
+  const sinks = new Map<string, FlowStage['after']>();
   const expanded = new Map<string, FlowStage[]>();
+  const resolve = (after: BriefStage['after']): FlowStage['after'] => after.flatMap((item) => sinks.get(item.nodeId)
+    ?? [{ id: item.nodeId, ...(item.output ? { output: item.output } : {}) }]);
+  // Stages come in topological order, so a link's predecessors are resolved before the link itself.
   for (const stage of stages) {
     if (!stage.workflow) continue;
     const sub = flatten(stage.workflow.stages);
     const referenced = new Set(sub.flatMap((item) => item.after.map((after) => after.id)));
-    sinks.set(stage.nodeId, sub.filter((item) => !referenced.has(item.id)).map((item) => item.id));
+    sinks.set(stage.nodeId, stage.workflow.wait ? sub.filter((item) => !referenced.has(item.id)).map((item) => ({ id: item.id })) : resolve(stage.after));
     expanded.set(stage.nodeId, sub);
   }
-  const resolve = (after: BriefStage['after']) => after.flatMap((item) => sinks.has(item.nodeId)
-    ? sinks.get(item.nodeId)!.map((id) => ({ id })) : [{ id: item.nodeId, ...(item.output ? { output: item.output } : {}) }]);
   return stages.flatMap((stage): FlowStage[] => stage.workflow
     ? expanded.get(stage.nodeId)!.map((item) => item.after.length ? item : { ...item, after: resolve(stage.after) })
     : [{ id: stage.nodeId, after: resolve(stage.after), label: stage.label, question: stage.instructions,
@@ -245,9 +259,9 @@ ${JSON.stringify(worktrees, null, 2)}
 - 단계 종류(\`kind\`):
   - \`worker\`: 워커 하나가 지침을 수행한다.
   - 들어오는 연결이 여럿인 단계: 기본은 **모두 필요**다. 앞 경로 중 하나라도 건너뛰어지면(고르지 않은 분기 출력, 건너뛴 단계) 이 단계도 건너뛴다. \`join: any\` 인 단계는 분기에서 갈라진 경로가 다시 모이는 곳이라 하나라도 오면 진행한다. 어느 쪽이든 건너뜀 계산은 캔버스가 하고, 너는 건너뛰지 않은 선행이 모두 끝났을 때 띄운다.
-  - \`gate\`: 사용자 개입 게이트. 워커를 띄우지 않는다. 출력이 \`approve\`(통과)·\`reject\`(거절) 두 개인 사용자 결정이다. 게이트에서 나가는 연결은 모두 \`approve\` 출력이다.
+  - \`gate\`: 사용자 개입 게이트. 워커를 띄우지 않는다. 출력이 \`approve\`(통과)·\`reject\`(거절) 두 개인 사용자 결정이다. 게이트에서 나가는 연결은 모두 \`approve\` 출력이다. \`branch.judge\` 가 \`user\` 면 코디네이터(캔버스 결정 대기 카드)가 묻고, \`previous\` 면 직전 워커가 자기 터미널에서 사용자에게 묻는다(그 워커의 \`decides\` 에 \`ask\` 로 들어 있다).
   - \`branch\`: 분기. 어느 출력으로 갈지 판정만 한다. \`branch.mode\` 가 \`exclusive\` 면 출력 하나, \`inclusive\` 면 조건에 맞는 출력 모두(하나 이상)를 고른다. \`branch.judge\` 가 판정 주체다: \`previous\` 직전 워커, \`worker\` 판정 전용 워커, \`user\` 사용자. \`after\` 항목에 \`output\` 이 있으면 그 분기가 그 출력을 골랐을 때만 이어지는 연결이다.
-  - \`workflow\`: 다른 워크플로로의 링크. \`workflow.stages\` 를 그 자리에 펼쳐 실행한다. 펼친 첫 단계들은 링크의 선행 단계를 deps 로 갖고, 링크의 후행 단계는 펼친 마지막 단계들을 deps 로 갖는다. 펼친 단계의 \`nodeId\` 는 \`<링크 nodeId>.<하위 nodeId>\` 꼴이다.
+  - \`workflow\`: 다른 워크플로로의 링크. \`workflow.stages\` 를 그 자리에 펼쳐 실행한다. 펼친 첫 단계들은 링크의 선행 단계를 deps 로 갖는다. \`workflow.wait\` 가 \`true\` 면 링크의 후행 단계는 펼친 마지막 단계들을 deps 로 갖고(끝날 때까지 대기), \`false\` 면 펼친 단계를 기다리지 않고 링크의 선행 단계를 deps 로 갖는다(시작만 하고 진행. 펼친 단계는 따로 끝까지 돌고, 실행은 그것까지 끝나야 끝난다). 펼친 단계의 \`nodeId\` 는 \`<링크 nodeId>.<하위 nodeId>\` 꼴이다.
 
 \`\`\`json
 ${JSON.stringify(stages, null, 2)}
@@ -276,7 +290,11 @@ ${worktreeSection}
      - \`worker\`: 분기 Task 에 그 단계의 \`model\`·\`effort\` 로 워커를 띄운다. spec 은 분기 지침과 출력 목록(id·조건)이고, 근거로 선행 단계의 산출물을 읽게 한다. 그 워커의 worker_done 첫 줄 \`decision:\` 을 쓴다.
      - 판정을 아래 "판정 등록" 으로 캔버스에 등록하고 "판정 반영" 을 한다.
      - 응답이 400·409 이거나 \`decision:\` 이 없거나 출력 목록에 없는 값이면 **추측해서 진행하지 않는다.** 분기 Task 를 blocked 로 두고 사용자 결정으로 넘긴다(아래와 같이 게이트를 걸고 캔버스에서 받는다). 판정을 다시 받으려고 워커를 재실행하지 않는다.
-   - **사용자 결정(kind \`gate\`, 그리고 judge \`user\` 인 \`branch\`)**: 자동으로 고르지 않는다. 그리고 **답을 기다리며 멈추지 않는다.** 결정은 여러 실행·여러 단계에서 서로 다른 시점에 생기므로, 하나를 묻고 기다리면 그동안 다른 워커 보고와 다른 결정이 모두 막힌다.
+   - **워커에서 묻는 게이트(kind \`gate\`, judge \`previous\`)**: 질문은 직전 워커가 자기 터미널에서 사용자에게 한다. 너는 게이트를 걸지 않고 묻지도 않는다. 그 워커는 사용자가 답할 때까지 worker_done 을 보내지 않으므로, 그동안 \`check --wait\` 반복을 계속한다(그 워커를 release 하지 않는다).
+     - 워커의 worker_done 첫 줄 \`decision: approve|reject\` 를 "판정 등록" 으로 보내고 "판정 반영" 을 한다. 409 면 사용자가 캔버스에서 먼저 고른 것이므로 등록된 판정을 따른다.
+     - 반복 중 등록된 판정을 확인할 때, 이런 게이트에 판정이 먼저 생겼으면(사용자가 캔버스 카드에서 고름) 그 워커에게 "사용자가 캔버스에서 <출력 id> 를 골랐다. 묻기를 멈추고 그 결정으로 worker_done 을 보내라" 를 메시지로 보낸다. 워커 보고를 기다렸다가 "판정 반영" 을 한다.
+     - 워커가 \`decision:\` 없이 끝나면 추측하지 않고, 이 게이트를 아래 사용자 결정과 같은 방법으로 다시 묻는다.
+   - **사용자 결정(kind \`gate\` judge \`user\`, 그리고 judge \`user\` 인 \`branch\`)**: 자동으로 고르지 않는다. 그리고 **답을 기다리며 멈추지 않는다.** 결정은 여러 실행·여러 단계에서 서로 다른 시점에 생기므로, 하나를 묻고 기다리면 그동안 다른 워커 보고와 다른 결정이 모두 막힌다.
      - 선행 단계가 끝나면 그 Task 에 \`gate-create\` 로 결정 게이트를 건다(질문은 단계 지침, 선택지는 \`branch.outputs\` 의 조건). 실행 로그에 \`gate\` 를 남기고, 이 터미널에 "결정 대기 · <단계 이름> #<n> · 캔버스에서 고르거나 여기에 답하세요" 한 줄을 출력한다.
      - **질문 도구(AskUserQuestion 등)로 묻거나, 답을 받으려고 턴을 끝내지 않는다.** 곧바로 \`check --wait --timeout-ms 30000\` 반복으로 돌아간다.
      - 사용자는 캔버스의 결정 대기 카드에서 고른다. 캔버스가 판정을 등록한다. \`check\` 가 깨거나 시간이 다 될 때마다, 결정 대기 중인 실행마다 등록된 판정을 확인한다:
@@ -313,6 +331,7 @@ curl -s -X POST -H 'Content-Type: application/json' ${logUrl} \\
 - 단계에 \`namesWorktree\` 가 있으면 spec 에 "작업을 마치면 이후 단계가 쓸 워크트리 이름(영문·숫자·\`.\`·\`_\`·\`-\`)을 정하거나 직접 만들고, worker_done 첫 줄에 \`worktree: <이름 또는 절대 경로>\` 로 보고한다" 를 넣는다.
 - 산출물·로그는 \`${artifactDir}/<n>-<nodeId>.txt\` 에 쓴다.
 - 단계에 \`decides\` 가 있으면 spec 에 그 분기의 출력 목록(id·조건)과 "작업을 마치면 조건에 맞는 출력을 고르고(\`mode: exclusive\` 면 하나만) worker_done 첫 줄에 \`decision: <출력 id>\` 로 보고한다. 판정은 한 번만 내고 재실행해 결과를 고르지 않는다" 를 넣는다. \`namesWorktree\` 도 있으면 \`worktree:\` 줄을 그다음 줄에 쓴다.
+- \`decides\` 항목에 \`ask\` 가 있으면(이 워커 뒤의 게이트를 이 워커가 묻는다) spec 에 다음을 넣는다: "작업을 마치면 worker_done 을 보내기 전에 이 터미널에서 사용자에게 \`ask\` 를 묻는다. 결과 요약과 산출물 경로를 함께 보여 주고, 통과(approve)·거절(reject) 중 하나를 고르게 한다. 사용자가 답할 때까지 기다리며, 그사이 사용자가 묻거나 고쳐 달라는 것은 작업 범위 안에서 반영한다. 답을 받으면 worker_done 첫 줄에 \`decision: approve\` 또는 \`decision: reject\` 로 보고한다. 코디네이터가 사용자가 이미 골랐다고 알려 오면 묻기를 멈추고 그 결정으로 보고한다."
 - worker_done 본문은 3줄 이하: 결과, 산출물 경로, 결정이 필요한 것.
 
 ## 완료 시 정리 (사용자가 실행할 때 고른 설정)

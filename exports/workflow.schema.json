@@ -102,7 +102,7 @@
                   "group",
                   "frame"
                 ],
-                "description": "일반 노드: worker(워커), gate(사용자 개입 게이트), branch(분기: 판정 결과에 따라 출력 하나 또는 여럿으로만 진행), note(실행과 무관한 메모), workflow(다른 워크플로 링크). 그룹 노드: group. 분기가 아닌 연결은 모두 병렬이고, 여러 연결이 들어오면 건너뛰지 않은 선행 단계가 모두 끝나야 진행한다. 읽을 때 v1의 task 는 worker 로 바뀐다. frame(메모 그룹)은 노드를 묶어 보여 주기만 하는 상자로, 실행·작업 위치와 무관하고 그룹 안에 넣을 수 없으며 연결도 갖지 않는다."
+                "description": "일반 노드: worker(워커), gate(사용자 개입 게이트), branch(분기: 판정 결과에 따라 출력 하나 또는 여럿으로만 진행), note(실행과 무관한 메모), workflow(다른 워크플로 링크). 그룹 노드: group. 분기가 아닌 연결은 모두 병렬이다. 게이트는 통과(approve)·거절(reject) 두 출력의 사용자 결정이며, 거절하면 그 뒤 단계는 합류 방식과 관계없이 건너뛴다. 읽을 때 v1의 task 는 worker 로 바뀐다. frame(메모 그룹)은 노드를 묶어 보여 주기만 하는 상자로, 실행·작업 위치와 무관하고 그룹 안에 넣을 수 없으며 연결도 갖지 않는다."
               },
               "taskId": {
                 "anyOf": [
@@ -243,6 +243,27 @@
                   "max"
                 ],
                 "description": "워커를 띄우는 노드의 추론 수준. 없으면 모델 기본값(--effort 생략)."
+              },
+              "join": {
+                "enum": [
+                  "all",
+                  "any"
+                ],
+                "description": "들어오는 연결이 여럿인 실행 단계의 합류 방식. all(기본): 앞 경로가 하나라도 건너뛰어지면 이 단계도 건너뜀. any: 분기에서 갈라진 경로가 다시 모이는 곳으로, 하나라도 오면 진행."
+              },
+              "asker": {
+                "enum": [
+                  "coordinator",
+                  "previous"
+                ],
+                "description": "kind gate 전용. 사용자에게 묻는 곳. coordinator(기본): 캔버스 결정 대기 카드·코디네이터 터미널. previous: 앞에 연결된 워커 하나가 작업을 마친 뒤 자기 터미널에서 묻고 decision: approve|reject 로 보고한다(캔버스 카드에서도 고를 수 있다)."
+              },
+              "linkMode": {
+                "enum": [
+                  "wait",
+                  "start"
+                ],
+                "description": "kind workflow 전용. wait(기본): 링크 뒤 단계는 펼친 워크플로의 마지막 단계들이 끝난 뒤 시작. start: 펼친 단계를 시작시키고 링크 뒤 단계는 링크 앞 단계만 기다린다(펼친 단계는 따로 끝까지 돌고, 실행은 그것까지 끝나야 끝난다)."
               }
             }
           },
@@ -330,7 +351,7 @@
           "decisions": {
             "type": "object",
             "maxProperties": 500,
-            "description": "분기 경로(링크 아래는 <링크 nodeId>.<하위 경로>) → 고른 출력 ID. 코디네이터가 판정 API 로 기록한다.",
+            "description": "분기·게이트 경로(링크 아래는 <링크 nodeId>.<하위 경로>) → 고른 출력 ID. 게이트의 출력은 approve·reject. 코디네이터 또는 캔버스의 결정 대기 카드가 판정 API 로 기록한다.",
             "propertyNames": {
               "type": "string",
               "pattern": "^[a-zA-Z0-9_.-]{1,400}$"

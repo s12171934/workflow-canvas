@@ -399,3 +399,6 @@ button.run-chip:hover { border-color:#76d8bc; color:#e3f6ef; }
 .decision-sent { font-size:10px; color:#8c9ca9; }
 @media (max-width:620px) { .decision-panel { top:auto; bottom:60px; right:10px; left:10px; width:auto; max-width:none; } }
 .join-meta { color:#9fc3d9; background:#7fb0f514; border-color:#7fb0f533; }
+.decision-asker { display:flex; align-items:center; gap:6px; flex-wrap:wrap; margin:4px 0 8px; color:#9fb6c6; font-size:11px; line-height:1.4; }
+.decision-asker span { flex:1 1 160px; }
+.link-mode { margin-left:6px; padding:1px 6px; border:1px solid #2f5a54; border-radius:999px; font-size:9px; color:#8fd8cb; }

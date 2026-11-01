@@ -10,6 +10,12 @@ export type BranchJudge = 'previous' | 'worker' | 'user';
 export type BranchOutput = { id: string; label: string };
 export const branchModeNames: Record<BranchMode, string> = { exclusive: '하나만', inclusive: '해당하는 것 모두' };
 export const branchJudgeNames: Record<BranchJudge, string> = { previous: '직전 단계 워커', worker: '판정 워커', user: '사용자' };
+/** Where a gate asks the user: the coordinator (decision card / its terminal), or the terminal of the worker right before it. */
+export type GateAsker = 'coordinator' | 'previous';
+/** Workflow link: 'wait' — what follows the link waits for its whole sub-graph; 'start' — the sub-graph starts and what follows goes on without it. */
+export type LinkMode = 'wait' | 'start';
+export const linkModeNames: Record<LinkMode, string> = { wait: '끝날 때까지 대기', start: '시작만 하고 진행' };
+export const gateAskerNames: Record<GateAsker, string> = { coordinator: '코디네이터', previous: '직전 워커' };
 export const maxBranchOutputs = 8;
 export type JoinMode = 'all' | 'any';
 export const joinNames: Record<JoinMode, string> = { all: '모두 필요', any: '하나라도 오면 진행' };
@@ -72,11 +78,14 @@ export type StageData = {
   membership?: { project?: string; worktrees: string[] };
   /** Display only: this group contains the selected node. */
   ancestor?: boolean;
-  /** kind 'workflow': the linked saved workflow. */
+  /** kind 'workflow': the linked saved workflow, and whether what follows waits for it (unset: 'wait'). */
   workflowId?: string;
+  linkMode?: LinkMode;
   /** kind 'branch': how many outputs it takes, who decides, and its outputs (each a source handle). */
   mode?: BranchMode;
   judge?: BranchJudge;
+  /** kind 'gate': where the user is asked. Unset means 'coordinator'. */
+  asker?: GateAsker;
   outputs?: BranchOutput[];
   /**
    * How a stage with several incoming edges treats a skipped one. 'all' (default): it needs every path, so one skipped
@@ -335,12 +344,13 @@ export function serializableWorkflow(workflow: Workflow): Workflow {
       ...(node.data.ref ? { ref: node.data.ref } : {}), ...(node.data.repoPath ? { repoPath: node.data.repoPath } : {}),
       ...(node.data.worktreeName ? { worktreeName: node.data.worktreeName } : {}), ...(node.data.branch ? { branch: node.data.branch } : {}) });
     else if (group) Object.assign(data, { scope: node.data.scope ?? 'project', path: node.data.path ?? '', ...(node.data.ref ? { ref: node.data.ref } : {}) });
-    else if (node.data.kind === 'workflow') Object.assign(data, node.data.workflowId ? { workflowId: node.data.workflowId } : {});
+    else if (node.data.kind === 'workflow') Object.assign(data, node.data.workflowId ? { workflowId: node.data.workflowId } : {}, node.data.linkMode === 'start' ? { linkMode: 'start' } : {});
     else if (isBranch(node)) Object.assign(data, { mode: node.data.mode ?? 'exclusive', judge: node.data.judge ?? 'previous',
       outputs: (node.data.outputs ?? []).map((output) => ({ id: output.id, label: output.label })), ...(node.data.taskId ? { taskId: node.data.taskId } : {}) });
     else if (node.data.taskId) data.taskId = node.data.taskId;
     if (launchesWorker(node)) Object.assign(data, { ...(node.data.workerModel ? { workerModel: node.data.workerModel } : {}), ...(node.data.effort ? { effort: node.data.effort } : {}) });
     if (!group && isExecutable(node) && node.data.join === 'any') data.join = 'any';
+    if (node.data.kind === 'gate' && node.data.asker === 'previous') data.asker = 'previous';
     const width = node.width ?? node.measured?.width;
     const height = node.height ?? node.measured?.height;
     return { id: node.id, type: group ? 'group' : frame ? 'frame' : 'stage', position: node.position, ...(parentId ? { parentId } : {}),
@@ -550,7 +560,11 @@ export type FlowStage = { id: string; after: { id: string; output?: string }[]; 
 export const gateOutputs: BranchOutput[] = [{ id: 'approve', label: '통과' }, { id: 'reject', label: '거절' }];
 /** A user decision the canvas can take now: its stage is reached, undecided, and every live predecessor finished. */
 export type PendingDecision = { executionId: string; executionLabel: string; node: string; label: string; question: string;
-  mode: BranchMode; outputs: BranchOutput[]; taskId?: string };
+  mode: BranchMode; outputs: BranchOutput[]; taskId?: string;
+  /** A gate asked in the terminal of the worker before it: that worker, now waiting for the user. */
+  askedBy?: { label: string; taskId?: string } };
+/** A gate whose question the worker before it asks in its own terminal (judge 'previous' on a gate). */
+const askedInWorker = (stage: FlowStage) => !!stage.veto && stage.judge === 'previous';
 /** User decisions of one execution that are open now (gates and user-judged branches whose predecessors finished). */
 export function pendingDecisions(flow: FlowStage[], execution: Execution, snapshot: RunSnapshot | null): PendingDecision[] {
   if (!snapshot) return [];
@@ -558,11 +572,18 @@ export function pendingDecisions(flow: FlowStage[], execution: Execution, snapsh
   const skipped = new Set(execution.skipped ?? []);
   const done = (id: string) => skipped.has(id) || executionTasks(execution, [id]).some((taskId) =>
     taskStatus(snapshot.tasks.find((task) => task.id === taskId), snapshot.workers) === 'completed');
-  return flow.filter((stage) => stage.branch && stage.judge === 'user' && !decisions[stage.id] && !skipped.has(stage.id)
-    && stage.after.every((item) => done(item.id))).map((stage) => {
+  const status = (id: string) => { const [taskId] = executionTasks(execution, [id]);
+    return taskId ? taskStatus(snapshot.tasks.find((task) => task.id === taskId), snapshot.workers) : 'unbound'; };
+  // A worker-asked gate is open while its worker waits for the user (Orca reports it as needing attention).
+  const asking = (stage: FlowStage) => askedInWorker(stage) && stage.after.length === 1 && status(stage.after[0].id) === 'blocked';
+  return flow.filter((stage) => stage.branch && !decisions[stage.id] && !skipped.has(stage.id)
+    && (stage.judge === 'user' ? stage.after.every((item) => done(item.id)) : asking(stage))).map((stage) => {
     const [taskId] = executionTasks(execution, [stage.id]);
+    const asker = askedInWorker(stage) ? flow.find((item) => item.id === stage.after[0].id) : undefined;
+    const [askerTask] = asker ? executionTasks(execution, [asker.id]) : [];
     return { executionId: execution.id, executionLabel: execution.label, node: stage.id, label: stage.label ?? stage.id, question: stage.question ?? '',
-      mode: stage.branch!.mode, outputs: stage.branch!.outputs.map((id) => ({ id, label: stage.outputLabels?.[id] ?? id })), ...(taskId ? { taskId } : {}) };
+      mode: stage.branch!.mode, outputs: stage.branch!.outputs.map((id) => ({ id, label: stage.outputLabels?.[id] ?? id })), ...(taskId ? { taskId } : {}),
+      ...(asker ? { askedBy: { label: asker.label ?? asker.id, ...(askerTask ? { taskId: askerTask } : {}) } } : {}) };
   });
 }
 

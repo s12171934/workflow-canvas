@@ -274,3 +274,18 @@ test('a join needs every path by default; a meeting point marked any runs when o
   ];
   assert.deepEqual(skippedStages(split, { pick: ['x'] }), ['y1', 'both']);
 });
+test('a gate asked in the worker before it opens a card only while that worker waits for the user', () => {
+  const stages: FlowStage[] = [
+    { id: 'impl', after: [], label: '구현' },
+    { id: 'gate', after: [{ id: 'impl' }], branch: { mode: 'exclusive', outputs: ['approve', 'reject'] }, judge: 'previous', veto: ['reject'], label: '검토', question: '머지할까요?' },
+  ];
+  const snapshot = (status: string): RunSnapshot => ({ run: { id: 'run-a', objective: 'A', updatedAt: '' }, workers: [], observedAt: '',
+    tasks: [{ id: 'task-impl', title: 'impl', spec: '', status, deps: [] }] });
+  const execution = { id: 'exec-1', label: '#1', bindings: { impl: 'task-impl', gate: 'task-gate' } };
+  assert.deepEqual(pendingDecisions(stages, execution, snapshot('running')), [], 'still working: nothing to answer yet');
+  assert.deepEqual(pendingDecisions(stages, execution, snapshot('waiting_for_input')).map((item) => [item.node, item.askedBy]),
+    [['gate', { label: '구현', taskId: 'task-impl' }]]);
+  assert.deepEqual(pendingDecisions(stages, { ...execution, decisions: { gate: ['approve'] } }, snapshot('waiting_for_input')), []);
+  // A non-gate branch judged by the previous worker is never a user decision.
+  assert.deepEqual(pendingDecisions([stages[0], { ...stages[1], veto: undefined }], execution, snapshot('waiting_for_input')), []);
+});

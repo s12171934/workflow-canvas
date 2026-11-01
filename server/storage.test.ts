@@ -123,3 +123,16 @@ test('validates memo groups and per-node model and effort', () => {
   assert.throws(() => validateWorkflow(withLaunch({ workerModel: '--terminal x' })));
   assert.throws(() => validateWorkflow(withLaunch({ effort: 'extreme' })));
 });
+test('only gates take an asker, and only a known one', () => {
+  const graph = newWorkflow();
+  const withData = (index: number, data: object) => ({ ...graph, nodes: graph.nodes.map((node, i) => i === index ? { ...node, data: { ...node.data, ...data } } : node) });
+  assert.equal(validateWorkflow(withData(5, { asker: 'previous' })).nodes[5].data.asker, 'previous');
+  assert.throws(() => validateWorkflow(withData(5, { asker: 'someone' })));
+  assert.throws(() => validateWorkflow(withData(0, { asker: 'previous' })));
+});
+test('only workflow links take a link mode, and only a known one', () => {
+  const graph = { ...newWorkflow(), nodes: [{ id: 'link', type: 'stage' as const, position: { x: 0, y: 0 }, data: { label: 'link', description: '', kind: 'workflow' as const, linkMode: 'start' as const } }], edges: [] };
+  assert.equal(validateWorkflow(graph).nodes[0].data.linkMode, 'start');
+  assert.throws(() => validateWorkflow({ ...graph, nodes: [{ ...graph.nodes[0], data: { ...graph.nodes[0].data, linkMode: 'later' as never } }] }));
+  assert.throws(() => validateWorkflow({ ...graph, nodes: [{ ...graph.nodes[0], data: { ...graph.nodes[0].data, kind: 'worker' as const } }] }));
+});
