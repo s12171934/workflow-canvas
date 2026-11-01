@@ -227,6 +227,7 @@ button.run-chip:hover { border-color:#76d8bc; color:#e3f6ef; }
 .tool-group-label { font-size:9px; color:#6f808d; letter-spacing:.4px; padding:0 4px 0 6px; user-select:none; }
 .tool-button { position:relative; color:#8b9aa7; background:transparent; border:0; border-radius:6px; padding:7px; display:inline-flex; align-items:center; justify-content:center; cursor:pointer; }
 .tool-button:hover, .tool-button:focus-visible { background:#303c46; color:#e1e9ee; outline:none; }
+.tool-button.mode-button.active { background:#2c4a42; color:#93d8c0; }
 .tool-button.kind-worker { color:var(--c-worker); } .tool-button.kind-gate { color:var(--c-gate); } .tool-button.kind-workflow { color:var(--c-workflow); }
 .tool-button.kind-note { color:var(--c-note); } .tool-button.kind-project { color:var(--c-project); } .tool-button.kind-worktree { color:var(--c-worktree); }
 .tool-tip { position:absolute; top:calc(100% + 8px); left:50%; transform:translate(-50%,-3px); width:max-content; max-width:220px; padding:7px 9px; border-radius:7px;

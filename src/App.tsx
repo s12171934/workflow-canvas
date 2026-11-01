@@ -7,7 +7,7 @@ import {
 import {
   Activity, ArrowDownToLine, History, ArrowUpFromLine, Bot, Check, ChevronRight, Circle,
   CircleHelp, Clock3, ExternalLink, FileJson2, FolderGit2, GitBranch, Group, Hand, Layers3, LayoutDashboard, Link2,
-  LoaderCircle, Menu, Network, Play, Plus, Save, Settings2, SkipForward, Sparkles, Split, SquareDashed, StickyNote,
+  LoaderCircle, Menu, Move, MousePointer2, Network, Play, Plus, Save, Settings2, SkipForward, Sparkles, Split, SquareDashed, StickyNote,
   Trash2, Unplug, Workflow as WorkflowIcon, X, XCircle, Zap,
 } from 'lucide-react';
 import {
@@ -128,6 +128,10 @@ function rememberWorkflow(id: string) { try { localStorage.setItem(lastWorkflowK
 function lastWorkflow(): string | null { try { return localStorage.getItem(lastWorkflowKey); } catch { return null; } }
 const lastProjectKey = 'workflow-canvas:last-project';
 function rememberProject(path: string) { try { localStorage.setItem(lastProjectKey, path); } catch { /* storage may be blocked */ } }
+/** 조작 모드: 'select' = 빈 곳 드래그로 여러 개 선택, 'pan' = 드래그로 화면 이동. Remembered per browser. */
+type PointerMode = 'select' | 'pan';
+const pointerModeKey = 'workflow-canvas:pointer-mode';
+function storedPointerMode(): PointerMode { try { return localStorage.getItem(pointerModeKey) === 'pan' ? 'pan' : 'select'; } catch { return 'select'; } }
 function lastProject(): string | null { try { return localStorage.getItem(lastProjectKey); } catch { return null; } }
 type RunForm = { mode: 'now' | 'schedule'; project: string; count: number; inputs: Record<string, string>; cleanup: Cleanup;
   name: string; trigger: string; cron: string; time: string; day: number };
@@ -159,6 +163,19 @@ function Workspace() {
   const [selectedEdgeId, setSelectedEdgeId] = useState<string | null>(null);
   // 여러 노드 선택(드래그 박스·Shift/⌘ 클릭). Two or more ids; a single pick always goes to selectedId so the inspector shows it.
   const [multiIds, setMultiIds] = useState<string[]>([]);
+  const [pointerMode, setPointerMode] = useState<PointerMode>(storedPointerMode);
+  useEffect(() => { try { localStorage.setItem(pointerModeKey, pointerMode); } catch { /* per-browser convenience only */ } }, [pointerMode]);
+  // V / H switch the mode, as in drawing tools; ignored while typing.
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (event.metaKey || event.ctrlKey || event.altKey || target?.closest('input, textarea, select, [contenteditable="true"]')) return;
+      if (event.key === 'v' || event.key === 'V') setPointerMode('select');
+      else if (event.key === 'h' || event.key === 'H') setPointerMode('pan');
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
   // Latest selection, so several React Flow select batches in one tick build on each other.
   const selection = useRef<string[]>([]);
   selection.current = multiIds.length ? multiIds : selectedId ? [selectedId] : [];
@@ -820,7 +837,12 @@ function Workspace() {
       <div className="editor-body">
         <section className="canvas" aria-label="워크플로 그래프 캔버스">
           <div className="canvas-tools" role="toolbar" aria-label="추가">
-            <span className="tool-group-label">노드</span>
+            <span className="tool-group-label">조작</span>
+            {([['select', MousePointer2, '선택 (V)', '빈 곳을 드래그해 여러 노드를 선택. 화면 이동은 스크롤·가운데 버튼·Space+드래그'],
+              ['pan', Move, '화면 이동 (H)', '드래그로 화면 이동. Shift+드래그로 여러 노드 선택']] as const).map(([mode, Icon, name, tip]) =>
+              <button key={mode} className={`tool-button mode-button ${pointerMode === mode ? 'active' : ''}`} aria-label={name} aria-pressed={pointerMode === mode} onClick={() => setPointerMode(mode)}>
+                <Icon size={17} /><span className="tool-tip" role="tooltip"><strong>{name}</strong>{tip}</span></button>)}
+            <span className="tool-divider" /><span className="tool-group-label">노드</span>
             {([['worker', Bot, '워커', '에이전트 하나가 지침을 수행'], ['gate', Hand, '사용자 개입 게이트', '사용자가 통과·거절을 결정'],
               ['branch', Split, '분기', '판정 결과에 따라 출력 하나(또는 여럿)로만 진행. 일반 연결은 모두 병렬'],
               ['workflow', WorkflowIcon, '워크플로 링크', '저장된 다른 워크플로를 펼쳐 실행'], ['note', StickyNote, '메모', '실행과 무관한 설명']] as const).map(([kind, Icon, name, tip]) =>
@@ -869,7 +891,7 @@ function Workspace() {
           <ReactFlow<StageNode> nodes={displayNodes} edges={displayEdges} nodeTypes={nodeTypes} onNodesChange={handleNodesChange} onEdgesChange={onEdgesChange} onConnect={onConnect}
             onNodeDragStart={(_event, node, dragged) => startDrag(node, dragged)} onNodeDrag={(_event, _node, dragged) => dragFrame(dragged)} onNodeDragStop={(_event, _node, dragged) => stopDrag(dragged)}
             onSelectionDragStart={(_event, dragged) => dragged[0] && startDrag(dragged[0], dragged)} onSelectionDrag={(_event, dragged) => dragFrame(dragged)} onSelectionDragStop={(_event, dragged) => stopDrag(dragged)}
-            selectionOnDrag panOnDrag={[1, 2]} panOnScroll multiSelectionKeyCode={['Meta', 'Control']}
+            selectionOnDrag={pointerMode === 'select'} panOnDrag={pointerMode === 'select' ? [1, 2] : true} panOnScroll multiSelectionKeyCode={['Meta', 'Control']}
             onBeforeDelete={async () => { removeSelected(); return false; }}
             onNodeClick={(event, node) => clickNode(node.id, event.metaKey || event.ctrlKey)} onEdgeClick={(_event, edge) => { setSelectedEdgeId(edge.id); setSelectedId(null); setMultiIds([]); }}
             onPaneClick={() => { setSelectedId(null); setSelectedEdgeId(null); setMultiIds([]); }} elevateNodesOnSelect={false} fitView fitViewOptions={{ padding: 0.25 }} minZoom={0.15} maxZoom={1.6} deleteKeyCode={['Backspace', 'Delete']} colorMode="dark" proOptions={{ hideAttribution: false }}>
@@ -879,7 +901,7 @@ function Workspace() {
           </ReactFlow>
           {nodes.length === 0 && <div className="empty-canvas"><Network size={36} /><h2>첫 단계를 만들어 보세요</h2><p>워커를 추가하고, 프로젝트·워크트리 그룹으로 작업 위치를 묶을 수 있습니다.</p><div className="empty-actions"><button className="button primary" onClick={() => addNode('worker')}><Plus size={16} />워커 추가</button>
             <button className="button" onClick={() => { setGenerateForm((form) => ({ ...form, project: form.project || defaultProject() })); setGenerateDialog(true); }}><Sparkles size={16} />자연어로 만들기</button></div></div>}
-          <div className="canvas-hint">빈 곳 드래그로 여러 개 선택 · 휠/가운데 버튼·Space+드래그로 화면 이동 · 노드 드래그로 이동 · 단계를 그룹 안에 놓아 작업 위치 지정 · 포트를 연결해 흐름 만들기 · Delete로 삭제</div>
+          <div className="canvas-hint">{pointerMode === 'select' ? '선택 모드: 빈 곳 드래그로 여러 개 선택 · 스크롤/가운데 버튼·Space+드래그로 화면 이동' : '이동 모드: 드래그로 화면 이동 · Shift+드래그로 여러 개 선택'} · V/H로 모드 전환 · 노드 드래그로 이동 · 단계를 그룹 안에 놓아 작업 위치 지정 · 포트를 연결해 흐름 만들기 · Delete로 삭제</div>
         </section>
 
         <aside className="inspector"><div className="inspector-header"><span><Settings2 size={16} />{multiSet.size > 1 ? '여러 노드 선택' : selectedEdge ? '연결 속성' : selectedGroup ? '그룹 속성' : selectedFrame ? '메모 그룹 속성' : '단계 속성'}</span><span className="inspector-counter">{selected ? `${nodes.findIndex((node) => node.id === selected.id) + 1} / ${nodes.length}` : '—'}</span></div>
