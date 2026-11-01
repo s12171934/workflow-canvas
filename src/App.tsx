@@ -1,4 +1,4 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
+import { createContext, type CSSProperties, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ReactFlow, ReactFlowProvider, Background, Controls, MiniMap, Handle, Position, NodeResizer,
   addEdge, useNodesState, useEdgesState, useReactFlow, useStore, MarkerType,
@@ -7,12 +7,13 @@ import {
 import {
   Activity, ArrowDownToLine, History, ArrowUpFromLine, Bot, Check, ChevronRight, Circle,
   CircleHelp, Clock3, ExternalLink, FileJson2, FolderGit2, GitBranch, Group, Hand, Layers3, LayoutDashboard, Link2,
-  Eye, LoaderCircle, Lock, Menu, Move, PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen, MousePointer2, Network, Play, Plus, Save, Settings2, SkipForward, Sparkles, Split, SquareDashed, StickyNote,
+  Eye, LoaderCircle, LocateFixed, Lock, Menu, Move, PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen, MousePointer2, Network, Play, Plus, Save, Settings2, SkipForward, Sparkles, Split, SquareDashed, StickyNote,
   Trash2, Unplug, Workflow as WorkflowIcon, X, XCircle, Zap,
 } from 'lucide-react';
 import {
   aggregateStatus, executionFinished, executionRun, executionStatuses as computeExecutionStatuses, mergeSnapshots, workflowRuns, openableStatuses, fromSnapshot, newWorkflow, projectNodes, serializableWorkflow, statusLabels,
   asksAtRun, defaultWorkerModel, effortLevels, frameContents, isFrame, launchesWorker, workerModels, type Effort, type Rect, joinNames, pendingDecisions, gateAskerNames, type GateAsker, linkModeNames, maxSpawnItems, type LinkMode, variableKeyPattern, variableRefs, maxVariables, maxVariableValue, type WorkflowVariable, loopBody, maxLoopRounds, type WorkflowEdge, type FlowStage, type PendingDecision, branchJudgeNames, branchModeNames, isBranch, maxBranchOutputs, type BranchJudge, type BranchMode, type BranchOutput, defaultCleanup, triggerNames, worktreeNamePattern, type AutomationConfig, type AutomationState, type Cleanup, canNest, maxGroupDepth, nameSourceNames, safeWorktreeName, type NameSource, createsWorktree, groupOf, membershipOf, orderNodes, worktreeRepo, isExecutable, isGroup, kindNames, normalizeNodes, scopeNames,
+  neighbors, relationTo, type Relation,
   type Workflow, type Execution, type StageNode, type StageKind, type NodeKind, type GroupScope, type StageStatus, type RunSummary, type RunSnapshot, type Locations,
 } from './model';
 import { RunLogDialog } from './RunLog';
@@ -46,6 +47,7 @@ function MiniMapNode({ id, x, y, width, height, borderRadius, selected, onClick 
     <rect x={x} y={y} width={width} height={height} rx={borderRadius} ry={borderRadius} fill={color} fillOpacity={group ? 0.08 : 0.2}
       stroke={color} strokeWidth={selected ? 14 : 6} strokeDasharray={data.kind === 'note' || group ? '18 10' : undefined} />
     <Icon x={group ? x + 20 : x + (width - size) / 2} y={group ? y + 20 : y + (height - size) / 2} size={size} color={color} strokeWidth={2.4} />
+    {data.live && !group && <rect className="minimap-live" x={x - 10} y={y - 10} width={width + 20} height={height + 20} rx={borderRadius + 8} fill="none" stroke={statusDotColors.running} strokeWidth={10} />}
     {dot && <circle cx={x + width - height * 0.18} cy={y + height * 0.18} r={height * 0.12} fill={dot} />}
   </g>;
 }
@@ -55,17 +57,20 @@ function StageCard({ data, selected }: NodeProps<StageNode>) {
   const { openTask, workflowName } = useContext(CanvasContext);
   const openable = !!data.activeTaskId && openableStatuses.includes(status);
   const KindIcon = kindIcons[data.kind] ?? Bot;
-  if (data.kind === 'note') return <article className={`stage-card note ${selected ? 'selected' : ''}`} aria-label={`메모, ${data.label}`}>
+  const relation = data.relation ? `rel-${data.relation}` : '';
+  if (data.kind === 'note') return <article className={`stage-card note ${relation} ${selected ? 'selected' : ''}`} aria-label={`메모, ${data.label}`}>
     <Handle type="target" position={Position.Left} />
-    <div className="stage-kind"><KindIcon size={14} /><span>{kindNames.note}</span><span className="note-badge">실행 안 함</span></div>
+    <div className="stage-kind"><KindIcon size={14} /><span>{kindNames.note}</span><RelationBadge relation={data.relation} /><span className="note-badge">실행 안 함</span></div>
     <h3>{data.label || '메모'}</h3>
     <p className="note-body">{data.description || '실행과 관계없는 설명을 적으세요.'}</p>
     <Handle type="source" position={Position.Right} />
   </article>;
   const linked = data.kind === 'workflow' ? workflowName(data.workflowId) : undefined;
-  return <article className={`stage-card ${data.kind} ${status} ${selected ? 'selected' : ''}`} aria-label={`${data.label}, ${statusLabels[status]}`}>
+  return <article className={`stage-card ${data.kind} ${status} ${data.live ? 'live' : ''} ${relation} ${selected ? 'selected' : ''}`}
+    aria-label={`${data.label}, ${statusLabels[status]}${data.live && status !== 'running' ? `, ${data.live}개 실행 중` : ''}`}>
     <Handle type="target" position={Position.Left} />
-    <div className="stage-kind"><KindIcon size={14} /><span>{kindNames[data.kind]}</span>
+    {data.live && <div className="live-badge" title="지금 이 단계를 실행하고 있습니다"><LoaderCircle size={11} className="spin" />실행 중{data.live > 1 ? ` ×${data.live}` : ''}</div>}
+    <div className="stage-kind"><KindIcon size={14} /><span>{kindNames[data.kind]}</span><RelationBadge relation={data.relation} />
       {data.join === 'any' && <span className="branch-meta join-meta" title="분기에서 갈라진 경로가 다시 모이는 곳">합류: 하나라도</span>}
       {data.kind === 'gate' && data.asker === 'previous' && <span className="branch-meta">{gateAskerNames.previous}이 물음</span>}
       {data.kind === 'branch' && <span className="branch-meta">{branchModeNames[data.mode ?? 'exclusive']} · {branchJudgeNames[data.judge ?? 'previous']}</span>}
@@ -100,6 +105,12 @@ function StageCard({ data, selected }: NodeProps<StageNode>) {
       <span className="agent-label">{openable ? '클릭해 실행 화면 열기' : data.agent || (data.activeTaskId ? data.activeTaskId.slice(0, 14) : data.runs ? '' : 'Task 연결 가능')}</span></div>
     {data.kind !== 'branch' && <Handle type="source" position={Position.Right} />}
   </article>;
+}
+const relationNames: Partial<Record<Relation, string>> = { upstream: '앞 단계', downstream: '다음 단계', both: '앞·다음 단계' };
+/** Marks a direct predecessor/successor of the selected stage. */
+function RelationBadge({ relation }: { relation?: Relation }) {
+  const name = relation && relationNames[relation];
+  return name ? <span className={`relation-badge ${relation}`}>{name}</span> : null;
 }
 function GroupCard({ data, selected }: NodeProps<StageNode>) {
   const scope = data.scope ?? 'project';
@@ -308,8 +319,12 @@ function Workspace() {
     const node = nodes.find((item) => item.id === selectedId);
     return node ? membershipOf({ nodes }, node) : { worktrees: [] as StageNode[] };
   }, [nodes, selectedId]);
+  // 1차 연관: the stages one connection away from the selected stage light up (앞 단계·다음 단계) and the rest fade.
+  const focusStage = selected && !isGroup(selected) && !isFrame(selected) && !multiSet.size ? selected.id : undefined;
+  const near = useMemo(() => focusStage ? neighbors(edges, focusStage) : undefined, [edges, focusStage]);
   const displayNodes = useMemo(() => orderNodes(projectNodes(nodes, observed, stale, executions, executionView, visibleIds).map((node) => ({ ...node, selected: node.id === selectedId || multiSet.has(node.id),
     data: { ...node.data,
+      ...(focusStage && near && !isGroup(node) && !isFrame(node) ? { relation: relationTo(node.id, focusStage, near) } : {}),
       ...(createsWorktree(node) && !node.data.repoPath ? { inheritedRepo: worktreeRepo({ nodes }, node) } : {}),
       // The selected node shows where it belongs, and the groups it belongs to light up.
       ...(node.id === selectedId && !isGroup(node) && (selectedMembership.project || selectedMembership.worktrees.length)
@@ -319,7 +334,7 @@ function Workspace() {
     // Groups sit under every stage (deeper groups above shallower ones), including stages that only overlap them.
     // Memo groups sit under everything, groups included.
     // A memo group inside a group shares its group's layer (it is ordered right after it): over that group, under groups nested beside it.
-    ...(isGroup(node) ? { zIndex: groupDepth(node) - maxGroupDepth - 2 } : isFrame(node) ? { zIndex: node.parentId ? groupDepth(node) - 1 - maxGroupDepth - 2 : -maxGroupDepth - 4 } : {}) }))), [nodes, observed, stale, executions, executionView, visibleIds, selectedId, multiSet, selectedMembership]);
+    ...(isGroup(node) ? { zIndex: groupDepth(node) - maxGroupDepth - 2 } : isFrame(node) ? { zIndex: node.parentId ? groupDepth(node) - 1 - maxGroupDepth - 2 : -maxGroupDepth - 4 } : {}) }))), [nodes, observed, stale, executions, executionView, visibleIds, selectedId, multiSet, selectedMembership, focusStage, near]);
   const displayEdges = useMemo(() => edges.map((edge) => {
     const target = displayNodes.find((node) => node.id === edge.target);
     const source = displayNodes.find((node) => node.id === edge.source);
@@ -328,21 +343,47 @@ function Workspace() {
     const output = source && isBranch(source) ? source.data.outputs?.find((item) => item.id === edge.sourceHandle) : undefined;
     const taken = !!output && !!source?.data.decision?.includes(output.id);
     const dead = (!!output && !!source?.data.decision && !taken) || target?.data.status === 'skipped' || source?.data.status === 'skipped';
+    // With a stage selected, its own connections come forward and the others step back.
+    const touches = !!focusStage && (edge.source === focusStage || edge.target === focusStage);
+    const focus = (style: CSSProperties) => !focusStage ? style : touches
+      ? { ...style, strokeWidth: Math.max(Number(style.strokeWidth ?? 1.4), 2.4), opacity: 1 } : { ...style, opacity: 0.15 };
+    const zIndex = touches ? { zIndex: 1 } : {};
     if (edge.loop) {
       // A loop goes back: violet, dashed, labelled with its output and limit.
       const loopStroke = dead ? '#4a4258' : '#b996f2';
       return { ...edge, selected: edge.id === selectedEdgeId, type: 'smoothstep', label: `↺ ${edge.label || output?.label || edge.sourceHandle} · 최대 ${edge.loop.max}회`,
         labelStyle: { fill: dead ? '#6b7680' : '#d9c7fb', fontSize: 10 }, labelBgStyle: { fill: '#1b2128' },
-        markerEnd: { type: MarkerType.ArrowClosed, color: loopStroke }, style: { stroke: loopStroke, strokeWidth: taken ? 2 : 1.4, strokeDasharray: '4 3', ...(dead ? { opacity: 0.5 } : {}) } };
+        markerEnd: { type: MarkerType.ArrowClosed, color: loopStroke }, style: focus({ stroke: loopStroke, strokeWidth: taken ? 2 : 1.4, strokeDasharray: '4 3', ...(dead ? { opacity: 0.5 } : {}) }), ...zIndex,
+      ...(focusStage && !touches ? { labelStyle: { fill: '#6b7680', fontSize: 10, opacity: 0.3 }, labelBgStyle: { fill: '#1b2128', opacity: 0.3 } } : {}) };
     }
-    const stroke = dead ? '#3a434b' : active ? '#76d8bc' : output ? '#e3b45f' : '#414b54';
+    const stroke = dead ? '#3a434b' : active ? '#76d8bc' : output ? '#e3b45f' : touches ? '#93d8c0' : '#414b54';
     return { ...edge, selected: edge.id === selectedEdgeId, animated: active, type: 'smoothstep',
       label: edge.label || output?.label, ...(output ? { labelStyle: { fill: dead ? '#6b7680' : '#f0d49b', fontSize: 10 }, labelBgStyle: { fill: '#1b2128' } } : {}),
       markerEnd: { type: MarkerType.ArrowClosed, color: stroke === '#414b54' ? '#49545c' : stroke },
-      style: { stroke, strokeWidth: active || taken ? 2 : 1.4, ...(output && !taken ? { strokeDasharray: '6 4' } : {}), ...(dead ? { opacity: 0.5, strokeDasharray: '3 5' } : {}) } };
-  }), [edges, displayNodes, selectedEdgeId]);
+      style: focus({ stroke, strokeWidth: active || taken ? 2 : 1.4, ...(output && !taken ? { strokeDasharray: '6 4' } : {}), ...(dead ? { opacity: 0.5, strokeDasharray: '3 5' } : {}) }), ...zIndex,
+      ...(focusStage && !touches && (edge.label || output) ? { labelStyle: { fill: '#6b7680', fontSize: 10, opacity: 0.3 }, labelBgStyle: { fill: '#1b2128', opacity: 0.3 } } : {}) };
+  }), [edges, displayNodes, selectedEdgeId, focusStage]);
   const counts = displayNodes.filter(isExecutable).reduce((totals, node) => { const key = node.data.status ?? 'unbound'; totals[key] = (totals[key] ?? 0) + 1; return totals; }, {} as Partial<Record<StageStatus, number>>);
   const stageCount = nodes.filter(isExecutable).length;
+  // Stages that need eyes now: running (in any shown execution) first, then those waiting on a person.
+  const liveNodes = useMemo(() => displayNodes.filter((node) => isExecutable(node) && (node.data.live || node.data.status === 'blocked'))
+    .sort((a, b) => Number(!a.data.live) - Number(!b.data.live)), [displayNodes]);
+  const liveCount = liveNodes.filter((node) => node.data.live).length;
+  const liveCursor = useRef(0);
+  /** Select a node and bring it into view without opening its terminal. */
+  const focusNode = useCallback((id: string) => {
+    setSelectedId(id); setSelectedEdgeId(null); setMultiIds([]);
+    void fitView({ nodes: [{ id }], padding: 0.6, maxZoom: 1.1, duration: 400 });
+  }, [fitView]);
+  /** Steps through the running stages one by one, wrapping around. */
+  const focusNextLive = () => {
+    const running = liveNodes.filter((node) => node.data.live);
+    if (!running.length) { setNotice('지금 실행 중인 단계가 없습니다.'); return; }
+    const at = running.findIndex((node) => node.id === selectedId);
+    const next = at >= 0 ? (at + 1) % running.length : liveCursor.current % running.length;
+    liveCursor.current = next + 1;
+    focusNode(running[next].id);
+  };
   const workflowName = useCallback((id?: string) => id ? (id === workflow.id ? workflow.name : saved.find((item) => item.id === id)?.name) : undefined, [saved, workflow.id, workflow.name]);
   const selectedGroup = selected && isGroup(selected) ? selected : undefined;
   const selectedFrame = selected && isFrame(selected) ? selected : undefined;
@@ -880,6 +921,22 @@ function Workspace() {
   }
 
   const canvasContext = useMemo(() => ({ openTask, workflowName, viewOnly }), [openTask, workflowName, viewOnly]);
+  /** 연결된 단계: the selected stage's direct predecessors and successors; clicking one moves to it. */
+  function related() {
+    if (!near || (!near.upstream.length && !near.downstream.length)) return null;
+    const row = (id: string, direction: string) => {
+      const node = displayNodes.find((item) => item.id === id);
+      if (!node) return null;
+      const Icon = kindIcons[node.data.kind] ?? Bot;
+      const status = node.data.status ?? 'unbound';
+      return <button key={`${direction}-${id}`} className={`related-row ${direction}`} onClick={() => focusNode(id)} title="클릭해 이 단계로 이동">
+        <Icon size={13} /><strong>{node.data.label || '이름 없는 단계'}</strong>
+        {isExecutable(node) && <span className={`task-state ${status}`}><span className="status-dot" />{node.data.live ? `실행 중${node.data.live > 1 ? ` ×${node.data.live}` : ''}` : statusLabels[status]}</span>}</button>;
+    };
+    return <div className="related" aria-label="연결된 단계"><span className="field-label">연결된 단계</span>
+      {near.upstream.length > 0 && <><small className="related-head">← 앞 단계 {near.upstream.length}</small>{near.upstream.map((id) => row(id, 'upstream'))}</>}
+      {near.downstream.length > 0 && <><small className="related-head">다음 단계 {near.downstream.length} →</small>{near.downstream.map((id) => row(id, 'downstream'))}</>}</div>;
+  }
   /** 소속: the project and worktree groups of the selected node; clicking one selects that group. */
   function membership() {
     const { project, worktrees } = selectedMembership;
@@ -905,7 +962,7 @@ function Workspace() {
       <header className="topbar"><div className="topbar-title"><button className="icon-button mobile-menu" aria-label="메뉴 열기" aria-expanded={panels.left} onClick={() => setPanels((value) => ({ ...value, left: !value.left }))}><Menu size={20} /></button>
           <div className="title-block"><input className="workflow-name" aria-label="워크플로 이름" value={workflow.name} maxLength={500} disabled={viewOnly} onChange={(event) => setWorkflow((value) => ({ ...value, name: event.target.value }))} />
             <p title={workflow.description}>{workflow.description || '단계를 연결해 작업의 흐름을 만드세요.'}</p></div>
-          <div className="heading-stats"><span><i className="status-dot running" />실행 {counts.running ?? 0}</span><span><Check size={14} />완료 {counts.completed ?? 0}</span><span className="total">{stageCount} 단계</span></div></div>
+          <div className="heading-stats"><button className="stat-button" disabled={!liveCount} title={liveCount ? '실행 중인 단계로 차례로 이동' : '실행 중인 단계가 없습니다'} onClick={focusNextLive}><i className={`status-dot ${liveCount ? 'running live-pulse' : ''}`} />실행 중 {liveCount}</button><span><Check size={14} />완료 {counts.completed ?? 0}</span><span className="total">{stageCount} 단계</span></div></div>
         <div className="toolbar-actions"><input ref={importRef} type="file" accept="application/json,.json" hidden onChange={(event) => { void importFile(event.target.files?.[0]); event.target.value = ''; }} />
           <button className="button ghost file-action" onClick={() => importRef.current?.click()} title="JSON 가져오기"><ArrowUpFromLine size={15} /><span>가져오기</span></button>
           <button className="button ghost file-action" onClick={download} title="JSON 내보내기"><ArrowDownToLine size={15} /><span>내보내기</span></button>
@@ -972,6 +1029,13 @@ function Workspace() {
           </section>}
           <div className="canvas-mode"><span className={`status-dot ${workflow.runId && snapshot && !stale ? 'running' : ''}`} />{workflow.runId ? 'Orca 실시간 관찰' : '설계 모드'}
             {activeAutomations.length > 0 && <span className="automation-badge" title="이 자동화가 시작한 실행이 진행 중입니다"><Zap size={11} />자동화 {activeAutomations.map((item) => `「${item.name}」`).join(' ')} 진행 중</span>}</div>
+          {liveNodes.length > 0 && <nav className="live-bar" aria-label="실행 중인 단계">
+            <button className="live-bar-title" title="실행 중인 단계로 차례로 이동" onClick={focusNextLive}><LocateFixed size={13} />실행 중 {liveCount}
+              {liveNodes.length > liveCount && <span className="live-bar-blocked">· 확인 필요 {liveNodes.length - liveCount}</span>}</button>
+            <div className="live-bar-items">{liveNodes.map((node) => <button key={node.id} className={`run-chip ${node.data.live ? 'running' : 'blocked'} ${node.id === selectedId ? 'active' : ''}`}
+              title={`${node.data.label || '이름 없는 단계'} · ${node.data.live ? `실행 중${node.data.live > 1 ? ` ×${node.data.live}` : ''}` : statusLabels.blocked} · 클릭해 이 단계로 이동`}
+              onClick={() => focusNode(node.id)}><span className="status-dot" />{node.data.label || '이름 없는 단계'}{node.data.live && node.data.live > 1 ? ` ×${node.data.live}` : ''}</button>)}</div>
+          </nav>}
           <ReactFlow<StageNode> nodes={displayNodes} edges={displayEdges} nodeTypes={nodeTypes} onNodesChange={handleNodesChange} onEdgesChange={onEdgesChange} onConnect={onConnect}
             onNodeDragStart={(_event, node, dragged) => startDrag(node, dragged)} onNodeDrag={(_event, _node, dragged) => dragFrame(dragged)} onNodeDragStop={(_event, _node, dragged) => stopDrag(dragged)}
             onSelectionDragStart={(_event, dragged) => dragged[0] && startDrag(dragged[0], dragged)} onSelectionDrag={(_event, dragged) => dragFrame(dragged)} onSelectionDragStop={(_event, dragged) => stopDrag(dragged)}
@@ -1103,6 +1167,7 @@ function Workspace() {
             <button className="button danger" onClick={removeSelected}><Trash2 size={14} />메모 그룹 삭제</button>
           </div> : selected ? <div className="inspector-content"><div className="selected-kind">{(() => { const Icon = kindIcons[selected.data.kind] ?? Bot; return <Icon size={21} />; })()}<div><span>{kindNames[selected.data.kind]}</span><strong>{selected.data.label || '이름 없는 단계'}</strong></div></div>
             {membership()}
+            {related()}
             <label className="field-label" htmlFor="stage-name">단계 이름</label><input id="stage-name" value={selected.data.label} maxLength={500} onChange={(event) => updateNode({ label: event.target.value })} />
             <label className="field-label" htmlFor="stage-kind">단계 유형</label><select id="stage-kind" value={selected.data.kind} onChange={(event) => changeKind(event.target.value as StageKind)}><option value="worker">워커</option><option value="gate">사용자 개입 게이트</option><option value="branch">분기</option><option value="workflow">워크플로 링크</option><option value="note">메모 (실행 안 함)</option></select>
             {selected.data.kind === 'workflow' && <><label className="field-label" htmlFor="stage-link">연결할 워크플로</label>

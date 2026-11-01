@@ -89,6 +89,10 @@ export type StageData = {
   membership?: { project?: string; worktrees: string[] };
   /** Display only: this group contains the selected node. */
   ancestor?: boolean;
+  /** Display only: how this node relates to the selected stage — the stage itself, a direct predecessor/successor (or both), or unrelated. */
+  relation?: Relation;
+  /** Display only: how many shown executions are running this stage right now (even when another execution's failure leads its status). */
+  live?: number;
   /** kind 'workflow': the linked saved workflow, and whether what follows waits for it (unset: 'wait'). */
   workflowId?: string;
   linkMode?: LinkMode;
@@ -404,7 +408,7 @@ export function projectNodes(nodes: StageNode[], snapshot: RunSnapshot | null, s
   executions: Execution[] = [], executionId: string | null = null, visible?: Set<string>): StageNode[] {
   const selected = executionId && executionId !== 'all' ? executions.find((item) => item.id === executionId) : undefined;
   return nodes.map((node) => {
-    if (!isExecutable(node)) return { ...node, data: { ...node.data, status: undefined, runs: undefined, activeTaskId: undefined, decision: undefined, spawned: undefined, round: undefined } };
+    if (!isExecutable(node)) return { ...node, data: { ...node.data, status: undefined, runs: undefined, activeTaskId: undefined, decision: undefined, spawned: undefined, round: undefined, live: undefined } };
     const runs = executions.map((execution) => ({ id: execution.id, label: execution.label,
       taskId: nodeExecutionTask(node, execution, snapshot, stale), status: nodeExecutionStatus(node, execution, snapshot, stale) }));
     const taskId = selected ? nodeExecutionTask(node, selected, snapshot, stale) : executionId === 'all' ? undefined : node.data.taskId;
@@ -416,7 +420,8 @@ export function projectNodes(nodes: StageNode[], snapshot: RunSnapshot | null, s
       : selected ? nodeExecutionStatus(node, selected, snapshot, stale) : bindingStatus(taskId, snapshot, stale);
     const requested = spawnsRuns(node) ? (selected ? [selected] : executionId === 'all' ? executions.filter((execution) => !visible || visible.has(execution.id)) : [])
       .flatMap((execution) => execution.spawned?.[node.id] ?? []) : [];
-    return { ...node, data: { ...node.data, status, runs: executionId === 'all' ? shown : undefined, activeTaskId: taskId,
+    const live = executionId === 'all' ? shown.filter((run) => run.status === 'running').length : status === 'running' ? 1 : 0;
+    return { ...node, data: { ...node.data, status, runs: executionId === 'all' ? shown : undefined, activeTaskId: taskId, live: live || undefined,
       spawned: requested.length ? requested : undefined,
       round: (() => { const rounds = (selected ? [selected] : executionId === 'all' ? executions.filter((execution) => !visible || visible.has(execution.id)) : [])
         .map((execution) => stageRound(execution, node.id)); const top = Math.max(1, ...rounds); return top > 1 ? top : undefined; })(),
@@ -539,6 +544,23 @@ export function groupOf(workflow: Pick<Workflow, 'nodes'>, node: StageNode): Sta
 }
 /** The project and worktree groups a node sits in (directly or through a worktree group inside a project). */
 /** The project group and the chain of worktree groups (outermost first) a node sits in. */
+export type Relation = 'focus' | 'upstream' | 'downstream' | 'both' | 'dim';
+/** Stages one connection away from `id`: what feeds it (upstream) and what it feeds (downstream), loops included, itself excluded. */
+export function neighbors(edges: Pick<Edge, 'source' | 'target'>[], id: string): { upstream: string[]; downstream: string[] } {
+  const upstream = new Set<string>(); const downstream = new Set<string>();
+  for (const edge of edges) {
+    if (edge.target === id && edge.source !== id) upstream.add(edge.source);
+    if (edge.source === id && edge.target !== id) downstream.add(edge.target);
+  }
+  return { upstream: [...upstream], downstream: [...downstream] };
+}
+/** The relation of `nodeId` to the focused stage, given its neighbours. */
+export function relationTo(nodeId: string, focus: string, near: { upstream: string[]; downstream: string[] }): Relation {
+  if (nodeId === focus) return 'focus';
+  const up = near.upstream.includes(nodeId); const down = near.downstream.includes(nodeId);
+  return up && down ? 'both' : up ? 'upstream' : down ? 'downstream' : 'dim';
+}
+
 export function membershipOf(workflow: Pick<Workflow, 'nodes'>, node: StageNode): { project?: StageNode; worktrees: StageNode[] } {
   const result: { project?: StageNode; worktrees: StageNode[] } = { worktrees: [] };
   for (let group = groupOf(workflow, node), depth = 0; group && depth <= maxGroupDepth; group = groupOf(workflow, group), depth += 1) {

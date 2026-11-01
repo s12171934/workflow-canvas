@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { pendingDecisions, frameContents, orderNodes, decisionError, skippedStages, topologicalOrder, waves, nodeExecutionStatus, type FlowStage, type StageNode, membershipOf, nodeLocation, aggregateStatus, executionFinished, taskStatus, projectNodes, serializableWorkflow, newWorkflow, fromSnapshot, type TaskSummary, type WorkerSummary, type RunSnapshot, executionRun, inputsKey, mergeSnapshots, workflowRuns, variableRefs, substituteVariables, resolveVariables, applyDecision, canNest, loopBody, stageRound, loggedExecutions, type Execution } from './model.ts';
+import { pendingDecisions, frameContents, orderNodes, decisionError, skippedStages, topologicalOrder, waves, nodeExecutionStatus, type FlowStage, type StageNode, membershipOf, nodeLocation, aggregateStatus, executionFinished, taskStatus, projectNodes, serializableWorkflow, newWorkflow, fromSnapshot, type TaskSummary, type WorkerSummary, type RunSnapshot, executionRun, inputsKey, mergeSnapshots, workflowRuns, variableRefs, substituteVariables, resolveVariables, applyDecision, canNest, loopBody, stageRound, loggedExecutions, neighbors, relationTo, type Execution } from './model.ts';
 
 const task = (status: string): TaskSummary => ({ id: 'task-a', title: 'A', spec: 'A', status, deps: [] });
 const worker = (liveness: string): WorkerSummary => ({ dispatchId: 'dispatch-a', taskId: 'task-a', liveness, stage: 'working', provider: 'claude', model: 'example-model', outcome: '' });
@@ -380,4 +380,15 @@ test('a memo group may sit in any group: it saves its parent and draws over that
   const saved = serializableWorkflow({ ...newWorkflow(), nodes, edges: [] });
   assert.deepEqual(saved.nodes.map((item) => [item.id, item.parentId]), [
     ['memo-top', undefined], ['project', undefined], ['memo-in-project', 'project'], ['wt', 'project'], ['memo-in-wt', 'wt'], ['stage', 'wt']]);
+});
+
+test('neighbors are one connection away in either direction, loops included', () => {
+  const edges = [{ source: 'a', target: 'b' }, { source: 'b', target: 'c' }, { source: 'c', target: 'b' }, { source: 'b', target: 'b' }, { source: 'c', target: 'd' }];
+  const near = neighbors(edges, 'b');
+  assert.deepEqual(near, { upstream: ['a', 'c'], downstream: ['c'] });
+  assert.equal(relationTo('b', 'b', near), 'focus');
+  assert.equal(relationTo('a', 'b', near), 'upstream');
+  assert.equal(relationTo('c', 'b', near), 'both');
+  assert.equal(relationTo('d', 'b', near), 'dim');
+  assert.deepEqual(neighbors(edges, 'a'), { upstream: [], downstream: ['b'] });
 });

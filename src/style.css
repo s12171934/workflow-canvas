@@ -447,3 +447,50 @@ button.run-chip:hover { border-color:#76d8bc; color:#e3f6ef; }
 .field-help.generating { display:flex; align-items:center; gap:6px; }
 .empty-actions { display:flex; gap:8px; justify-content:center; flex-wrap:wrap; }
 .round-badge { margin-left:6px; padding:1px 6px; border:1px solid #5b4a7a; border-radius:999px; font-size:9px; color:#d9c7fb; background:#251d33; }
+
+/* 실행 중 가시성: a running stage glows and pulses, carries a badge, and is listed in the live bar for jumping to it. */
+.stage-card.live { border-color:#77d4b5; animation:live-glow 2.2s ease-in-out infinite; }
+.stage-card.live::before { content:''; position:absolute; left:10px; right:10px; top:-3px; height:3px; border-radius:3px;
+  background:linear-gradient(90deg,transparent,#8de0c7,transparent) 0 0 / 40% 100% no-repeat; animation:live-sweep 1.6s linear infinite; }
+@keyframes live-glow { 0%,100% { box-shadow:0 0 0 0 #6bd5ad00,0 5px 15px #0002; } 50% { box-shadow:0 0 0 5px #6bd5ad22,0 0 28px #6bd5ad33; } }
+@keyframes live-sweep { from { background-position:-60% 0; } to { background-position:160% 0; } }
+.stage-card.blocked:not(.live) { animation:wait-glow 2.8s ease-in-out infinite; }
+@keyframes wait-glow { 0%,100% { box-shadow:0 0 0 0 #dcc17e00; } 50% { box-shadow:0 0 0 4px #dcc17e22,0 0 22px #dcc17e26; } }
+.live-badge { position:absolute; top:-11px; right:12px; display:inline-flex; align-items:center; gap:4px; padding:3px 8px; border-radius:999px; font-size:9px; font-weight:600;
+  color:#0f1a17; background:#8de0c7; box-shadow:0 2px 8px #0004; }
+.live-pulse { animation:dot-pulse 1.4s ease-in-out infinite; }
+@keyframes dot-pulse { 50% { box-shadow:0 0 0 4px #8de0c733; } }
+.minimap-live { animation:minimap-live 1.6s ease-in-out infinite; }
+@keyframes minimap-live { 0%,100% { opacity:.25; } 50% { opacity:1; } }
+.stat-button { display:flex; align-items:center; gap:6px; font:inherit; color:#9ddcc7; background:none; border:1px solid transparent; border-radius:6px; padding:3px 7px; margin:-3px -7px; cursor:pointer; }
+.stat-button:hover:not(:disabled) { border-color:#3b5149; background:#1e2c28; }
+.stat-button:disabled { color:#8798a6; cursor:default; }
+.live-bar { position:absolute; bottom:calc(var(--gap) + 4px); left:calc(var(--inset-left) + 44px); z-index:5; display:flex; align-items:center; gap:8px;
+  max-width:min(46%, calc(100% - var(--inset-left) - var(--inset-right) - 400px)); padding:5px 7px; background:#11181de8; border:1px solid #2f4a42; border-radius:8px; box-shadow:0 4px 18px #0003; }
+.live-bar-title { display:inline-flex; align-items:center; gap:5px; flex-shrink:0; font:inherit; font-size:10px; font-weight:600; color:#9ddcc7; background:none; border:0; padding:2px 4px; cursor:pointer; white-space:nowrap; }
+.live-bar-title:hover { color:#e3f6ef; }
+.live-bar-blocked { color:#dcc17e; font-weight:500; }
+.live-bar-items { display:flex; gap:4px; overflow-x:auto; scrollbar-width:thin; min-width:0; }
+.live-bar-items .run-chip { flex-shrink:0; max-width:160px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; cursor:pointer; }
+.live-bar-items .run-chip.running .status-dot { animation:dot-pulse 1.4s ease-in-out infinite; }
+.live-bar-items .run-chip:hover { border-color:#76d8bc; color:#e3f6ef; }
+@media (max-width:900px) { .live-bar { max-width:calc(100% - var(--inset-right) - 60px); } }
+@media (max-width:620px) { .live-bar { left:var(--gap); right:var(--gap); bottom:var(--gap); max-width:none; } }
+
+/* 1차 연관: with a stage selected, its direct predecessors and successors stay lit and the rest fade. */
+.stage-card { transition:opacity .18s ease, filter .18s ease; }
+.stage-card.rel-dim { opacity:.32; filter:saturate(.5); }
+.stage-card.rel-dim.live { opacity:.6; }
+.stage-card.rel-upstream, .stage-card.rel-downstream, .stage-card.rel-both { outline:1px dashed #93d8c0aa; outline-offset:3px; }
+.relation-badge { padding:1px 6px; border-radius:999px; font-size:9px; line-height:1.5; border:1px solid #93d8c066; color:#b5ead8; background:#93d8c014; white-space:nowrap; }
+.relation-badge.upstream::before { content:'← '; } .relation-badge.downstream::after { content:' →'; }
+.related { display:flex; flex-direction:column; gap:5px; margin-bottom:18px; }
+.related .field-label { margin-top:0; }
+.related-head { font-size:9px; color:#748590; margin-top:2px; }
+.related-row { display:grid; grid-template-columns:auto 1fr auto; gap:7px; align-items:center; text-align:left; font:inherit; padding:7px 10px; border-radius:7px;
+  border:1px solid #2f4a42; background:#182028; color:#9fb0bc; cursor:pointer; }
+.related-row:hover { background:#202a33; border-color:#93d8c0; }
+.related-row strong { font-size:11px; font-weight:600; color:#d9e3e8; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.related-row .task-state { display:inline-flex; align-items:center; gap:4px; padding:0; border:0; margin:0; font-size:9px; white-space:nowrap; }
+
+@media (prefers-reduced-motion:reduce) { .stage-card.live, .stage-card.blocked, .stage-card.live::before, .live-pulse, .minimap-live, .live-bar-items .run-chip.running .status-dot { animation:none; } .stage-card { transition:none; } }
