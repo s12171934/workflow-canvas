@@ -211,6 +211,8 @@ export type Execution = { id: string; label: string; bindings: Record<string, st
   runId?: string;
   /** Run-time worktree names of the 실행 request that started it (group id → name). Runs with the same inputs never overlap. */
   inputs?: Record<string, string>;
+  /** Setting values of the 실행 request that started it (defaults applied). Together with `inputs` they tell requests apart. */
+  values?: Record<string, string>;
   /** Spawn links (node id) → the separate executions they requested, in request order. */
   spawned?: Record<string, SpawnResult[]> };
 /** Run of an execution: its own, or the workflow's for documents from before executions carried one. */
@@ -222,6 +224,10 @@ export function workflowRuns(workflow: Pick<Workflow, 'runId' | 'executions'>): 
 /** Comparable form of run-time inputs: empty names are dropped (they are asked during the run). */
 export function inputsKey(inputs: Record<string, string> | undefined): string {
   return JSON.stringify(Object.entries(inputs ?? {}).filter(([, value]) => value).sort(([a], [b]) => a.localeCompare(b)));
+}
+/** What makes two 실행 requests "the same": their run-time inputs and setting values. Only the same never overlap. */
+export function requestKey(inputs: Record<string, string> | undefined, values: Record<string, string> | undefined): string {
+  return JSON.stringify([inputsKey(inputs), Object.entries(values ?? {}).filter(([, value]) => value).sort(([a], [b]) => a.localeCompare(b))]);
 }
 /** One snapshot over several Runs: Task and worker ids are unique across Runs, so statuses resolve as for one Run. */
 export function mergeSnapshots(snapshots: RunSnapshot[]): RunSnapshot | null {
@@ -397,6 +403,7 @@ export function serializableWorkflow(workflow: Workflow): Workflow {
       ...(execution.automation ? { automation: { id: execution.automation.id, name: execution.automation.name } } : {}),
       ...(execution.runId ? { runId: execution.runId } : {}),
       ...(execution.inputs && Object.keys(execution.inputs).length ? { inputs: execution.inputs } : {}),
+      ...(execution.values && Object.keys(execution.values).length ? { values: execution.values } : {}),
       ...(execution.spawned && Object.keys(execution.spawned).some((nodeId) => nodeIds.has(nodeId))
         ? { spawned: Object.fromEntries(Object.entries(execution.spawned).filter(([nodeId]) => nodeIds.has(nodeId))) } : {}) };
   });

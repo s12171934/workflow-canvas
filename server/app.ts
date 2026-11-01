@@ -8,7 +8,7 @@ import { createStorage, validId, validateWorkflow } from './storage.ts';
 import { buildBrief, checkBranches, checkGroups, checkSpawns, checkVariables, flowOf, linkedWorkflows } from './execute.ts';
 import { briefPrompt, generatedWorkflow, generationTimeoutMs, maxPromptLength, workflowPrompt, type Generation } from './generate.ts';
 import { coordinatorEventTypes, createRunLog, launchDirName } from './runlog.ts';
-import { decisionError, executionResults, executionRun, maxSpawnItems, resolveVariables, validVariableValue, spawnsRuns, type SpawnResult, executionTasks, inputsKey, loggedExecutions, skippedStages, type Execution, type RunLogDetail } from '../src/model.ts';
+import { decisionError, executionResults, executionRun, maxSpawnItems, requestKey, resolveVariables, validVariableValue, spawnsRuns, type SpawnResult, executionTasks, inputsKey, loggedExecutions, skippedStages, type Execution, type RunLogDetail } from '../src/model.ts';
 import { defaultCleanup, type AutomationConfig, type AutomationState, type Cleanup, asksAtRun, executionFinished, executionStatuses, isExecutable, worktreeNamePattern, type RunSnapshot, type Workflow } from '../src/model.ts';
 
 /** Minimum gap between two 실행 requests for the same workflow, so a double click cannot start two coordinators. */
@@ -88,7 +88,9 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
     }
     // The 실행 request this coordinator was started for: its run-time inputs go on every execution it registers.
     const launch = typeof req.body?.launch === 'string' && runlog.validLaunch(id, req.body.launch) ? req.body.launch as string : undefined;
-    const inputs = launch ? (await runlog.meta(launch).catch(() => undefined))?.inputs : undefined;
+    const launchMeta = launch ? await runlog.meta(launch).catch(() => undefined) : undefined;
+    const inputs = launchMeta?.inputs;
+    const launchValues = launchMeta?.values;
     const prefix = Object.values(inputs ?? {}).filter(Boolean).join('·');
     const result = await serial(id, async () => {
       const graph = await storage.load(id);
@@ -107,6 +109,7 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
           // Re-registering the same Run keeps branch decisions already recorded for an execution.
           ...(before?.decisions && !execution.decisions ? { decisions: before.decisions, skipped: before.skipped } : {}),
           ...(before?.inputs ? { inputs: before.inputs } : inputs && Object.keys(inputs).length ? { inputs } : {}),
+          ...(before?.values ? { values: before.values } : launchValues && Object.keys(launchValues).length ? { values: launchValues } : {}),
           // Several requests show side by side on the canvas: the inputs (a ticket key, say) tell their chips apart.
           ...(prefix && typeof execution.label === 'string' && !execution.label.startsWith(prefix) ? { label: `${prefix} ${execution.label}`.slice(0, 200) } : {}) };
       }) as Execution[];
@@ -224,10 +227,11 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
     catch (error) { throw new RunError(400, (error as Error).message); }
     // Requests with different run-time inputs (one per ticket, say) run side by side; the same inputs never overlap.
     const inputs = inputsKey(settings.inputs);
-    const launchKey = `${id}\n${inputs}`;
+    const request = requestKey(settings.inputs, settings.values);
+    const launchKey = `${id}\n${request}`;
     const last = launches.get(launchKey);
-    if (last && Date.now() - last < launchCooldownMs) throw new RunError(409, '방금 같은 입력으로 실행을 요청했습니다. 코디네이터가 실행을 등록할 때까지 잠시 기다리세요.');
-    const same = (graph.executions ?? []).filter((execution) => inputsKey(execution.inputs) === inputs && executionRun(graph, execution));
+    if (last && Date.now() - last < launchCooldownMs) throw new RunError(409, '방금 같은 입력·설정값으로 실행을 요청했습니다. 코디네이터가 실행을 등록할 때까지 잠시 기다리세요.');
+    const same = (graph.executions ?? []).filter((execution) => requestKey(execution.inputs, execution.values) === request && executionRun(graph, execution));
     let open = 0;
     for (const runId of new Set(same.map((execution) => executionRun(graph, execution)))) {
       let snapshot: RunSnapshot;
@@ -236,7 +240,7 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
       open += same.filter((execution) => executionRun(graph, execution) === runId
         && !executionFinished(executionStatuses(graph.nodes, execution, snapshot, false))).length;
     }
-    if (open) throw new RunError(409, `${inputs === '[]' ? '' : '같은 입력의 '}진행 중인 실행 ${open}개가 끝난 뒤 다시 실행하세요.`);
+    if (open) throw new RunError(409, `${request === requestKey({}, {}) ? '' : '같은 입력·설정값의 '}진행 중인 실행 ${open}개가 끝난 뒤 다시 실행하세요.`);
     launches.set(launchKey, Date.now());
     try {
       // Launch directories are named by the millisecond: a request in the same one as another takes the next free one.

@@ -168,6 +168,8 @@ export function validateWorkflow(value: unknown): Workflow {
           || typeof execution.automation.name !== 'string' || execution.automation.name.length > 100))
         || (execution.runId !== undefined && (typeof execution.runId !== 'string' || !validId(execution.runId)))
         || !validInputs(execution.inputs)
+        || (execution.values !== undefined && (!execution.values || typeof execution.values !== 'object' || Array.isArray(execution.values)
+          || Object.entries(execution.values).some(([key, value]) => !variableKeyPattern.test(key) || !validVariableValue(value))))
         || (execution.spawned !== undefined && (!execution.spawned || typeof execution.spawned !== 'object' || Array.isArray(execution.spawned)
           || Object.entries(execution.spawned).some(([nodeId, results]) => !ids.has(nodeId) || !Array.isArray(results) || results.length > maxSpawnItems * 10
             || results.some((result) => !result || typeof result.item !== 'string' || !worktreeNamePattern.test(result.item) || typeof result.at !== 'string'

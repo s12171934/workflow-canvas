@@ -729,6 +729,8 @@ test('workflow settings: asked per run, fixed per automation, written into instr
       body: JSON.stringify({ name: '주기', trigger: 'hourly', project: '/example/repo', count: 1, values: { epic: 'ABC-200' }, cleanup: { coordinator: true, worktrees: false, sessions: true } }) })).json();
     const config = created.automations[0];
     assert.deepEqual(config.values, { epic: 'ABC-200' });
+    const fired = await (await fetch(`${base}/api/workflows/master/automations/${config.id}/brief`, { method: 'POST' })).json();
+    assert.match(await readFile(fired.briefPath, 'utf8'), /에픽 ABC-200 를 보고/);
 
     // The spawn link passes the run's values on, for the keys the target declares.
     assert.equal((await fetch(`${base}/api/workflows/master/executions`, { method: 'PUT', headers: json,
