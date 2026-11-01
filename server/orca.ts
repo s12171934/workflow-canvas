@@ -136,6 +136,12 @@ export function createOrcaBridge(command: Command = orcaCommand) {
       const text = JSON.stringify(result);
       return { terminal: text.match(/term_[a-zA-Z0-9-]{1,128}/)?.[0] };
     },
+    /** Starts a generation agent the way a new agent tab does (chat or terminal, per the user's setting). */
+    async launchGenerator(workspaceRoot: string, prompt: string): Promise<{ terminal?: string }> {
+      const result = await command(['agent', 'launch', '--agent', 'claude', '--model', 'claude-opus-5-5',
+        '--worktree', `path:${workspaceRoot}`, '--prompt', prompt]);
+      return { terminal: JSON.stringify(result).match(/term_[a-zA-Z0-9-]{1,128}/)?.[0] };
+    },
     async renameTerminal(terminal: string, title: string) {
       if (!/^term_[a-zA-Z0-9-]{1,128}$/.test(terminal)) return;
       await command(['terminal', 'rename', '--terminal', terminal, '--title', title.slice(0, 80)]);

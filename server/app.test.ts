@@ -478,3 +478,64 @@ test('a link that only starts lets what follows it go on without waiting for its
   const brief = buildBrief({ graph: parent('start'), linked, count: 1, apiBase: 'http://127.0.0.1:1', workspace: '/example/repo', artifactDir: '/tmp/x' });
   assert.match(brief, /"wait": false/);
 });
+test('natural-language generation: Orca launches an agent, its results are validated, saved and reported', async () => {
+  await mkdir('.local', { recursive: true });
+  const directory = await mkdtemp(join(resolve('.local'), 'api-generate-test-'));
+  const calls: string[][] = [];
+  const bridge = createOrcaBridge(async (args) => { calls.push(args); return places(args) ?? { terminal: { handle: 'term_gen' } }; });
+  const server = createApp(directory, bridge).listen(0, '127.0.0.1');
+  await new Promise<void>((resolve) => server.once('listening', resolve));
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const json = { 'Content-Type': 'application/json' };
+  const post = (body: unknown) => fetch(`${base}/api/generations`, { method: 'POST', headers: json, body: JSON.stringify(body) });
+  const put = (id: string, body: unknown) => fetch(`${base}/api/generations/${id}`, { method: 'PUT', headers: json, body: JSON.stringify(body) });
+  try {
+    assert.equal((await post({ kind: 'workflow', prompt: '배포', project: '/elsewhere' })).status, 400, 'only a project Orca has open');
+    assert.equal((await post({ kind: 'workflow', prompt: ' ', project: '/example/repo' })).status, 400);
+
+    const started = await (await post({ kind: 'workflow', prompt: '설계 후 구현, 검토', project: '/example/repo' })).json();
+    assert.equal(started.status, 'pending');
+    const launch = calls.find((args) => args[0] === 'agent')!;
+    assert.deepEqual(launch.slice(0, 8), ['agent', 'launch', '--agent', 'claude', '--model', 'claude-opus-5-5', '--worktree', 'path:/example/repo']);
+    const prompt = await readFile(launch[9].split(' ')[0], 'utf8');
+    assert.match(prompt, /설계 후 구현, 검토/);
+    assert.match(prompt, new RegExp(`/api/generations/${started.id}`));
+
+    // A cycle is refused with a reason the agent can act on; a valid graph is laid out, saved and reported.
+    const cyclic = { name: 'x', nodes: [{ id: 'a', kind: 'worker', label: 'A' }, { id: 'b', kind: 'worker', label: 'B' }], edges: [{ source: 'a', target: 'b' }, { source: 'b', target: 'a' }] };
+    assert.match((await (await put(started.id, cyclic)).json()).error, /순환/);
+    const badBranch = { name: 'x', nodes: [{ id: 'a', kind: 'worker' }, { id: 'c', kind: 'branch', outputs: [{ id: 'ok', label: '통과' }] }], edges: [{ source: 'a', target: 'c' }] };
+    assert.match((await (await put(started.id, badBranch)).json()).error, /두 개 이상/);
+    const good = { name: '기능 개발', description: '설계부터 검토까지', nodes: [
+      { id: 'design', kind: 'worker', label: '설계', description: '설계한다', effort: 'high' },
+      { id: 'impl', kind: 'worker', label: '구현', description: '구현한다', workerModel: 'claude-sonnet-5-5' },
+      { id: 'review', kind: 'gate', label: '검토', description: '머지할까요?', asker: 'previous', sourceHandle: 'ignored' }],
+      edges: [{ source: 'design', target: 'impl' }, { source: 'impl', target: 'review' }] };
+    assert.equal((await put(started.id, good)).status, 200);
+    assert.equal((await put(started.id, good)).status, 409, 'a finished generation takes no second result');
+    const done = await (await fetch(`${base}/api/generations/${started.id}`)).json();
+    assert.equal(done.status, 'done');
+    const saved = await (await fetch(`${base}/api/workflows/${done.workflowId}`)).json();
+    assert.equal(saved.name, '기능 개발');
+    assert.deepEqual(saved.nodes.map((node: { id: string; position: { x: number } }) => [node.id, node.position.x]), [['design', 0], ['impl', 320], ['review', 640]]);
+    assert.deepEqual([saved.nodes[0].data.effort, saved.nodes[1].data.workerModel, saved.nodes[2].data.asker], ['high', 'claude-sonnet-5-5', 'previous']);
+
+    // Instructions for one stage, with the canvas's current graph as context; the agent may also give up with a reason.
+    const graph = newWorkflow();
+    assert.equal((await post({ kind: 'brief', prompt: '테스트 포함', project: '/example/repo', workflow: graph, nodeId: 'missing' })).status, 400);
+    const brief = await (await post({ kind: 'brief', prompt: '테스트 포함', project: '/example/repo', workflow: graph, nodeId: 'backend' })).json();
+    const briefPrompt = await readFile(calls.filter((args) => args[0] === 'agent').at(-1)![9].split(' ')[0], 'utf8');
+    assert.match(briefPrompt, /\*\*\[이 단계\]\*\* 백엔드 구현/);
+    assert.match(briefPrompt, /바로 앞 단계: 설계/);
+    assert.equal((await put(brief.id, { description: '' })).status, 400);
+    assert.equal((await put(brief.id, { description: 'API 를 구현하고 테스트한다.', label: '백엔드 API' })).status, 200);
+    assert.deepEqual(await (await fetch(`${base}/api/generations/${brief.id}`)).json(),
+      { ...brief, status: 'done', description: 'API 를 구현하고 테스트한다.', label: '백엔드 API' });
+    const failing = await (await post({ kind: 'workflow', prompt: '불가능한 것', project: '/example/repo' })).json();
+    assert.equal((await put(failing.id, { error: '요청이 모호합니다.' })).status, 200);
+    assert.equal((await (await fetch(`${base}/api/generations/${failing.id}`)).json()).error, '요청이 모호합니다.');
+  } finally {
+    server.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});

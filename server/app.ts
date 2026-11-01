@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { createStorage, validId, validateWorkflow } from './storage.ts';
 import { buildBrief, checkBranches, checkGroups, flowOf, linkedWorkflows } from './execute.ts';
+import { briefPrompt, generatedWorkflow, generationTimeoutMs, maxPromptLength, workflowPrompt, type Generation } from './generate.ts';
 import { coordinatorEventTypes, createRunLog, launchDirName } from './runlog.ts';
 import { decisionError, executionResults, executionTasks, loggedExecutions, skippedStages, type RunLogDetail } from '../src/model.ts';
 import { defaultCleanup, type AutomationConfig, type AutomationState, type Cleanup, asksAtRun, executionFinished, executionStatuses, isExecutable, worktreeNamePattern, type RunSnapshot, type Workflow } from '../src/model.ts';
@@ -340,6 +341,85 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
     await runlog.detail(id, logId); // the launch must exist
     await runlog.append(logId, { type: body.type, message, ...(body.taskId ? { taskId: body.taskId } : {}) });
     res.json({ logged: true });
+  });
+  // Natural-language generation (workflow or one stage's instructions), done by an agent Orca launches.
+  const generations = new Map<string, Generation>();
+  const view = (item: Generation): Generation => item.status === 'pending' && Date.now() - item.createdAt > generationTimeoutMs
+    ? { ...item, status: 'failed', error: '생성 에이전트가 시간 안에 결과를 보내지 않았습니다.' } : item;
+  app.post('/api/generations', async (req, res) => {
+    const body = req.body ?? {};
+    const kind = body.kind;
+    const request = typeof body.prompt === 'string' ? body.prompt.trim() : '';
+    if (kind !== 'workflow' && kind !== 'brief') { res.status(400).json({ error: 'kind 는 workflow 또는 brief 여야 합니다.' }); return; }
+    if (!request || request.length > maxPromptLength) { res.status(400).json({ error: `요청을 1~${maxPromptLength}자로 적으세요.` }); return; }
+    if ([...generations.values()].filter((item) => view(item).status === 'pending').length >= 5) {
+      res.status(429).json({ error: '생성 중인 요청이 많습니다. 끝난 뒤 다시 시도하세요.' }); return;
+    }
+    // The agent works in a project Orca has open (it may read it for context); never a path the client made up.
+    const project = typeof body.project === 'string' ? body.project : '';
+    let projects: string[];
+    try { projects = (await bridge.locations()).projects.map((item) => item.path); }
+    catch { res.status(503).json({ error: 'Orca 프로젝트 목록을 확인할 수 없습니다.' }); return; }
+    if (!projects.includes(project)) { res.status(400).json({ error: '생성 에이전트가 작업할 프로젝트를 Orca에 열린 프로젝트 중에서 고르세요.' }); return; }
+    let graph: Workflow | undefined;
+    const nodeId = typeof body.nodeId === 'string' ? body.nodeId : '';
+    if (kind === 'brief') {
+      // The canvas's current (possibly unsaved) graph gives the stage its context.
+      try { graph = validateWorkflow(body.workflow); } catch (error) { res.status(400).json({ error: (error as Error).message }); return; }
+      if (!graph.nodes.some((node) => node.id === nodeId && node.type === 'stage')) { res.status(400).json({ error: '지침을 만들 단계를 찾지 못했습니다.' }); return; }
+    }
+    const id = randomUUID();
+    const dir = join(directory, '.generations', id);
+    await mkdir(dir, { recursive: true, mode: 0o700 });
+    const apiBase = `http://${req.get('host')}`;
+    const resultUrl = `${apiBase}/api/generations/${id}`;
+    const resultFile = join(dir, 'result.json');
+    const promptPath = join(dir, 'prompt.md');
+    await writeFile(promptPath, kind === 'workflow'
+      ? workflowPrompt({ request, resultUrl, resultFile, saved: await storage.list() })
+      : briefPrompt({ request, resultUrl, resultFile, graph: graph!, nodeId }), { mode: 0o600 });
+    const item: Generation = { id, kind, status: 'pending', createdAt: Date.now(), project, ...(kind === 'brief' ? { nodeId } : {}) };
+    generations.set(id, item);
+    try {
+      const { terminal } = await bridge.launchGenerator(project, `${promptPath} 파일을 읽고 그대로 수행해줘. ${kind === 'workflow' ? '자연어 요청으로 워크플로를 만드는' : '워크플로 단계의 지침을 쓰는'} 역할이다.`);
+      const label = kind === 'brief' ? graph!.nodes.find((node) => node.id === nodeId)?.data.label : '';
+      if (terminal) await bridge.renameTerminal(terminal, kind === 'workflow' ? '워크플로 생성' : `지침 생성 · ${label || '단계'}`).catch(() => {});
+    } catch (error) {
+      generations.delete(id);
+      res.status(503).json({ error: `생성 에이전트를 띄우지 못했습니다: ${(error as Error).message}` }); return;
+    }
+    res.json(item);
+  });
+  app.get('/api/generations/:id', (req, res) => {
+    const item = generations.get(req.params.id);
+    if (!item) { res.status(404).json({ error: '생성 요청을 찾을 수 없습니다(서버가 다시 시작되었을 수 있습니다).' }); return; }
+    res.json(view(item));
+  });
+  // Used by the generation agent: its result, validated here; a 400 tells it what to fix.
+  app.put('/api/generations/:id', async (req, res) => {
+    const item = generations.get(req.params.id);
+    if (!item) { res.status(404).json({ error: '생성 요청을 찾을 수 없습니다.' }); return; }
+    if (view(item).status !== 'pending') { res.status(409).json({ error: '이미 끝난 생성 요청입니다.' }); return; }
+    const body = req.body ?? {};
+    if (typeof body.error === 'string' && Object.keys(body).length === 1) {
+      generations.set(item.id, { ...item, status: 'failed', error: body.error.slice(0, 2000) || '에이전트가 만들지 못했습니다.' });
+      res.json({ recorded: true }); return;
+    }
+    try {
+      if (item.kind === 'brief') {
+        if (typeof body.description !== 'string' || !body.description.trim() || body.description.length > 20000) throw new Error('description 은 1~20000자 문자열이어야 합니다.');
+        if (body.label !== undefined && (typeof body.label !== 'string' || body.label.length > 500)) throw new Error('label 은 500자 이하 문자열이어야 합니다.');
+        generations.set(item.id, { ...item, status: 'done', description: body.description, ...(body.label?.trim() ? { label: body.label.trim() } : {}) });
+      } else {
+        const graph = validateWorkflow(generatedWorkflow(body, randomUUID()));
+        if (!graph.nodes.some(isExecutable)) throw new Error('실행할 단계(worker·gate·branch·workflow)가 하나 이상 필요합니다.');
+        const linked = await linkedWorkflows(graph, (linkId) => storage.load(linkId));
+        checkBranches([graph, ...linked.values()]);
+        await storage.save(graph);
+        generations.set(item.id, { ...item, status: 'done', workflowId: graph.id });
+      }
+      res.json({ accepted: true });
+    } catch (error) { res.status(400).json({ error: (error as Error).message }); }
   });
   app.use('/api', (_req, res) => { res.status(404).json({ error: 'API를 찾을 수 없습니다.' }); });
   const errors: ErrorRequestHandler = (error, _req, res, _next) => {

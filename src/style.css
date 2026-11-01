@@ -402,3 +402,9 @@ button.run-chip:hover { border-color:#76d8bc; color:#e3f6ef; }
 .decision-asker { display:flex; align-items:center; gap:6px; flex-wrap:wrap; margin:4px 0 8px; color:#9fb6c6; font-size:11px; line-height:1.4; }
 .decision-asker span { flex:1 1 160px; }
 .link-mode { margin-left:6px; padding:1px 6px; border:1px solid #2f5a54; border-radius:999px; font-size:9px; color:#8fd8cb; }
+/* Natural-language generation */
+.generate-open { justify-self:start; margin-top:6px; }
+.generate-form { display:grid; gap:6px; margin-top:6px; padding:8px; border:1px solid #33404b; border-radius:8px; background:#1b232a; }
+.generate-actions { display:flex; justify-content:flex-end; gap:6px; }
+.field-help.generating { display:flex; align-items:center; gap:6px; }
+.empty-actions { display:flex; gap:8px; justify-content:center; flex-wrap:wrap; }

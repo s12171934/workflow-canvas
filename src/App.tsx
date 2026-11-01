@@ -7,7 +7,7 @@ import {
 import {
   Activity, ArrowDownToLine, History, ArrowUpFromLine, Bot, Check, ChevronRight, Circle,
   CircleHelp, Clock3, ExternalLink, FileJson2, FolderGit2, GitBranch, Group, Hand, Layers3, LayoutDashboard, Link2,
-  LoaderCircle, Menu, Network, Play, Plus, Save, Settings2, SkipForward, Split, SquareDashed, StickyNote,
+  LoaderCircle, Menu, Network, Play, Plus, Save, Settings2, SkipForward, Sparkles, Split, SquareDashed, StickyNote,
   Trash2, Unplug, Workflow as WorkflowIcon, X, XCircle, Zap,
 } from 'lucide-react';
 import {
@@ -142,6 +142,11 @@ function branchDefaults(): Pick<StageNode['data'], 'mode' | 'judge' | 'outputs'>
 }
 /** A readable output id that is not taken yet in this branch (coordinators report decisions by it). */
 function nextOutputId(outputs: BranchOutput[]) { let n = outputs.length + 1; while (outputs.some((item) => item.id === `out-${n}`)) n += 1; return `out-${n}`; }
+/** A natural-language generation running in Orca, as the canvas tracks it. */
+type GenerationState = { id: string; kind: 'workflow' | 'brief'; status: 'pending' | 'done' | 'failed'; nodeId?: string; workflowId?: string;
+  description?: string; label?: string; error?: string;
+  /** brief: the stage's instructions when asked, to tell whether the user edited them in the meantime. */
+  before?: string };
 function blankWorkflow(): Workflow { return { ...newWorkflow(), name: '새 워크플로', nodes: [], edges: [] }; }
 
 export function App() { return <ReactFlowProvider><Workspace /></ReactFlowProvider>; }
@@ -392,6 +397,64 @@ function Workspace() {
     setEdges((items) => addEdge({ ...connection, id: crypto.randomUUID() }, items));
   }, [setEdges]);
 
+  // Natural-language generation: Orca launches an agent that sends its result back to the server; the canvas polls and applies it.
+  const [generations, setGenerations] = useState<GenerationState[]>([]);
+  const [generateDialog, setGenerateDialog] = useState(false);
+  const [generateForm, setGenerateForm] = useState({ prompt: '', project: '' });
+  const [briefForm, setBriefForm] = useState<{ nodeId: string; prompt: string; project: string } | null>(null);
+  /** Where the agent starts: the stage's project group, the workflow's default, the last used project, else the first one Orca has open. */
+  function defaultProject(node?: StageNode) {
+    const paths = locations.projects.map((item) => item.path);
+    const group = node ? membershipOf({ nodes }, node).project : undefined;
+    return [group?.data.path, workflow.workspace, lastProject()].find((path) => path && paths.includes(path)) ?? paths[0] ?? '';
+  }
+  async function startGeneration(kind: 'workflow' | 'brief', prompt: string, project: string, node?: StageNode): Promise<boolean> {
+    try {
+      const item = await api<GenerationState>('/api/generations', { method: 'POST',
+        body: JSON.stringify({ kind, prompt, project, ...(node ? { nodeId: node.id, workflow: current } : {}) }) });
+      setGenerations((list) => [...list, { ...item, ...(node ? { before: node.data.description } : {}) }]);
+      rememberProject(project);
+      setNotice(kind === 'workflow' ? 'Orca에서 워크플로 생성 에이전트를 띄웠습니다. 끝나면 캔버스에 엽니다.' : 'Orca에서 지침 생성 에이전트를 띄웠습니다. 끝나면 이 단계에 반영합니다.');
+      return true;
+    } catch (error) { setNotice((error as Error).message); return false; }
+  }
+  const pendingGenerations = generations.filter((item) => item.status === 'pending').map((item) => item.id).join(',');
+  useEffect(() => {
+    if (!pendingGenerations) return;
+    let cancelled = false;
+    const timer = setInterval(() => {
+      for (const id of pendingGenerations.split(',')) {
+        api<GenerationState>(`/api/generations/${id}`)
+          .catch((error: Error) => ({ status: 'failed' as const, error: error.message }))
+          .then((result) => { if (!cancelled && result.status !== 'pending') setGenerations((list) => list.map((item) => item.id === id ? { ...item, ...result, before: item.before } : item)); });
+      }
+    }, 3000);
+    return () => { cancelled = true; clearInterval(timer); };
+  }, [pendingGenerations]);
+  // Apply each finished generation once.
+  const appliedGenerations = useRef(new Set<string>());
+  useEffect(() => {
+    for (const item of generations) {
+      if (item.status === 'pending' || appliedGenerations.current.has(item.id)) continue;
+      appliedGenerations.current.add(item.id);
+      if (item.status === 'failed') { setNotice(`생성 실패: ${item.error ?? '알 수 없는 오류'}`); continue; }
+      if (item.kind === 'workflow' && item.workflowId) {
+        void api<{ id: string; name: string }[]>('/api/workflows').then(setSaved).catch(() => {});
+        if (!dirty) void load(item.workflowId);
+        else setNotice('워크플로를 만들어 저장했습니다. 지금 캔버스에 저장하지 않은 변경이 있어 열지 않았습니다. 사이드바에서 여세요.');
+        continue;
+      }
+      const node = nodes.find((candidate) => candidate.id === item.nodeId);
+      if (!node || item.description === undefined) { setNotice('지침을 만들었지만 그 단계가 캔버스에 없어 반영하지 못했습니다.'); continue; }
+      if (node.data.description !== (item.before ?? '') && node.data.description.trim()
+        && !window.confirm(`「${node.data.label}」 지침을 그사이 직접 고쳤습니다. 생성한 지침으로 바꿀까요?`)) continue;
+      // A suggested name replaces only a default or empty one.
+      const rename = item.label && (!node.data.label.trim() || node.data.label === kindNames[node.data.kind]);
+      setNodes((list) => list.map((candidate) => candidate.id === node.id
+        ? { ...candidate, data: { ...candidate.data, description: item.description!, ...(rename ? { label: item.label! } : {}) } } : candidate));
+      setNotice(`「${rename ? item.label : node.data.label}」 지침을 생성했습니다. 저장하면 반영됩니다.`);
+    }
+  }, [generations]);
   function applyWorkflow(graph: Workflow, persisted: boolean) {
     graph = { ...graph, nodes: normalizeNodes(graph.nodes) };
     setWorkflow(graph); setNodes(graph.nodes); setEdges(graph.edges); setView('all');
@@ -680,6 +743,8 @@ function Workspace() {
       {saved.filter((item) => item.id !== workflow.id).map((item) => <div className="sidebar-row" key={item.id}><button className="sidebar-item" onClick={() => void load(item.id)}><FileJson2 size={16} /><span>{item.name}</span></button>
         <button className="icon-button row-delete" title="워크플로 삭제" aria-label={`${item.name} 삭제`} onClick={() => void removeWorkflow(item.id, item.name)}><Trash2 size={14} /></button></div>)}
       <button className="sidebar-item subtle" onClick={() => { if (confirmReplace()) applyWorkflow(blankWorkflow(), false); }}><Plus size={16} /><span>새 워크플로</span></button>
+      <button className="sidebar-item subtle" onClick={() => { setGenerateForm((form) => ({ ...form, project: form.project || defaultProject() })); setGenerateDialog(true); setSidebarOpen(false); }}>
+        <Sparkles size={16} /><span>자연어로 만들기</span>{generations.some((item) => item.kind === 'workflow' && item.status === 'pending') && <LoaderCircle size={13} className="spin" />}</button>
       <div className="sidebar-divider" />
       <div className="sidebar-section-title">ORCA 연결 <Activity size={13} /></div>
       <label className="field-label run-label" htmlFor="run-selector">관찰할 Run</label>
@@ -778,7 +843,8 @@ function Workspace() {
             <Controls showInteractive={false} />
             <MiniMap<StageNode> nodeComponent={MiniMapNode} maskColor="rgba(16,20,25,.6)" pannable zoomable />
           </ReactFlow>
-          {nodes.length === 0 && <div className="empty-canvas"><Network size={36} /><h2>첫 단계를 만들어 보세요</h2><p>워커를 추가하고, 프로젝트·워크트리 그룹으로 작업 위치를 묶을 수 있습니다.</p><button className="button primary" onClick={() => addNode('worker')}><Plus size={16} />워커 추가</button></div>}
+          {nodes.length === 0 && <div className="empty-canvas"><Network size={36} /><h2>첫 단계를 만들어 보세요</h2><p>워커를 추가하고, 프로젝트·워크트리 그룹으로 작업 위치를 묶을 수 있습니다.</p><div className="empty-actions"><button className="button primary" onClick={() => addNode('worker')}><Plus size={16} />워커 추가</button>
+            <button className="button" onClick={() => { setGenerateForm((form) => ({ ...form, project: form.project || defaultProject() })); setGenerateDialog(true); }}><Sparkles size={16} />자연어로 만들기</button></div></div>}
           <div className="canvas-hint">드래그로 이동 · 단계를 그룹 안에 놓아 작업 위치 지정 · 포트를 연결해 흐름 만들기 · Delete로 삭제</div>
         </section>
 
@@ -900,6 +966,22 @@ function Workspace() {
                 <option value="any">{joinNames.any} — 분기에서 갈라진 경로가 다시 모이는 곳</option></select>
               <p className="field-help">어느 쪽이든 실제로 진행 중인 앞 단계가 모두 끝난 뒤에 시작합니다.</p></>}
             <label className="field-label" htmlFor="stage-description">{selected.data.kind === 'note' ? '메모 내용' : selected.data.kind === 'gate' ? '사용자에게 물을 내용' : selected.data.kind === 'branch' ? '판정 지침' : selected.data.kind === 'workflow' ? '추가 지침' : '작업 지침'}</label><textarea id="stage-description" rows={5} value={selected.data.description} maxLength={20000} placeholder={selected.data.kind === 'note' ? '실행에 쓰이지 않는 설명입니다.' : selected.data.kind === 'branch' ? '무엇을 근거로 어느 출력을 고를지 적으세요.' : selected.data.kind === 'gate' ? '무엇을 확인하고 통과·거절을 정할지 적으세요.' : '목표, 작업 범위, 완료 조건을 적으세요.'} onChange={(event) => updateNode({ description: event.target.value })} />
+            {selected.data.kind !== 'note' && (() => {
+              if (generations.some((item) => item.kind === 'brief' && item.nodeId === selected.id && item.status === 'pending')) {
+                return <p className="field-help generating"><LoaderCircle size={12} className="spin" />Orca에서 지침을 생성하는 중입니다. 에이전트 탭에서 진행을 볼 수 있습니다.</p>;
+              }
+              if (briefForm?.nodeId !== selected.id) return <button className="button small generate-open" onClick={() => setBriefForm({ nodeId: selected.id, prompt: '', project: defaultProject(selected) })}><Sparkles size={13} />자연어로 지침 생성</button>;
+              return <div className="generate-form">
+                <textarea aria-label="지침 생성 요청" rows={3} autoFocus maxLength={10000} value={briefForm.prompt} placeholder="이 단계가 할 일을 자연어로 적으세요. 예: 로그인 API에 토큰 갱신을 넣고 테스트까지"
+                  onChange={(event) => setBriefForm({ ...briefForm, prompt: event.target.value })} />
+                <select aria-label="에이전트가 읽을 프로젝트" value={briefForm.project} onChange={(event) => setBriefForm({ ...briefForm, project: event.target.value })}>
+                  <option value="">Orca에 열린 프로젝트 선택</option>
+                  {locations.projects.map((item) => <option key={item.id} value={item.path}>{item.name} · {shortPath(item.path)}</option>)}</select>
+                <p className="field-help">Orca가 이 프로젝트에서 에이전트를 띄워 앞뒤 단계와 코드를 읽고 지침을 씁니다. 지금 지침은 결과로 바뀝니다.</p>
+                <div className="generate-actions"><button className="button ghost small" onClick={() => setBriefForm(null)}>취소</button>
+                  <button className="button primary small" disabled={!briefForm.prompt.trim() || !briefForm.project}
+                    onClick={async () => { if (await startGeneration('brief', briefForm.prompt, briefForm.project, selected)) setBriefForm(null); }}><Sparkles size={13} />생성</button></div></div>;
+            })()}
             {launchesWorker(selected) && <>
               <label className="field-label" htmlFor="stage-model">모델</label>
               <select id="stage-model" value={selected.data.workerModel ?? ''} onChange={(event) => updateNode({ workerModel: event.target.value || undefined })}>
@@ -992,6 +1074,21 @@ function Workspace() {
           <p className="field-help">고른 정리 설정은 이 워크플로의 기본값으로 저장됩니다.</p></fieldset>
         <footer><button type="button" className="button ghost" onClick={() => setRunDialog(false)}>취소</button>
           <button type="submit" className="button primary" disabled={busy || !runForm.project}>{runForm.mode === 'now' ? <><Play size={14} />{runForm.count}회 실행</> : <><Zap size={14} />자동화 등록</>}</button></footer>
+      </form></div>}
+    {generateDialog && <div className="modal-scrim" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setGenerateDialog(false); }}>
+      <form className="modal" role="dialog" aria-modal="true" aria-labelledby="generate-title" onKeyDown={(event) => { if (event.key === 'Escape') setGenerateDialog(false); }}
+        onSubmit={async (event) => { event.preventDefault(); if (await startGeneration('workflow', generateForm.prompt, generateForm.project)) { setGenerateDialog(false); setGenerateForm((form) => ({ ...form, prompt: '' })); } }}>
+        <header><h2 id="generate-title"><Sparkles size={16} />자연어로 워크플로 만들기</h2><button type="button" className="icon-button" aria-label="닫기" onClick={() => setGenerateDialog(false)}><X size={16} /></button></header>
+        <label className="field-label" htmlFor="generate-prompt">무엇을 하는 워크플로인가요</label>
+        <textarea id="generate-prompt" rows={7} autoFocus required maxLength={10000} value={generateForm.prompt} onChange={(event) => setGenerateForm((form) => ({ ...form, prompt: event.target.value }))}
+          placeholder="예: 이슈를 받아 설계 → 백엔드·프론트 병렬 구현 → 테스트가 통과하면 사용자 검토, 실패하면 수정 후 다시 검증" />
+        <label className="field-label" htmlFor="generate-project">에이전트가 읽을 프로젝트</label>
+        <select id="generate-project" required value={generateForm.project} onChange={(event) => setGenerateForm((form) => ({ ...form, project: event.target.value }))}>
+          <option value="">Orca에 열린 프로젝트 선택</option>
+          {locations.projects.map((item) => <option key={item.id} value={item.path}>{item.name} · {shortPath(item.path)}</option>)}</select>
+        <p className="field-help">Orca가 이 프로젝트에서 에이전트를 띄워 요청과 코드를 읽고 단계·연결·지침을 만듭니다. 만든 워크플로는 새 문서로 저장되어 캔버스에 열립니다. 프로젝트·워크트리 그룹은 만들지 않으니 열린 뒤 묶으세요.</p>
+        <footer><button type="button" className="button ghost" onClick={() => setGenerateDialog(false)}>취소</button>
+          <button type="submit" className="button primary" disabled={!generateForm.prompt.trim() || !generateForm.project}><Sparkles size={14} />생성</button></footer>
       </form></div>}
     {notice && <div className="toast" role="status"><span>{notice}</span><button className="icon-button" aria-label="알림 닫기" onClick={() => setNotice('')}><X size={15} /></button></div>}
     {sidebarOpen && <button className="sidebar-scrim" aria-label="메뉴 닫기" onClick={() => setSidebarOpen(false)} />}
