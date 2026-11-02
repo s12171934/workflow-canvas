@@ -162,7 +162,8 @@ function storedViewOnly(): boolean { try { return localStorage.getItem(viewOnlyK
 function lastProject(): string | null { try { return localStorage.getItem(lastProjectKey); } catch { return null; } }
 /** The workflow's settings (like environment variables): asked in the run dialog, fixed per automation, used as {{key}}. */
 function VariablesEditor({ variables, nodes, onChange }: { variables: WorkflowVariable[]; nodes: StageNode[]; onChange: (variables: WorkflowVariable[]) => void }) {
-  const used = new Set(nodes.filter(isExecutable).flatMap((node) => variableRefs(node.data.description)));
+  const used = new Set([...nodes.filter(isExecutable).flatMap((node) => variableRefs(node.data.description)),
+    ...nodes.filter(isGroup).flatMap((node) => variableRefs(node.data.parentPath ?? ''))]);
   const update = (index: number, patch: Partial<WorkflowVariable>) => onChange(variables.map((item, at) => at === index ? { ...item, ...patch } : item));
   const nextKey = () => { let n = variables.length + 1; while (variables.some((item) => item.key === `value_${n}`)) n += 1; return `value_${n}`; };
   return <section className="variables-editor" aria-label="워크플로 설정값">
@@ -1138,6 +1139,17 @@ function Workspace() {
               onChange={(event) => updateNode({ baseBranch: event.target.value.replace(/[^A-Za-z0-9._/-]/g, '').replace(/^-+/, '').replace(/\.\.+/g, '.') || undefined })} />
             <label className="check-row"><input type="checkbox" checked={!!selectedGroup.data.perExecution} onChange={(event) => updateNode({ perExecution: event.target.checked || undefined })} />
               <span>실행마다 따로 만들기<small>이름 뒤에 -1, -2 …를 붙입니다. 끄면 병렬·반복 실행이 같은 워크트리를 재사용합니다.</small></span></label>
+            {(() => {
+              const outer = membershipOf({ nodes }, selectedGroup).worktrees;
+              if (outer.length) return <p className="field-help">워크트리 그룹 「{outer[outer.length - 1].data.label}」 안에 있어 그 워크트리의 하위로 만들어집니다.</p>;
+              const declared = new Set((workflow.variables ?? []).map((item) => item.key));
+              const unknown = variableRefs(selectedGroup.data.parentPath ?? '').filter((key) => !declared.has(key));
+              return <><label className="field-label" htmlFor="group-parent">부모 워크트리</label>
+                <input id="group-parent" value={selectedGroup.data.parentPath ?? ''} maxLength={1024} placeholder="비우면 부모 없음 · 절대 경로 또는 {{설정값}}"
+                  onChange={(event) => updateNode({ parentPath: event.target.value.replace(/[\u0000-\u001f]/g, '') || undefined })} />
+                {unknown.length ? <p className="field-help warning">{unknown.map((key) => `{{${key}}}`).join(', ')} 은(는) 워크플로 설정값에 없습니다 — 이대로면 실행 전에 거부됩니다.</p>
+                  : <p className="field-help">이 워크트리를 그 워크트리의 하위 워크트리로 만듭니다. 설정값으로 주면 실행·자동화마다 다르게 정할 수 있고, 값이 비면 부모 없이 만듭니다.</p>}</>;
+            })()}
             </> : <>
             <label className="field-label" htmlFor="group-target">{selectedGroup.data.scope === 'worktree' ? '워크트리' : '프로젝트'}</label>
             <select id="group-target" value={selectedGroup.data.path ?? ''} onChange={(event) => { const option = locationOptions.find((item) => item.path === event.target.value);
@@ -1307,7 +1319,13 @@ function Workspace() {
                 : <p className="field-help">일반 연결은 병렬입니다. 앞 단계가 끝나면 바로 이어지고, 한 단계에 여러 연결이 들어오면 건너뛰지 않은 앞 단계가 모두 끝날 때까지 기다립니다. 연결 설명은 참고용이며 진행 여부를 바꾸지 않습니다. 골라서 진행하려면 분기 노드를 쓰세요.</p>;
             })()}<button className="button danger" onClick={removeSelected}><Trash2 size={14} />연결 삭제</button></div>
             : <div className="inspector-content"><div className="inspector-empty compact"><Settings2 size={22} /><p>단계나 연결을 선택해 속성을 편집하세요.</p></div>
-              <VariablesEditor variables={workflow.variables ?? []} nodes={nodes} onChange={(variables) => setWorkflow((value) => ({ ...value, variables: variables.length ? variables : undefined }))} /></div>}
+              <VariablesEditor variables={workflow.variables ?? []} nodes={nodes} onChange={(variables) => setWorkflow((value) => ({ ...value, variables: variables.length ? variables : undefined }))} />
+              <label className="field-label" htmlFor="coordinator-group">코디네이터 위치</label>
+              <select id="coordinator-group" value={workflow.coordinatorGroup ?? ''} onChange={(event) => setWorkflow((value) => ({ ...value, coordinatorGroup: event.target.value || undefined }))}>
+                <option value="">실행 프로젝트</option>
+                {nodes.filter((node) => isGroup(node) && node.data.scope === 'worktree').map((node) => <option key={node.id} value={node.id}>워크트리 그룹 「{node.data.label}」</option>)}
+              </select>
+              <p className="field-help">워크트리 그룹을 고르면 캔버스 서버가 실행 전에 그 워크트리를 찾거나 만들고, 코디네이터를 그 안에서 띄웁니다. 이름은 직접 지정이나 실행 시 입력이어야 합니다. 자동화가 띄운 코디네이터는 실행 프로젝트에서 시작합니다.</p></div>}
           </fieldset>
         </aside>
       </div>

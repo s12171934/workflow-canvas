@@ -1,7 +1,9 @@
-import { asksAtRun, forwardEdges, loopBody, spawnsRuns, maxSpawnItems, resolveVariables, substituteVariables, variableRefs, createsWorktree, gateOutputs, defaultWorkerModel, launchesWorker, isBranch, isExecutable, isGroup, membershipOf, newWorktreeToken, orderNodes, parentWorktree, topologicalOrder, waves, worktreeRepo, type FlowStage, type StageNode, type Workflow, type Cleanup, defaultCleanup } from '../src/model.ts';
+import { asksAtRun, forwardEdges, loopBody, spawnsRuns, maxSpawnItems, resolveVariables, substituteVariables, variableRefs, createsWorktree, gateOutputs, defaultWorkerModel, launchesWorker, isBranch, isExecutable, isGroup, membershipOf, newWorktreeToken, orderNodes, parentWorktree, resolvedParentPath, topologicalOrder, waves, worktreeRepo, type FlowStage, type StageNode, type Workflow, type Cleanup, defaultCleanup } from '../src/model.ts';
 
 export type BriefInput = {
   graph: Workflow;
+  /** The coordinator was started inside this group's worktree, prepared by the server (absent: it starts in the project). */
+  preparedGroup?: string;
   /** Saved workflows reachable through workflow-link nodes, by id. */
   linked?: Map<string, Workflow>;
   count: number;
@@ -55,6 +57,9 @@ export function checkGroups(workflows: Workflow[]) {
       const holdsWork = workflow.nodes.some((node) => isExecutable(node) && membershipOf(workflow, node).worktrees.concat(membershipOf(workflow, node).project ?? []).some((item) => item.id === group.id));
       if (!holdsWork) continue;
       if (!createsWorktree(group) && !group.data.path) throw new Error(`${where}'${group.data.label}' 그룹의 대상을 고르세요.`);
+      if (group.data.parentPath?.trim() && parentWorktree(workflow, group)) {
+        throw new Error(`${where}'${group.data.label}' 그룹은 다른 워크트리 그룹 안에 있어 그 워크트리의 하위로 만들어집니다. 「부모 워크트리」를 비우세요.`);
+      }
       if (createsWorktree(group) && group.data.nameSource === 'agent') {
         const namer = workflow.nodes.find((node) => node.id === group.data.nameFrom && isExecutable(node));
         if (!namer) throw new Error(`${where}'${group.data.label}' 그룹의 워크트리 이름을 정할 단계를 고르세요.`);
@@ -104,6 +109,10 @@ export function checkVariables(workflows: Workflow[]) {
   for (const workflow of workflows) {
     const where = workflows.length > 1 ? `'${workflow.name}'의 ` : '';
     const declared = new Set((workflow.variables ?? []).map((item) => item.key));
+    for (const group of workflow.nodes.filter((node) => createsWorktree(node) && node.data.parentPath)) {
+      const unknown = variableRefs(group.data.parentPath!).filter((key) => !declared.has(key));
+      if (unknown.length) throw new Error(`${where}'${group.data.label}' 그룹의 부모 워크트리 ${unknown.map((key) => `{{${key}}}`).join(', ')} 이(가) 워크플로 설정값에 없습니다.`);
+    }
     for (const node of workflow.nodes.filter(isExecutable)) {
       const unknown = variableRefs(node.data.description).filter((key) => !declared.has(key));
       if (unknown.length) throw new Error(`${where}'${node.data.label || '단계'}' 지침의 ${unknown.map((key) => `{{${key}}}`).join(', ')} 이(가) 워크플로 설정값에 없습니다. 설정값을 추가하거나 지침을 고치세요.`);
@@ -111,8 +120,29 @@ export function checkVariables(workflows: Workflow[]) {
   }
 }
 
+/**
+ * Refuses a coordinator location the server could not prepare before the coordinator exists: it must be a worktree group whose
+ * name is known up front (fixed or given at run time), one worktree for every execution, and not under a worktree made during the run.
+ */
+export function checkCoordinatorGroup(workflow: Workflow) {
+  if (!workflow.coordinatorGroup) return;
+  const group = workflow.nodes.find((node) => node.id === workflow.coordinatorGroup);
+  if (!group || !isGroup(group) || group.data.scope !== 'worktree') throw new Error('코디네이터 위치로 고른 워크트리 그룹이 없습니다.');
+  const name = `'${group.data.label}'`;
+  if (!createsWorktree(group)) { if (!group.data.path) throw new Error(`${name} 그룹의 대상을 고르세요.`); return; }
+  if (group.data.nameSource === 'agent') throw new Error(`코디네이터 위치 ${name} 의 이름을 이전 단계가 정하면 코디네이터를 띄우기 전에 만들 수 없습니다. 이름을 직접 지정하거나 실행 시 입력으로 받으세요.`);
+  if (group.data.perExecution) throw new Error(`코디네이터 위치 ${name} 는 「실행마다 따로 만들기」를 끄세요. 코디네이터는 하나입니다.`);
+  for (let parent = parentWorktree(workflow, group); parent; parent = parentWorktree(workflow, parent)) {
+    if (createsWorktree(parent)) throw new Error(`코디네이터 위치 ${name} 가 실행 중에 만들어질 '${parent.data.label}' 안에 있습니다. 바깥 그룹을 기존 워크트리로 고르거나 「부모 워크트리」를 쓰세요.`);
+  }
+}
+
 type WorktreeSpec = {
   location: string; group: string; mode: 'existing' | 'create'; repo: string; parent?: string;
+  /** No parent group: the worktree to create it under, from the group's 「부모 워크트리」 (settings applied). */
+  parentPath?: string;
+  /** The coordinator's own worktree: the server prepared it and started the coordinator inside it. */
+  prepared?: true;
   existing?: { path: string; name?: string; branch?: string };
   name?: { source: 'fixed'; value: string } | { source: 'agent'; fromStage: string } | { source: 'input'; value?: string; prompt?: string };
   baseBranch?: string; perExecution?: boolean;
@@ -172,7 +202,7 @@ type BriefStage = {
   reportsItems?: string[];
 };
 
-type BriefContext = { linked: Map<string, Workflow>; project: string; inputs: Record<string, string>; worktrees: WorktreeSpec[];
+type BriefContext = { linked: Map<string, Workflow>; project: string; inputs: Record<string, string>; worktrees: WorktreeSpec[]; preparedGroup?: string;
   /** Setting values for this level: the run's, with a linked workflow's own defaults filling keys the run does not set. */
   values: Record<string, string> };
 
@@ -190,7 +220,7 @@ function stagesOf(graph: Workflow, ctx: BriefContext, fallback: string, prefix =
     const base = { location: groupLocation(group, prefix), group: group.data.label, repo: worktreeRepo(graph, group) || ctx.project,
       ...(parent ? { parent: groupLocation(parent, prefix) } : {}) };
     if (!createsWorktree(group)) {
-      ctx.worktrees.push({ ...base, mode: 'existing', existing: { path: group.data.path ?? '',
+      ctx.worktrees.push({ ...base, mode: 'existing', ...(!prefix && ctx.preparedGroup === group.id ? { prepared: true as const } : {}), existing: { path: group.data.path ?? '',
         ...(group.data.worktreeName ? { name: group.data.worktreeName } : {}), ...(group.data.branch ? { branch: group.data.branch } : {}) } });
       continue;
     }
@@ -199,7 +229,9 @@ function stagesOf(graph: Workflow, ctx: BriefContext, fallback: string, prefix =
       : source === 'input' ? { source, ...(ctx.inputs[`${prefix}${group.id}`] ? { value: ctx.inputs[`${prefix}${group.id}`] } : {}), ...(group.data.inputPrompt ? { prompt: group.data.inputPrompt } : {}) }
       : { source, value: group.data.worktreeName || `wf-${group.id.slice(0, 8)}` };
     if (source === 'agent' && group.data.nameFrom) namers.set(group.data.nameFrom, [...(namers.get(group.data.nameFrom) ?? []), base.location]);
-    ctx.worktrees.push({ ...base, mode: 'create', name, ...(group.data.baseBranch ? { baseBranch: group.data.baseBranch } : {}), perExecution: !!group.data.perExecution });
+    const parentPath = parent ? '' : resolvedParentPath(group, ctx.values);
+    ctx.worktrees.push({ ...base, mode: 'create', name, ...(group.data.baseBranch ? { baseBranch: group.data.baseBranch } : {}), perExecution: !!group.data.perExecution,
+      ...(parentPath ? { parentPath } : {}), ...(!prefix && ctx.preparedGroup === group.id ? { prepared: true as const } : {}) });
   }
   const stageEdges = forwardEdges(graph.edges).filter((edge) => executable.has(edge.source) && executable.has(edge.target));
   const { order } = topologicalOrder([...executable], stageEdges);
@@ -288,10 +320,10 @@ export function flowOf(graph: Workflow, linked: Map<string, Workflow>): FlowStag
  * judges the natural-language conditions in node instructions, and reports bindings back
  * through the canvas API so the graph can observe the executions.
  */
-export function buildBrief({ graph, linked = new Map(), count, apiBase, workspace, artifactDir, logUrl, launchId, inputs = {}, cleanup = defaultCleanup, automation, values }: BriefInput): string {
+export function buildBrief({ graph, preparedGroup, linked = new Map(), count, apiBase, workspace, artifactDir, logUrl, launchId, inputs = {}, cleanup = defaultCleanup, automation, values }: BriefInput): string {
   const automationJson = automation ? `,"automation":${JSON.stringify(automation)}` : '';
   const settings = values ?? resolveVariables(graph.variables).values;
-  const ctx: BriefContext = { linked, project: workspace, inputs, worktrees: [], values: settings };
+  const ctx: BriefContext = { linked, project: workspace, inputs, worktrees: [], values: settings, ...(preparedGroup ? { preparedGroup } : {}) };
   const stages = stagesOf(graph, ctx, workspace);
   const worktrees = ctx.worktrees;
   const worktreeSection = worktrees.length ? `
@@ -302,6 +334,7 @@ export function buildBrief({ graph, linked = new Map(), count, apiBase, workspac
 ${JSON.stringify(worktrees, null, 2)}
 \`\`\`
 
+0. **이미 준비된 워크트리**: \`prepared: true\` 인 워크트리는 캔버스 서버가 실행 전에 준비했고, 너(코디네이터)는 그 안에서 시작했다. 다시 찾거나 만들지 말고 너의 현재 작업 디렉터리(\`pwd\`, \`orca worktree current\`)를 그 경로로 쓴다. 아래 1~3 은 나머지 워크트리에만 적용한다.
 1. **이름 정하기**
    - \`mode: existing\`: \`existing.path\` 가 실제로 있으면 그대로 쓴다. 없으면(지워졌으면) \`existing.name\` 으로 아래 3의 방법으로 다시 만든다(\`existing.branch\` 가 있으면 \`--branch\` 로 넘긴다).
    - \`name.source: fixed\`: \`name.value\` 를 쓴다.
@@ -311,7 +344,9 @@ ${JSON.stringify(worktrees, null, 2)}
    - 이름에는 영문·숫자·\`.\`·\`_\`·\`-\` 만 쓴다. 다른 문자는 \`-\` 로 바꾸고, \`-\` 로 시작하지 않게 한다.
 2. **재사용**: 만들기 전에 \`orca worktree list --repo path:<repo> --json\` 에서 displayName 이나 branch 가 같은 워크트리를 찾는다. 있으면 새로 만들지 않고 그 경로를 쓴다(이전 실행이나 병렬 실행이 만든 것). 같은 이름은 이 Run 에서 한 번만 만든다. 병렬 실행이 같은 이름을 요구하면 먼저 만든 것을 기다렸다가 재사용한다.
 3. **만들기**: \`orca worktree create --repo path:<repo> --name <이름> [--base-branch <baseBranch>] [--parent-worktree path:<부모 경로> | --no-parent] --setup inherit --json\`
-   - \`parent\` 가 있으면 그 location 이 이 실행에서 가리키는 경로를 \`--parent-worktree path:<경로>\` 로 넘겨 **하위 워크트리**로 만든다. 부모를 먼저 준비한다. \`parent\` 가 없으면 \`--no-parent\`.
+   - \`parent\` 가 있으면 그 location 이 이 실행에서 가리키는 경로를 \`--parent-worktree path:<경로>\` 로 넘겨 **하위 워크트리**로 만든다. 부모를 먼저 준비한다.
+   - \`parentPath\` 가 있으면 그 경로를 \`--parent-worktree path:<parentPath>\` 로 넘겨 그 워크트리의 **하위 워크트리**로 만든다. 그 경로가 없으면 만들지 말고 멈춰 보고한다.
+   - 둘 다 없으면 \`--no-parent\`.
 4. 확정된 경로를 그 실행에서 해당 location 대신 쓴다. 진행하지 않을 단계만 있는 워크트리는 만들지 않는다. 만든 워크트리는 지우지 않고, 마무리 보고에 실행별 워크트리 경로와 재사용 여부를 남긴다.
 ` : '';
   return `# 워크플로 실행 코디네이터 브리프

@@ -1,10 +1,12 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { worktreeNamePattern } from '../src/model.ts';
 import type { AutomationState, Locations, RunSnapshot, RunSummary, TaskSummary, WorkerSummary } from '../src/model.ts';
 
 const exec = promisify(execFile);
 type Row = Record<string, any>;
-export type Command = (args: string[]) => Promise<Row>;
+/** `timeoutMs`: for slow commands (creating a worktree runs its setup); the default suits queries. */
+export type Command = (args: string[], options?: { timeoutMs?: number }) => Promise<Row>;
 
 export function commandForEnvironment(env: NodeJS.ProcessEnv = process.env): string {
   if (env.ORCA_CLI_COMMAND) return env.ORCA_CLI_COMMAND;
@@ -12,10 +14,10 @@ export function commandForEnvironment(env: NodeJS.ProcessEnv = process.env): str
   return process.platform === 'linux' && !env.ORCA_TERMINAL_HANDLE && !env.ORCA_WORKSPACE_ID ? 'orca-ide' : 'orca';
 }
 
-export const orcaCommand: Command = async (args) => {
+export const orcaCommand: Command = async (args, options) => {
   try {
     const { stdout } = await exec(commandForEnvironment(), [...args, '--json'], {
-      timeout: 12000, maxBuffer: 8 * 1024 * 1024, windowsHide: true,
+      timeout: options?.timeoutMs ?? 12000, maxBuffer: 8 * 1024 * 1024, windowsHide: true,
     });
     const response = JSON.parse(stdout);
     if (response.ok !== true || !response.result) throw new Error(response.error?.message ?? 'Orca 응답을 확인할 수 없습니다.');
@@ -129,6 +131,25 @@ export function createOrcaBridge(command: Command = orcaCommand) {
      * The handle is resolved server-side from the Run snapshot; clients never pass a handle.
      * This is a view action only: it does not send input or change any lifecycle state.
      */
+    /**
+     * The worktree a coordinator starts in: one of the repo's worktrees whose display name or branch is `name`, else a new one
+     * (under `parent` when given, else with no parent). Reused worktrees are left as they are.
+     */
+    async prepareWorktree(input: { repo: string; name: string; parent?: string; baseBranch?: string }): Promise<{ path: string; created: boolean }> {
+      if (!worktreeNamePattern.test(input.name)) throw new Error('올바르지 않은 워크트리 이름입니다.');
+      const absolute = (value: unknown): value is string => typeof value === 'string' && value.startsWith('/') && !/[\u0000-\u001f]/.test(value);
+      if (!absolute(input.repo) || (input.parent !== undefined && !absolute(input.parent))) throw new Error('워크트리 경로가 올바르지 않습니다.');
+      const listed = await command(['worktree', 'list', '--repo', `path:${input.repo}`, '--limit', '500']);
+      const found = (listed.worktrees ?? []).find((row: Row) => absolute(row.path) && !row.isArchived && !row.isBare
+        && (row.displayName === input.name || (typeof row.branch === 'string' && row.branch.replace(/^refs\/heads\//, '') === input.name)));
+      if (found) return { path: found.path, created: false };
+      const result = await command(['worktree', 'create', '--repo', `path:${input.repo}`, '--name', input.name,
+        ...(input.baseBranch ? ['--base-branch', input.baseBranch] : []),
+        ...(input.parent ? ['--parent-worktree', `path:${input.parent}`] : ['--no-parent']), '--setup', 'inherit'], { timeoutMs: 600_000 });
+      const path = result.worktree?.path ?? result.path;
+      if (!absolute(path)) throw new Error('Orca가 만든 워크트리의 경로를 확인할 수 없습니다.');
+      return { path, created: true };
+    },
     /** Starts the coordinator agent in a terminal (orchestration needs a terminal-bound coordinator). */
     async launchCoordinator(workspaceRoot: string, prompt: string): Promise<{ terminal?: string }> {
       const result = await command(['agent', 'launch', '--agent', 'claude', '--model', 'claude-opus-5-5',

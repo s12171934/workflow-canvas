@@ -50,6 +50,10 @@ export function validateWorkflow(value: unknown): Workflow {
       || (node.data.nameFrom !== undefined && (typeof node.data.nameFrom !== 'string' || !validId(node.data.nameFrom)))
       || (node.data.inputPrompt !== undefined && (typeof node.data.inputPrompt !== 'string' || node.data.inputPrompt.length > 500))
       || (node.data.perExecution !== undefined && typeof node.data.perExecution !== 'boolean')
+      // An absolute path or a {{setting}}: resolved per run, it reaches `--parent-worktree path:` argv.
+      || (node.data.parentPath !== undefined && (typeof node.data.parentPath !== 'string' || node.data.parentPath.length > 1024
+        || /[\u0000-\u001f]/.test(node.data.parentPath) || (node.data.parentPath.trim() !== '' && !/^\s*(\/|\{\{)/.test(node.data.parentPath))
+        || (node.data.parentPath.trim() !== '' && node.data.worktreeMode !== 'create')))
       || (node.width !== undefined && !(Number.isFinite(node.width) && node.width > 0 && node.width < 20000))
       || (node.height !== undefined && !(Number.isFinite(node.height) && node.height > 0 && node.height < 20000)))) {
       throw new Error('그룹 노드의 대상(프로젝트·워크트리)과 경로가 올바르지 않습니다.');
@@ -72,6 +76,10 @@ export function validateWorkflow(value: unknown): Workflow {
     }
     ids.add(node.id);
     if (group) groups.add(node.id);
+  }
+  if (graph.coordinatorGroup !== undefined && (typeof graph.coordinatorGroup !== 'string'
+    || !graph.nodes.some((node) => node.id === graph.coordinatorGroup && node.data.kind === 'group' && node.data.scope === 'worktree'))) {
+    throw new Error('코디네이터 위치는 이 워크플로의 워크트리 그룹이어야 합니다.');
   }
   // The naming stage must be a real, executable stage of this workflow.
   if (graph.nodes.some((node) => node.data.kind === 'group' && node.data.nameFrom
