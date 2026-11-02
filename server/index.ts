@@ -3,12 +3,16 @@ import { fileURLToPath } from 'node:url';
 import { readFile } from 'node:fs/promises';
 import express from 'express';
 import { createApp } from './app.ts';
+import { createStorage } from './storage.ts';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const portArg = process.argv.indexOf('--port');
 const port = Number(portArg >= 0 ? process.argv[portArg + 1] : process.env.WORKFLOW_CANVAS_PORT ?? 4318);
 if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('올바른 포트가 필요합니다.');
-const app = createApp(resolve(process.env.WORKFLOW_CANVAS_DATA_DIR ?? join(root, '.local/workflows')), undefined, { root, watchMs: 10_000 });
+const directory = resolve(process.env.WORKFLOW_CANVAS_DATA_DIR ?? join(root, '.local/workflows'));
+const seeded = await createStorage(directory).seed(join(root, 'examples')).catch((error: Error) => { console.error(`예시 워크플로를 넣지 못했습니다: ${error.message}`); return []; });
+if (seeded.length) console.log(`예시 워크플로 추가: ${seeded.join(', ')}`);
+const app = createApp(directory, undefined, { root, watchMs: 10_000 });
 const server = app.listen(port, '127.0.0.1', () => console.log(`Workflow Canvas: http://127.0.0.1:${port}`));
 server.on('error', (error) => { console.error(error.message); process.exitCode = 1; });
 if (process.argv.includes('--dev')) {

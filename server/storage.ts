@@ -1,4 +1,4 @@
-import { mkdir, readFile, readdir, rename, stat, writeFile, unlink } from 'node:fs/promises';
+import { mkdir, readFile, readdir, rename, stat, writeFile, unlink, utimes } from 'node:fs/promises';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { Workflow } from '../src/model.ts';
@@ -245,6 +245,33 @@ export function createStorage(directory: string) {
         throw error;
       }
       return graph;
+    },
+    /**
+     * Copies bundled example workflows into the data directory once each.
+     * An example is skipped when a document with its id exists or when it was seeded before
+     * (recorded in `.examples.json`), so a deleted or edited example is never brought back.
+     * Seeded files get an old mtime so they do not replace the last-used document at startup.
+     */
+    async seed(examples: string) {
+      const files = (await readdir(examples).catch(() => [] as string[])).filter((file) => file.endsWith('.json')).sort();
+      if (files.length === 0) return [];
+      await mkdir(directory, { recursive: true });
+      const record = join(directory, '.examples.json');
+      const seeded = new Set<string>(await readFile(record, 'utf8').then((text) => JSON.parse(text) as string[]).catch(() => []));
+      const existing = new Set((await readdir(directory)).filter((file) => file.endsWith('.json')).map((file) => file.slice(0, -5)));
+      const added: string[] = [];
+      for (const file of files) {
+        let graph: Workflow;
+        try { graph = validateWorkflow(JSON.parse(await readFile(join(examples, file), 'utf8'))); } catch { continue; }
+        if (seeded.has(graph.id)) continue;
+        seeded.add(graph.id);
+        if (existing.has(graph.id)) continue;
+        await this.save(graph);
+        await utimes(join(directory, `${graph.id}.json`), 0, 0);
+        added.push(graph.id);
+      }
+      await writeFile(record, JSON.stringify([...seeded].sort(), null, 2), { mode: 0o600 });
+      return added;
     },
     async remove(id: string) {
       if (!validId(id)) throw new Error('올바르지 않은 워크플로 ID입니다.');

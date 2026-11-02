@@ -145,3 +145,18 @@ test('memo groups go in any group, but nothing goes in a memo group', () => {
   assert.equal(stored.nodes.find((node) => node.id === 'f')!.parentId, 'w');
   assert.throws(() => validateWorkflow({ ...graph, nodes: [project, worktree, frame, ...graph.nodes.map((node, index) => index ? node : { ...node, parentId: 'f' })] }), /그룹 노드 안에만/);
 });
+test('seeds bundled examples once, never over or after the user\'s own copy', async () => {
+  await mkdir('.local', { recursive: true });
+  const directory = await mkdtemp(join(resolve('.local'), 'storage-test-'));
+  try {
+    const storage = createStorage(directory);
+    const examples = resolve('examples');
+    const ids = ['qa-ticket-select', 'qa-ticket-solve'];
+    assert.deepEqual(await storage.seed(examples), ids);
+    for (const id of ids) assert.equal((await storage.load(id)).runId, '');
+    await storage.remove(ids[0]);
+    assert.deepEqual(await storage.seed(examples), []);
+    await assert.rejects(storage.load(ids[0]));
+    assert.deepEqual(await storage.seed(join(directory, 'missing')), []);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
