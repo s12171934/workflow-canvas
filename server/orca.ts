@@ -79,7 +79,7 @@ export function createOrcaBridge(command: Command = orcaCommand) {
     async createAutomation(input: { name: string; trigger: string; time?: string; day?: number; project: string; prompt: string }): Promise<string> {
       const result = await command(['automations', 'create', '--name', input.name, '--trigger', input.trigger,
         ...(input.time ? ['--time', input.time] : []), ...(input.day !== undefined ? ['--day', String(input.day)] : []),
-        '--prompt', input.prompt, '--provider', 'claude', '--repo', `path:${input.project}`, '--workspace-mode', 'existing', '--fresh-session', '--enabled']);
+        '--prompt', input.prompt, '--provider', 'claude', '--workspace', `path:${input.project}`, '--workspace-mode', 'existing', '--fresh-session', '--enabled']);
       const id = result.automation?.id ?? result.id;
       if (typeof id !== 'string' || !/^[a-zA-Z0-9-]{1,128}$/.test(id)) throw new Error('Orca가 만든 자동화의 ID를 확인할 수 없습니다.');
       return id;

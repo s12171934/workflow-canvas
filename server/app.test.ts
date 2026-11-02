@@ -242,7 +242,7 @@ test('automations: create in Orca with a brief-fetching prompt, fire, and remove
     const config = created.automations[0];
     assert.equal(config.orcaId, 'orca-auto-1');
     const create = calls.find((args) => args[1] === 'create')!;
-    assert.ok(create.includes('--repo') && create.includes('path:/example/repo') && create.includes('--time') && create.includes('02:00'));
+    assert.ok(create.includes('--workspace') && !create.includes('--repo') && create.includes('path:/example/repo') && create.includes('--time') && create.includes('02:00'));
     assert.match(create[create.indexOf('--prompt') + 1], new RegExp(`/api/workflows/${graph.id}/automations/${config.id}/brief`));
     const listing = await (await fetch(`${base}/api/workflows/${graph.id}/automations`)).json();
     assert.equal(listing.automations[0].state.enabled, true);
