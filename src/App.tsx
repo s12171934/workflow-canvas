@@ -1,4 +1,4 @@
-import { createContext, type CSSProperties, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
+import { createContext, type CSSProperties, type RefObject, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ReactFlow, ReactFlowProvider, Background, Controls, MiniMap, Handle, Position, NodeResizer,
   addEdge, useNodesState, useEdgesState, useReactFlow, useStore, MarkerType,
@@ -247,6 +247,22 @@ type GenerationState = { id: string; kind: 'workflow' | 'brief'; status: 'pendin
   before?: string };
 function blankWorkflow(): Workflow { return { ...newWorkflow(), name: '새 워크플로', nodes: [], edges: [] }; }
 
+/**
+ * Keeps the canvas's zoom in CSS: `--zi` (1/zoom, 1–4) lets running-stage marks keep their on-screen size when zoomed
+ * out, and `data-far` marks a zoom where card text is too small to read. Set on the element directly so zooming never
+ * re-renders the editor.
+ */
+function ZoomVars({ target }: { target: RefObject<HTMLElement | null> }) {
+  const zoom = useStore((state) => state.transform[2]);
+  useEffect(() => {
+    const element = target.current;
+    if (!element) return;
+    element.style.setProperty('--zi', String(Math.min(4, Math.max(1, 1 / zoom))));
+    element.toggleAttribute('data-far', zoom < 0.6); // an attribute React never rewrites, unlike className
+  }, [zoom, target]);
+  return null;
+}
+
 export function App() { return <ReactFlowProvider><Workspace /></ReactFlowProvider>; }
 
 function Workspace() {
@@ -420,6 +436,7 @@ function Workspace() {
     .sort((a, b) => Number(!a.data.live) - Number(!b.data.live)), [displayNodes]);
   const liveCount = liveNodes.filter((node) => node.data.live).length;
   const liveCursor = useRef(0);
+  const canvasRef = useRef<HTMLElement>(null);
   /** Select a node and bring it into view without opening its terminal. */
   const focusNode = useCallback((id: string) => {
     setSelectedId(id); setSelectedEdgeId(null); setMultiIds([]);
@@ -1033,7 +1050,8 @@ function Workspace() {
       </header>
       {(snapshotError || connectionError) && <div className="error-banner" role="alert"><CircleHelp size={15} />{snapshotError || connectionError}</div>}
       <div className={`editor-body ${panels.left ? 'left-open' : 'left-closed'} ${panels.right ? 'right-open' : 'right-closed'} ${viewOnly ? 'view-only' : ''}`}>
-        <section className="canvas" aria-label="워크플로 그래프 캔버스">
+        <section ref={canvasRef} className={`canvas ${liveCount ? 'has-live' : ''}`} aria-label="워크플로 그래프 캔버스">
+          <ZoomVars target={canvasRef} />
           <div className="canvas-tools" role="toolbar" aria-label="추가">
             <span className="tool-group-label">조작</span>
             {([['select', MousePointer2, '선택 (V)', '빈 곳을 드래그해 여러 노드를 선택. 화면 이동은 스크롤·가운데 버튼·Space+드래그'],
@@ -1132,7 +1150,8 @@ function Workspace() {
           <div className="sidebar-head"><a className="brand" href="/" onClick={(event) => event.preventDefault()}><span className="brand-mark"><Network size={23} /></span><span>workflow<span className="brand-sub">canvas</span></span><span className="version">0.1</span></a><button className="icon-button panel-collapse" title="사이드바 접기 ([)" aria-label="사이드바 접기" onClick={() => setPanels((value) => ({ ...value, left: false }))}><PanelLeftClose size={16} /></button></div>
           <div className="workspace-label"><span className="workspace-avatar">W</span><div>로컬 워크스페이스<small>Orca orchestration</small></div><ChevronRight size={14} /></div>
           <div className="sidebar-section-title">워크플로<span>{saved.length}</span></div>
-          <button className="sidebar-item active" onClick={closeDrawer}><GitBranch size={17} /><span title={workflow.name}>{workflow.name}</span><span className="tiny-dot" /></button>
+          <button className="sidebar-item active" onClick={closeDrawer}><GitBranch size={17} /><span title={workflow.name}>{workflow.name}</span>
+            {liveCount > 0 ? <span className="sidebar-live" title={`단계 ${liveCount}개 실행 중`}><LoaderCircle size={11} className="spin" />{liveCount}</span> : <span className="tiny-dot" />}</button>
           {saved.filter((item) => item.id !== workflow.id).map((item) => <div className="sidebar-row" key={item.id}><button className="sidebar-item" onClick={() => void load(item.id)}><FileJson2 size={16} /><span>{item.name}</span></button>
             <button className="icon-button row-delete" title="워크플로 삭제" aria-label={`${item.name} 삭제`} onClick={() => void removeWorkflow(item.id, item.name)}><Trash2 size={14} /></button></div>)}
           <button className="sidebar-item subtle" onClick={() => { if (confirmReplace()) applyWorkflow(blankWorkflow(), false); }}><Plus size={16} /><span>새 워크플로</span></button>

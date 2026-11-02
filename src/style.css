@@ -537,3 +537,13 @@ button.summary-status { cursor:pointer; } button.summary-status:hover { text-dec
 .summary-stages span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .summary-stages .running { color:#9ddcc7; } .summary-stages .blocked { color:#dcc17e; } .summary-stages .failed { color:#f0a0ae; }
 @media (max-width:620px) { .summary-panel { top:auto; bottom:52px; left:var(--gap); right:var(--gap); width:auto; max-height:40%; } }
+
+/* 축소해도 보이는 실행 중: marks scale by --zi (1/zoom) so they keep their on-screen size, and the card itself is tinted. */
+.canvas { --zi:1; }
+.stage-card.live { background:linear-gradient(135deg,#1f3a33,#1a2a27); outline:calc(2px * var(--zi)) solid #8de0c7; outline-offset:calc(3px * var(--zi)); }
+.stage-card.blocked:not(.live) { outline:calc(2px * var(--zi)) solid #dcc17ecc; outline-offset:calc(3px * var(--zi)); }
+.live-badge { transform:scale(var(--zi)); transform-origin:100% 100%; }
+/* Zoomed out with something running: everything not running, waiting or failed steps back. */
+.canvas[data-far].has-live .stage-card:not(.live):not(.blocked):not(.failed):not(.selected) { opacity:.4; filter:saturate(.4); }
+.canvas[data-far] .stage-card.live h3 { color:#e3f6ef; }
+.sidebar-live { margin-left:auto; display:inline-flex; align-items:center; gap:3px; padding:1px 6px; border-radius:999px; font-size:10px; font-weight:600; color:#0f1a17; background:#8de0c7; }
