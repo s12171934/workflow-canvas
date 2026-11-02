@@ -1,0 +1,606 @@
+{
+  "version": 1,
+  "id": "qa-ticket-solve",
+  "name": "QA 티켓 해결",
+  "description": "qa-ticket-driver 의 티켓별 코디네이터 흐름. 실행 시 입력(티켓 키)의 워크트리에서 준비 → 분석 → (방향 확인) → 구현 → 검토 → 화면 실측(검토 「보완 필요」·실측 「실패」는 구현으로 되돌아가 최대 3회 반복) → 반출 승인 → push·PR → 머지 지시 → 머지·Jira 완료 → 정리까지 진행한다. 「QA 티켓 선별」 플로가 티켓마다 실행을 요청하며, 티켓이 다르면 동시에 진행한다.",
+  "runId": "",
+  "nodes": [
+    {
+      "id": "wt",
+      "type": "group",
+      "position": {
+        "x": -648.8771565810022,
+        "y": 590.3397039173939
+      },
+      "width": 2239,
+      "height": 1603,
+      "data": {
+        "label": "티켓 워크트리 (이름 = 티켓 키)",
+        "description": "실행 시 입력(티켓 키)으로 실행 프로젝트(QA_REPO)에 만들고, 같은 키(재오픈)면 재사용한다.",
+        "kind": "group",
+        "scope": "worktree",
+        "path": "",
+        "worktreeMode": "create",
+        "repoPath": "",
+        "nameSource": "input",
+        "inputPrompt": "QA 티켓 키 (예: ABC-123) — 선별 플로가 넣는다"
+      }
+    },
+    {
+      "id": "41964c0f-4306-4f54-aee3-00d9ff612890",
+      "type": "frame",
+      "position": {
+        "x": 767.03732291705,
+        "y": 97.89302893980198
+      },
+      "parentId": "wt",
+      "width": 1386,
+      "height": 580,
+      "data": {
+        "label": "구현 및 자동 검증",
+        "description": "",
+        "kind": "frame"
+      }
+    },
+    {
+      "id": "ea913d42-3703-4bf2-b737-0cfa8e15414a",
+      "type": "frame",
+      "position": {
+        "x": 45.97043253442337,
+        "y": 92.96486101282989
+      },
+      "parentId": "wt",
+      "width": 672,
+      "height": 829,
+      "data": {
+        "label": "티켓 분석",
+        "description": "",
+        "kind": "frame"
+      }
+    },
+    {
+      "id": "bc13b7bc-081b-4e6a-8753-2e97181f8606",
+      "type": "frame",
+      "position": {
+        "x": 765.8748793241066,
+        "y": 734.3177390965121
+      },
+      "parentId": "wt",
+      "width": 712,
+      "height": 320,
+      "data": {
+        "label": "리뷰 및 머지 준비",
+        "description": "",
+        "kind": "frame"
+      }
+    },
+    {
+      "id": "6da2854c-f323-41aa-809a-a123b4227a36",
+      "type": "frame",
+      "position": {
+        "x": 761.7156084030245,
+        "y": 1136.7311293495904
+      },
+      "parentId": "wt",
+      "width": 1383,
+      "height": 404,
+      "data": {
+        "label": "머지 후 처리",
+        "description": "",
+        "kind": "frame"
+      }
+    },
+    {
+      "id": "setup",
+      "type": "stage",
+      "position": {
+        "x": 265.6737372015461,
+        "y": 1092.8314636642372
+      },
+      "parentId": "wt",
+      "data": {
+        "label": "설정 체크리스트",
+        "description": "티켓 하나를 머지까지 처리하는 플로. 보통은 「QA 티켓 선별」 플로가 티켓마다 이 플로를 실행 요청한다(실행 시 입력 = 티켓 키). 티켓 키를 직접 넣어 손으로 돌려도 된다.\n\n- 상태 디렉터리 ~/.qa-driver/<에픽>/ (qa-ticket-driver 형식)가 있어야 한다 — 설정은 선별 플로의 체크리스트를 따른다.\n- 실행 프로젝트는 QA_REPO 와 같은 저장소. 완료 시 정리의 「만든 워크트리 삭제」는 끈다(마지막 단계가 머지 확인 뒤 정리한다).\n- 같은 티켓이 진행 중이면 캔버스가 새 실행을 거부하고, 다른 티켓은 동시에 진행한다.\n- 상태 신호는 드라이버와 같은 계약으로 남으므로 agent-dashboard QA 화면이 그대로 읽는다. 반출 승인·머지 지시는 캔버스 게이트로 한다.",
+        "kind": "note"
+      }
+    },
+    {
+      "id": "prepare",
+      "type": "stage",
+      "position": {
+        "x": 88.89791739740986,
+        "y": 178.99548283635113
+      },
+      "parentId": "wt",
+      "data": {
+        "label": "티켓 준비",
+        "description": "이 실행이 맡은 QA 티켓의 상태 디렉터리·회차를 정하고 다음 단계들이 읽을 준비 산출물을 쓴다. 코드는 건드리지 않는다.\n\n1. 티켓 키 = 이 워크트리의 Orca 이름(실행 시 입력). 워크트리 경로의 마지막 이름이나 `orca worktree list` 의 표시 이름으로 확인한다. 티켓 키 형식(예: ABC-123)이 아니면 멈춘다.\n2. STATE — 설정값 에픽 `{{epic}}` 이 주어졌으면(중괄호 그대로가 아니면, 링크면 마지막 경로의 키) `~/.qa-driver/<그 키 소문자>/`. 아니면 `~/.qa-driver/*/claimed/<KEY>` 가 있는 상태 디렉터리. 없으면(손으로 돌린 실행) config.env 가 있는 상태 디렉터리가 하나뿐일 때만 그것을 쓴다. 정할 수 없거나 config.env 필수 키(JIRA_SITE·JIRA_EMAIL·QA_REPO·QA_STATUS_NEW·QA_STATUS_REOPEN)가 비었거나 QA_AUTO_HANDOFF 가 yes/no 가 아니면 stop.\n3. 회차 — `STATE/claimed/<KEY>` 마지막 줄이 선별 플로가 2시간 안에 쓴 줄(셋째 칸 `canvas-select:`)이면 그대로 쓴다. 아니면 손으로 돌린 실행이므로 `<ISO 시각>\\t<epoch>\\tcanvas-manual:$ORCA_TERMINAL_HANDLE\\t<제목>` 한 줄을 덧붙인다. round = 줄 수.\n4. round ≥ 2(재오픈)이면 이전 회차 신호(STATE 의 handoffs·done·ready·approved·delivered·merge·blocked 아래 <KEY>*)를 `STATE/rounds/<KEY>/<round-1>/<종류>/` 로 옮긴다.\n5. STATE/tickets/<KEY>.json 을 만들거나 갱신한다: {key, parent, summary, round, worktree: {path: <이 워크트리 절대 경로>, created_at}, updated_at}. 대시보드와 `qa-driver cleanup` 이 읽는다.\n6. 산출물 파일에 `key: value` 줄로 쓴다: parent, key, summary, status, round, reopen(yes/no), state_dir, record_file(QA_RECORD_DIR, 기본 STATE/records 아래 이 티켓 노트 — 재오픈이면 기존 노트), repo, base_branch, harness_docs, ticket_skills, screen_skills, auto_handoff, jira_site, jira_email, token_keychain_service(서비스 이름만 — 토큰 값은 어디에도 쓰지 않는다).\n\n판정 — go: 준비 완료 / stop: 상태 디렉터리·설정을 정할 수 없다(무엇이 빠졌는지 보고). 상태 디렉터리 규칙: `~/.claude/skills/qa-ticket-driver/exports/state-contract.md`.",
+        "kind": "worker",
+        "effort": "medium"
+      }
+    },
+    {
+      "id": "ready-to-go",
+      "type": "stage",
+      "position": {
+        "x": 92.01061762836207,
+        "y": 421.5897887835306
+      },
+      "parentId": "wt",
+      "data": {
+        "label": "준비 결과",
+        "description": "준비 워커가 판정한다. stop 이면 아무것도 하지 않고 끝난다.",
+        "kind": "branch",
+        "mode": "exclusive",
+        "judge": "previous",
+        "outputs": [
+          {
+            "id": "go",
+            "label": "준비 완료"
+          },
+          {
+            "id": "stop",
+            "label": "상태 디렉터리·설정을 정할 수 없다"
+          }
+        ]
+      }
+    },
+    {
+      "id": "analyze",
+      "type": "stage",
+      "position": {
+        "x": 88.66309454372038,
+        "y": 684.1849461157885
+      },
+      "parentId": "wt",
+      "data": {
+        "label": "문제 특정·기록",
+        "description": "공통 — 먼저 같은 산출물 폴더의 준비 산출물 `<실행 번호>-prepare.txt` 를 읽어 parent·key·round·reopen·state_dir(아래 STATE)·record_file·설정 값을 확인한다. 상태 디렉터리 규칙은 `~/.claude/skills/qa-ticket-driver/exports/state-contract.md` 가, 단계별 세부 절차는 `~/.claude/skills/qa-ticket-driver/references/brief-coordinator.md` 가 정본이다(@@KEY@@ 등 자리는 준비 산출물 값, @@STATE_DIR@@ 은 STATE, @@RECORD_DIR@@ 은 record_file 의 폴더). 다른 티켓의 신호·기록은 건드리지 않는다. 임시 파일은 STATE/scratch/<KEY>/ 에 둔다.\n\n티켓 하나의 근본 원인을 코드로 특정하고 기록한다. 코드·브랜치는 바꾸지 않는다(필요한 서브모듈 populate·fetch 만 한다).\n1. reopen: yes 면 `~/.claude/skills/qa-ticket-driver/references/brief-reopen.md` 의 0단계와 기록 규칙을 먼저 따른다.\n2. brief-coordinator.md 의 「기능 맥락」(STATE/context.md)·「먼저 읽을 것」·「1단계 — 문제 특정」·「2단계 — 기록」을 따른다. Jira 토큰은 ATLASSIAN_API_TOKEN, 없으면 `security find-generic-password -s <token_keychain_service> -w`.\n3. 산출물에 요약: 소유 저장소(서브모듈)·베이스, 근본 원인 파일:라인, 수정 방향과 버린 대안, 사업 규칙 판단·여러 저장소 계약 변경 여부, 화면 영향 예상.\n\n판정 — auto: 원인·방향이 코드로 확정됐고 auto_handoff=yes 이며 사업 규칙 판단·여러 저장소 계약 변경이 없다 / ask: 원인은 특정했지만 auto 조건이 아니다 / blocked: 원인을 코드로 특정하지 못했다(기록에 막힌 지점을 적고 STATE/blocked/<KEY>.md — 첫 줄 제목, 둘째 줄 빈 줄, 셋째 줄 한 줄 요약).",
+        "kind": "worker",
+        "effort": "high"
+      }
+    },
+    {
+      "id": "direction",
+      "type": "stage",
+      "position": {
+        "x": 418.2828419220423,
+        "y": 412.8555668608476
+      },
+      "parentId": "wt",
+      "data": {
+        "label": "방향 확인 필요?",
+        "description": "분석 워커가 판정한다(QA_AUTO_HANDOFF 규칙).",
+        "kind": "branch",
+        "mode": "exclusive",
+        "judge": "previous",
+        "outputs": [
+          {
+            "id": "auto",
+            "label": "방향 확정 — 묻지 않고 구현"
+          },
+          {
+            "id": "ask",
+            "label": "사용자에게 방향 확인"
+          },
+          {
+            "id": "blocked",
+            "label": "원인 미특정"
+          }
+        ]
+      }
+    },
+    {
+      "id": "direction-gate",
+      "type": "stage",
+      "position": {
+        "x": 825.4799486289315,
+        "y": 139.2088379939654
+      },
+      "parentId": "wt",
+      "data": {
+        "label": "구현 방향 승인",
+        "description": "분석 산출물과 기록 파일의 원인·소유 저장소·수정 방향을 보고 「이 방향으로 구현할까요?」. 거절하면 구현 없이 이 실행을 끝낸다(티켓은 claim 된 채 남고, 기록을 고친 뒤 다시 돌린다).",
+        "kind": "gate"
+      }
+    },
+    {
+      "id": "implement",
+      "type": "stage",
+      "position": {
+        "x": 1150.7761820481428,
+        "y": 137.82042502645493
+      },
+      "parentId": "wt",
+      "data": {
+        "label": "구현",
+        "description": "공통 — 먼저 같은 산출물 폴더의 준비 산출물 `<실행 번호>-prepare.txt` 를 읽어 parent·key·round·reopen·state_dir(아래 STATE)·record_file·설정 값을 확인한다. 상태 디렉터리 규칙은 `~/.claude/skills/qa-ticket-driver/exports/state-contract.md` 가, 단계별 세부 절차는 `~/.claude/skills/qa-ticket-driver/references/brief-coordinator.md` 가 정본이다(@@KEY@@ 등 자리는 준비 산출물 값, @@STATE_DIR@@ 은 STATE, @@RECORD_DIR@@ 은 record_file 의 폴더). 다른 티켓의 신호·기록은 건드리지 않는다. 임시 파일은 STATE/scratch/<KEY>/ 에 둔다.\n\n기록 파일의 「수정 계획」대로 구현한다(brief-coordinator.md 3단계를 이 워커가 직접 한다).\n2회차 이상(검토 「보완 필요」나 실측 「실패」로 되돌아온 경우)이면 새로 구현하지 않는다: 각 STATE/handoffs/<KEY>-<이름>.md 의 마지막 `## 보완` 절과 STATE/done/<KEY>-screen.md 의 실패 시나리오만 고치고, push 전이므로 인계 브리프가 정한 커밋을 amend 한 뒤 done/<KEY>-<이름>.md 를 갱신한다. 브랜치는 이어 쓴다.\n1. 고칠 서브모듈마다 베이스(기능 맥락 우선, 없으면 하네스)에서 `<KEY>-<영문-슬러그>` 브랜치를 만든다. 재회차면 기존 브랜치를 이어 쓴다.\n2. 서브모듈마다 STATE/handoffs/<KEY>-<이름>.md 인계 브리프를 남긴다(3단계 2의 항목) — 대시보드가 구현 단계를 이걸로 판정한다.\n3. 의존 저장소부터 한 서브모듈씩 `~/.claude/skills/qa-ticket-driver/references/worker-duties.md` 의 의무대로 수정·검증(red 확인)·로컬 커밋하고 STATE/done/<KEY>-<이름>.md 를 쓴다. 소비처의 핀은 의존 저장소 커밋을 가리킨다.\n4. Jira 착수 전이는 첫 커밋 전에 ticket_skills 규칙대로 한다. push·PR·그 밖의 Jira 쓰기는 하지 않는다.\n막혀 커밋하지 못한 서브모듈은 done 대신 STATE/blocked/<KEY>-<이름>.md 를 쓰고 산출물에 사유를 남긴다.",
+        "kind": "worker",
+        "effort": "high",
+        "join": "any"
+      }
+    },
+    {
+      "id": "review",
+      "type": "stage",
+      "position": {
+        "x": 822.0452507232286,
+        "y": 388.87569088836597
+      },
+      "parentId": "wt",
+      "data": {
+        "label": "검토",
+        "description": "공통 — 먼저 같은 산출물 폴더의 준비 산출물 `<실행 번호>-prepare.txt` 를 읽어 parent·key·round·reopen·state_dir(아래 STATE)·record_file·설정 값을 확인한다. 상태 디렉터리 규칙은 `~/.claude/skills/qa-ticket-driver/exports/state-contract.md` 가, 단계별 세부 절차는 `~/.claude/skills/qa-ticket-driver/references/brief-coordinator.md` 가 정본이다(@@KEY@@ 등 자리는 준비 산출물 값, @@STATE_DIR@@ 은 STATE, @@RECORD_DIR@@ 은 record_file 의 폴더). 다른 티켓의 신호·기록은 건드리지 않는다. 임시 파일은 STATE/scratch/<KEY>/ 에 둔다.\n\n구현 결과를 검토한다. 코드를 고치지 않는다(읽기·검증 실행만).\n1. 브랜치 diff 를 기록의 수정 계획과 대조한다 — 계획 밖 변경, 빠진 사이드이펙트 처리, blocked 된 서브모듈.\n2. 검증 명령을 직접 다시 돌린다. red 확인 기록(수정 전 실패 메시지)이 없으면 통과가 아니다.\n3. 화면 판정: 수정이 사용자 화면의 동작·표시를 바꾸면, 실측 인계 브리프 STATE/handoffs/<KEY>-screen.md 를 brief-coordinator.md 4단계 4 의 항목(대상 화면과 경로, 브랜치·핀, 계정, 시나리오 — 재현 경로 먼저·경계 사례, 단계별 입력값·기대값·입력 방식, 누르면 안 되는 버튼, 녹화별 시작 URL)으로 쓴다. 해당 없으면 이유를 산출물에 한 줄로 쓴다.\n4. 부족하면 고칠 것을 해당 handoffs/<KEY>-<이름>.md 끝에 `## 보완 (<회차>회차 검토)` 절로 적는다 — 구현 단계가 다음 회차에 그것만 고친다. 2회차 이상이면 앞 회차 보완이 반영됐는지부터 확인한다.\n\n판정 — screen: 통과, 화면 실측 필요 / no-screen: 통과, 실측 해당 없음 / fix: 보완하면 통과할 수 있다(구현으로 되돌아간다, 최대 3회) / stop: 보완으로 해결할 수 없다 — 사유를 STATE/blocked/<KEY>.md 에 쓴다",
+        "kind": "worker",
+        "effort": "high"
+      }
+    },
+    {
+      "id": "review-result",
+      "type": "stage",
+      "position": {
+        "x": 1146.5350311394077,
+        "y": 361.75645539972663
+      },
+      "parentId": "wt",
+      "data": {
+        "label": "검토 결과",
+        "description": "검토 워커가 판정한다. 「보완 필요」는 구현으로 되돌아가 다시 검토하고(최대 3회), 3회를 넘기면 「보완으로 해결 불가」로 막힘 보고에 간다.",
+        "kind": "branch",
+        "mode": "exclusive",
+        "judge": "previous",
+        "outputs": [
+          {
+            "id": "screen",
+            "label": "통과 — 화면 실측 필요"
+          },
+          {
+            "id": "no-screen",
+            "label": "통과 — 실측 해당 없음"
+          },
+          {
+            "id": "fix",
+            "label": "보완 필요 — 구현으로 되돌아감"
+          },
+          {
+            "id": "stop",
+            "label": "보완으로 해결 불가"
+          }
+        ]
+      }
+    },
+    {
+      "id": "screen",
+      "type": "stage",
+      "position": {
+        "x": 1468.2671043955106,
+        "y": 373.90331746499703
+      },
+      "parentId": "wt",
+      "data": {
+        "label": "화면 실측",
+        "description": "공통 — 먼저 같은 산출물 폴더의 준비 산출물 `<실행 번호>-prepare.txt` 를 읽어 parent·key·round·reopen·state_dir(아래 STATE)·record_file·설정 값을 확인한다. 상태 디렉터리 규칙은 `~/.claude/skills/qa-ticket-driver/exports/state-contract.md` 가, 단계별 세부 절차는 `~/.claude/skills/qa-ticket-driver/references/brief-coordinator.md` 가 정본이다(@@KEY@@ 등 자리는 준비 산출물 값, @@STATE_DIR@@ 은 STATE, @@RECORD_DIR@@ 은 record_file 의 폴더). 다른 티켓의 신호·기록은 건드리지 않는다. 임시 파일은 STATE/scratch/<KEY>/ 에 둔다.\n\n검토를 통과한 브랜치를 실제 화면에서 잰다. 코드·브랜치·커밋은 건드리지 않는다. 인계 브리프 STATE/handoffs/<KEY>-screen.md 를 읽고 `~/.claude/skills/qa-ticket-driver/references/screen-duties.md` 의 의무와 screen_skills 의 방법을 따른다(값을 재고, 녹화마다 탭을 따로 쓰고, 저장·제출하지 않는다). 결과는 STATE/done/<KEY>-screen.md, 재지 못했으면 STATE/blocked/<KEY>-screen.md. 띄운 서버·탭은 닫고, 못 닫은 것은 「남은 것」에 적는다.\n\n판정 — pass: 모든 시나리오가 기대값과 일치 / fail: 실패 시나리오가 있다 — 코드 보완이 필요하다(구현으로 되돌아간다, 최대 3회) / stop: 환경을 띄우지 못하거나 대상 화면에 닿지 못해 재지 못했다",
+        "kind": "worker",
+        "effort": "medium",
+        "join": "any"
+      }
+    },
+    {
+      "id": "screen-result",
+      "type": "stage",
+      "position": {
+        "x": 1831.483370106822,
+        "y": 352.8442284576248
+      },
+      "parentId": "wt",
+      "data": {
+        "label": "실측 결과",
+        "description": "실측 워커가 판정한다. 「실패」는 구현으로 되돌아가 검토·실측을 다시 하고(최대 3회), 넘기면 막힘 보고로 간다.",
+        "kind": "branch",
+        "mode": "exclusive",
+        "judge": "previous",
+        "outputs": [
+          {
+            "id": "pass",
+            "label": "모든 시나리오 통과"
+          },
+          {
+            "id": "fail",
+            "label": "실패 시나리오 — 구현으로 되돌아감"
+          },
+          {
+            "id": "stop",
+            "label": "재지 못함 또는 반복 초과"
+          }
+        ]
+      }
+    },
+    {
+      "id": "ready",
+      "type": "stage",
+      "position": {
+        "x": 1845.102705199724,
+        "y": 137.74443984473874
+      },
+      "parentId": "wt",
+      "data": {
+        "label": "검토 완료 보고",
+        "description": "공통 — 먼저 같은 산출물 폴더의 준비 산출물 `<실행 번호>-prepare.txt` 를 읽어 parent·key·round·reopen·state_dir(아래 STATE)·record_file·설정 값을 확인한다. 상태 디렉터리 규칙은 `~/.claude/skills/qa-ticket-driver/exports/state-contract.md` 가, 단계별 세부 절차는 `~/.claude/skills/qa-ticket-driver/references/brief-coordinator.md` 가 정본이다(@@KEY@@ 등 자리는 준비 산출물 값, @@STATE_DIR@@ 은 STATE, @@RECORD_DIR@@ 은 record_file 의 폴더). 다른 티켓의 신호·기록은 건드리지 않는다. 임시 파일은 STATE/scratch/<KEY>/ 에 둔다.\n\n검토·실측 결과를 모아 STATE/ready/<KEY>.md 를 brief-coordinator.md 4단계 5 의 형식으로 쓴다(저장소별 브랜치·PR 타깃·커밋, 다시 돌린 검증과 red 확인, 화면 실측 결과 또는 해당 없음의 이유, 기록, 남은 확인 — 실측 워커의 「남은 것」 포함). 사용자에게 보여 줄 5줄 요약(원인 / 수정 / 검증 / 화면 실측 / 남은 확인)을 만든다.",
+        "kind": "worker",
+        "effort": "low",
+        "join": "any"
+      }
+    },
+    {
+      "id": "deliver-gate",
+      "type": "stage",
+      "position": {
+        "x": 818.8471762260979,
+        "y": 819.19724872308
+      },
+      "parentId": "wt",
+      "data": {
+        "label": "반출 승인",
+        "description": "ready 요약과 STATE/ready/<KEY>.md 를 보여 주고 「push 와 PR 생성을 승인할까요?」 검증의 red 확인을 특히 보게 한다. 거절하면 커밋은 이 워크트리에 남고 이 실행은 끝난다.",
+        "kind": "gate",
+        "asker": "previous"
+      }
+    },
+    {
+      "id": "deliver",
+      "type": "stage",
+      "position": {
+        "x": 1143.7283459693072,
+        "y": 818.6112888044016
+      },
+      "parentId": "wt",
+      "data": {
+        "label": "반출 (push·PR)",
+        "description": "공통 — 먼저 같은 산출물 폴더의 준비 산출물 `<실행 번호>-prepare.txt` 를 읽어 parent·key·round·reopen·state_dir(아래 STATE)·record_file·설정 값을 확인한다. 상태 디렉터리 규칙은 `~/.claude/skills/qa-ticket-driver/exports/state-contract.md` 가, 단계별 세부 절차는 `~/.claude/skills/qa-ticket-driver/references/brief-coordinator.md` 가 정본이다(@@KEY@@ 등 자리는 준비 산출물 값, @@STATE_DIR@@ 은 STATE, @@RECORD_DIR@@ 은 record_file 의 폴더). 다른 티켓의 신호·기록은 건드리지 않는다. 임시 파일은 STATE/scratch/<KEY>/ 에 둔다.\n\n사용자가 캔버스 게이트에서 반출을 승인했다. 먼저 STATE/approved/<KEY>.md 에 승인 시각과 「workflow-canvas 게이트」를 적는다. 그다음 brief-coordinator.md 5단계를 따른다: origin/<베이스> 위로 리베이스하고 검증을 다시 돌린다 → 의존 저장소부터 push·PR(본문 = 원인·수정·검증(red 포함)·남은 확인) → STATE/delivered/<KEY>.md 에 저장소별 PR 주소. 머지와 Jira 쓰기는 하지 않는다. 실패하면 멈추고 STATE/blocked/<KEY>.md 에 사유를 쓴다.",
+        "kind": "worker",
+        "effort": "medium"
+      }
+    },
+    {
+      "id": "merge-gate",
+      "type": "stage",
+      "position": {
+        "x": 794.701242101979,
+        "y": 1249.3808235375886
+      },
+      "parentId": "wt",
+      "data": {
+        "label": "머지 지시",
+        "description": "STATE/delivered/<KEY>.md 의 PR(리뷰·체크)을 확인하고 「의존 저장소부터 머지하고 Jira 를 개발 완료로 옮길까요?」 반출이 실패했거나 아직 머지할 때가 아니면 거절한다 — PR 과 워크트리는 남는다.",
+        "kind": "gate"
+      }
+    },
+    {
+      "id": "merge",
+      "type": "stage",
+      "position": {
+        "x": 1153.5718644442968,
+        "y": 1249.765827141529
+      },
+      "parentId": "wt",
+      "data": {
+        "label": "머지·Jira 완료",
+        "description": "공통 — 먼저 같은 산출물 폴더의 준비 산출물 `<실행 번호>-prepare.txt` 를 읽어 parent·key·round·reopen·state_dir(아래 STATE)·record_file·설정 값을 확인한다. 상태 디렉터리 규칙은 `~/.claude/skills/qa-ticket-driver/exports/state-contract.md` 가, 단계별 세부 절차는 `~/.claude/skills/qa-ticket-driver/references/brief-coordinator.md` 가 정본이다(@@KEY@@ 등 자리는 준비 산출물 값, @@STATE_DIR@@ 은 STATE, @@RECORD_DIR@@ 은 record_file 의 폴더). 다른 티켓의 신호·기록은 건드리지 않는다. 임시 파일은 STATE/scratch/<KEY>/ 에 둔다.\n\n사용자가 머지를 지시했다. 먼저 STATE/merge/<KEY>.md 에 지시 시각을 적는다. 그다음 brief-coordinator.md 6단계를 따른다: delivered 의 PR 을 의존 저장소부터 머지하고, 소비처의 핀은 의존 저장소의 머지된 해시로 갱신해 push 한 뒤 머지한다. 체크 실패·충돌·리뷰 요구로 머지할 수 없으면 머지하지 않고 STATE/blocked/<KEY>.md 에 사유를 쓴다. PR 이 모두 머지된 것을 확인한 뒤에만 ticket_skills 규칙대로 「개발 완료」 전이와 전달 코멘트를 한다.\n\n판정 — merged: 모든 PR 머지와 Jira 전이 완료 / blocked: 하나라도 머지하지 못했다",
+        "kind": "worker",
+        "effort": "medium"
+      }
+    },
+    {
+      "id": "merge-result",
+      "type": "stage",
+      "position": {
+        "x": 1494.5656685304557,
+        "y": 1237.770229128335
+      },
+      "parentId": "wt",
+      "data": {
+        "label": "머지 결과",
+        "description": "머지 워커가 판정한다.",
+        "kind": "branch",
+        "mode": "exclusive",
+        "judge": "previous",
+        "outputs": [
+          {
+            "id": "merged",
+            "label": "모두 머지됨"
+          },
+          {
+            "id": "blocked",
+            "label": "머지하지 못함"
+          }
+        ]
+      }
+    },
+    {
+      "id": "blocked",
+      "type": "stage",
+      "position": {
+        "x": 1831.8290038318628,
+        "y": 795.614512075263
+      },
+      "parentId": "wt",
+      "data": {
+        "label": "막힘 보고",
+        "description": "공통 — 먼저 같은 산출물 폴더의 준비 산출물 `<실행 번호>-prepare.txt` 를 읽어 parent·key·round·reopen·state_dir(아래 STATE)·record_file·설정 값을 확인한다. 상태 디렉터리 규칙은 `~/.claude/skills/qa-ticket-driver/exports/state-contract.md` 가, 단계별 세부 절차는 `~/.claude/skills/qa-ticket-driver/references/brief-coordinator.md` 가 정본이다(@@KEY@@ 등 자리는 준비 산출물 값, @@STATE_DIR@@ 은 STATE, @@RECORD_DIR@@ 은 record_file 의 폴더). 다른 티켓의 신호·기록은 건드리지 않는다. 임시 파일은 STATE/scratch/<KEY>/ 에 둔다.\n\n이 실행이 막혀서 멈췄다. 코드·브랜치는 건드리지 않는다. 앞 단계 산출물과 STATE/blocked/<KEY>*.md 를 모아, STATE/blocked/<KEY>.md 가 없으면 쓰고(첫 줄 제목, 둘째 줄 빈 줄, 셋째 줄 한 줄 요약) 기록 파일의 `## 미확인 사항` 에 막힌 지점을 남긴다. 사용자가 무엇을 결정·확인해야 다시 진행할 수 있는지 3줄로 보고한다.",
+        "kind": "worker",
+        "effort": "low",
+        "join": "any"
+      }
+    },
+    {
+      "id": "cleanup",
+      "type": "stage",
+      "position": {
+        "x": 1822.331005380553,
+        "y": 1237.7859271870338
+      },
+      "parentId": "wt",
+      "data": {
+        "label": "워크트리 정리",
+        "description": "공통 — 먼저 같은 산출물 폴더의 준비 산출물 `<실행 번호>-prepare.txt` 를 읽어 parent·key·round·reopen·state_dir(아래 STATE)·record_file·설정 값을 확인한다. 상태 디렉터리 규칙은 `~/.claude/skills/qa-ticket-driver/exports/state-contract.md` 가, 단계별 세부 절차는 `~/.claude/skills/qa-ticket-driver/references/brief-coordinator.md` 가 정본이다(@@KEY@@ 등 자리는 준비 산출물 값, @@STATE_DIR@@ 은 STATE, @@RECORD_DIR@@ 은 record_file 의 폴더). 다른 티켓의 신호·기록은 건드리지 않는다. 임시 파일은 STATE/scratch/<KEY>/ 에 둔다.\n\n머지가 끝난 티켓의 워크트리를 정리한다. `~/.claude/skills/qa-ticket-driver/bin/qa-driver cleanup <parent> <KEY> --dry-run` 으로 확인하고, 남길 것(커밋하지 않은 변경·머지되지 않은 커밋)이 없을 때만 `qa-driver cleanup <parent> <KEY>` 로 서브모듈 deinit·워크트리 삭제·cleaned/<KEY> 기록을 한다. 남길 것이 있으면 지우지 않고 사유를 보고한다. --force 는 쓰지 않는다.",
+        "kind": "worker",
+        "effort": "low"
+      }
+    }
+  ],
+  "edges": [
+    {
+      "id": "prepare--ready-to-go",
+      "source": "prepare",
+      "target": "ready-to-go"
+    },
+    {
+      "id": "ready-to-go--analyze--go",
+      "source": "ready-to-go",
+      "target": "analyze",
+      "sourceHandle": "go"
+    },
+    {
+      "id": "analyze--direction",
+      "source": "analyze",
+      "target": "direction"
+    },
+    {
+      "id": "direction--direction-gate--ask",
+      "source": "direction",
+      "target": "direction-gate",
+      "sourceHandle": "ask"
+    },
+    {
+      "id": "direction--implement--auto",
+      "source": "direction",
+      "target": "implement",
+      "sourceHandle": "auto"
+    },
+    {
+      "id": "direction-gate--implement",
+      "source": "direction-gate",
+      "target": "implement"
+    },
+    {
+      "id": "implement--review",
+      "source": "implement",
+      "target": "review"
+    },
+    {
+      "id": "review--review-result",
+      "source": "review",
+      "target": "review-result"
+    },
+    {
+      "id": "review-result--screen--screen",
+      "source": "review-result",
+      "target": "screen",
+      "sourceHandle": "screen"
+    },
+    {
+      "id": "screen--screen-result",
+      "source": "screen",
+      "target": "screen-result"
+    },
+    {
+      "id": "review-result--ready--no-screen",
+      "source": "review-result",
+      "target": "ready",
+      "sourceHandle": "no-screen"
+    },
+    {
+      "id": "screen-result--ready--pass",
+      "source": "screen-result",
+      "target": "ready",
+      "sourceHandle": "pass"
+    },
+    {
+      "id": "ready--deliver-gate",
+      "source": "ready",
+      "target": "deliver-gate"
+    },
+    {
+      "id": "deliver-gate--deliver",
+      "source": "deliver-gate",
+      "target": "deliver"
+    },
+    {
+      "id": "deliver--merge-gate",
+      "source": "deliver",
+      "target": "merge-gate"
+    },
+    {
+      "id": "merge-gate--merge",
+      "source": "merge-gate",
+      "target": "merge"
+    },
+    {
+      "id": "merge--merge-result",
+      "source": "merge",
+      "target": "merge-result"
+    },
+    {
+      "id": "direction--blocked--blocked",
+      "source": "direction",
+      "target": "blocked",
+      "sourceHandle": "blocked"
+    },
+    {
+      "id": "merge-result--blocked--blocked",
+      "source": "merge-result",
+      "target": "blocked",
+      "sourceHandle": "blocked"
+    },
+    {
+      "id": "merge-result--cleanup--merged",
+      "source": "merge-result",
+      "target": "cleanup",
+      "sourceHandle": "merged"
+    },
+    {
+      "id": "review-result--implement--loop",
+      "source": "review-result",
+      "target": "implement",
+      "sourceHandle": "fix",
+      "loop": {
+        "max": 3,
+        "exit": "stop"
+      }
+    },
+    {
+      "id": "review-result--blocked--stop",
+      "source": "review-result",
+      "target": "blocked",
+      "sourceHandle": "stop"
+    },
+    {
+      "id": "screen-result--implement--loop",
+      "source": "screen-result",
+      "target": "implement",
+      "sourceHandle": "fail",
+      "loop": {
+        "max": 3,
+        "exit": "stop"
+      }
+    },
+    {
+      "id": "screen-result--blocked--stop",
+      "source": "screen-result",
+      "target": "blocked",
+      "sourceHandle": "stop"
+    }
+  ],
+  "variables": [
+    {
+      "key": "epic",
+      "label": "QA 에픽",
+      "description": "QA 부모 에픽 티켓 키나 링크. 선별 플로가 넘긴다. 손으로 돌릴 때 비우면 claimed 기록으로 찾는다."
+    }
+  ],
+  "cleanup": {
+    "coordinator": true,
+    "worktrees": false,
+    "sessions": true
+  }
+}

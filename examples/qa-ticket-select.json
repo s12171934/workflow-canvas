@@ -1,0 +1,109 @@
+{
+  "version": 1,
+  "id": "qa-ticket-select",
+  "name": "QA 티켓 선별",
+  "description": "qa-ticket-driver 의 드라이버 회차. 설정값 「QA 에픽」의 신규·재오픈 하위 티켓을 claim 하고, 「항목마다 따로 실행」 링크로 티켓마다 「QA 티켓 해결」을 따로 실행한다(항목 = 티켓 키, 에픽 값도 함께 넘어간다). TC 시트를 주면 진행도도 갱신한다. 에픽마다 「자동화로 예약」으로 주기 실행한다.",
+  "runId": "",
+  "nodes": [
+    {
+      "id": "pick",
+      "type": "stage",
+      "position": {
+        "x": 0,
+        "y": 0
+      },
+      "data": {
+        "label": "티켓 선별·claim",
+        "description": "에픽 키 = 설정값 「QA 에픽」(`{{epic}}`). 링크(…/browse/ABC-100)로 주어졌으면 마지막 경로의 키(ABC-100)를 쓴다. 아래 <EPIC> 은 그 키, <epic> 은 소문자다.\n\nQA 부모 에픽 <EPIC> 에서 이번 회차에 새로 처리할 하위 티켓을 고르고 claim 한다. 티켓을 직접 분석·수정하지 않고, 실행 요청도 하지 않는다(다음 링크 단계가 한다).\n\n0. STATE = ~/.qa-driver/<epic>/ (qa-ticket-driver 형식). 없거나 config.env 필수 키(JIRA_SITE·JIRA_EMAIL·QA_REPO·QA_STATUS_NEW·QA_STATUS_REOPEN)가 비었거나 QA_AUTO_HANDOFF 가 yes/no 가 아니면 claim 하지 않고 빠진 키를 보고한다. 같은 에픽을 부르는 qa-driver 자동화가 켜져 있으면(`orca automations list`) 역시 멈추고 알린다 — 두 경로가 같은 티켓을 claim 한다. 이 실행의 프로젝트가 QA_REPO 와 다르면 멈추고 알린다(따로 띄울 해결 실행이 이 프로젝트에서 돈다).\n1. 후보: `~/.claude/skills/qa-ticket-driver/bin/qa-driver run <EPIC> --dry-run` 의 `기동 예정:` 줄(신규·재오픈, ignored·처리한 회차·동시 상한 QA_MAX_ACTIVE·회차 상한 QA_MAX_NEW_PER_RUN 반영, `(재기동)` = 재오픈). 20개를 넘으면 앞의 20개만.\n2. claim — `mkdir STATE/scratch/canvas-claim.lock` 이 성공할 때만 진행한다(실패하면 2초 간격 재시도, 60초가 넘으면 이번 회차는 claim 없이 끝낸다). 잠금 안에서 후보마다 `STATE/claimed/<KEY>` 마지막 줄의 epoch 가 1의 조회 시각보다 늦으면(그새 다른 쪽이 claim) 건너뛰고, 아니면 `<ISO 시각>\\t<epoch>\\tcanvas-select:$ORCA_TERMINAL_HANDLE\\t<제목>` 한 줄을 덧붙인다. 끝나면 잠금 디렉터리를 지운다.\n3. 산출물에 claim 한 티켓마다 `<KEY> <신규|재오픈> <제목>` 한 줄, 건너뛴 후보는 사유와 함께 적는다.\n\n보고하는 항목(items)은 이번에 claim 한 티켓 키들이다. claim 한 것이 없으면 빈 목록이다.",
+        "kind": "worker",
+        "effort": "medium"
+      }
+    },
+    {
+      "id": "solve",
+      "type": "stage",
+      "position": {
+        "x": 330,
+        "y": 0
+      },
+      "data": {
+        "label": "티켓마다 해결 실행",
+        "description": "claim 한 티켓마다 「QA 티켓 해결」을 따로 실행한다. 이 실행은 요청까지만 하고 해결 실행을 기다리지 않는다.",
+        "kind": "workflow",
+        "workflowId": "qa-ticket-solve",
+        "linkMode": "spawn"
+      }
+    },
+    {
+      "id": "wrap",
+      "type": "stage",
+      "position": {
+        "x": 660,
+        "y": 0
+      },
+      "data": {
+        "label": "요청 결과 정리",
+        "description": "에픽 키 = 설정값 「QA 에픽」(`{{epic}}`). 링크(…/browse/ABC-100)로 주어졌으면 마지막 경로의 키(ABC-100)를 쓴다. 아래 <EPIC> 은 그 키, <epic> 은 소문자다.\n\n링크 단계가 티켓마다 「QA 티켓 해결」 실행을 요청한 결과를 정리한다. 코드는 건드리지 않는다.\n\n1. 같은 산출물 폴더의 `<실행 번호>-pick.txt`(claim 목록)와 `<실행 번호>-solve.txt`(링크 단계가 쓴 요청 결과 — 항목마다 status requested·already·failed 와 error)를 읽는다. STATE 는 pick 산출물의 상태 디렉터리(~/.qa-driver/<epic>/)다.\n2. failed 인 티켓은 이번 회차 pick 단계가 `STATE/claimed/<KEY>` 에 덧붙인 마지막 줄(`canvas-select:` 이고 이 실행의 시각)을 지워 다음 회차가 다시 고르게 한다. 다른 줄은 건드리지 않는다. error 가 「같은 입력」 이면 그 티켓은 이미 해결 실행이 진행 중이므로 claim 을 지우지 말고 그대로 둔다.\n3. 산출물과 터미널에 티켓마다 한 줄 `<KEY> → 실행 요청됨 | 이미 요청됨 | 이미 진행 중 | 실패(사유, claim 되돌림)` 과 마지막 줄 `요청 n건 · 실패 k건` 을 쓴다. 처리할 티켓이 없었으면 「처리할 티켓 없음」 한 줄.",
+        "kind": "worker",
+        "effort": "low"
+      }
+    },
+    {
+      "id": "setup",
+      "type": "stage",
+      "position": {
+        "x": 0,
+        "y": 260
+      },
+      "data": {
+        "label": "설정 체크리스트",
+        "description": "에픽마다 한 번:\n1. `~/.claude/skills/qa-ticket-driver/bin/qa-driver init <EPIC>` 로 ~/.qa-driver/<epic>/ 을 만들고 config.env(JIRA_SITE·JIRA_EMAIL·QA_REPO·QA_STATUS_NEW·QA_STATUS_REOPEN·QA_AUTO_HANDOFF·QA_TICKET_SKILLS·QA_SCREEN_SKILLS·QA_RECORD_DIR·QA_JIRA_TOKEN_KEYCHAIN_SERVICE·QA_MAX_ACTIVE)와 context.md 를 채운다. QA_AUTO_HANDOFF 는 추측하지 말고 직접 정한다.\n2. `qa-driver run <EPIC> --dry-run` 이 후보를 내는지 확인한다.\n3. QA_REPO 를 Orca 에 프로젝트로 열어 두고, 실행 프로젝트도 그 저장소로 고른다 — 링크가 띄우는 해결 실행도 같은 프로젝트에서 돈다.\n4. 같은 에픽에 qa-driver 자동화가 켜져 있으면 끈다.\n5. 실행 창 → 설정값 「QA 에픽」(필수)·「TC 스프레드시트」(선택)를 넣고 「자동화로 예약」(예: */10 * * * *). 에픽마다 자동화를 하나씩 만들면 서로 막지 않고 동시에 돈다. 예약 시각에 캔버스 서버(127.0.0.1:4318)가 떠 있어야 한다.\n6. TC 시트를 쓰면 agent-dashboard 의 server/prefs.json `qa_sets` 에 이 에픽의 `sheet` 링크를 넣고 대시보드를 재시작한다(qa-ticket-driver SKILL.md 설정 5).\n\n할 일이 없는 회차에도 코디네이터와 선별 워커가 한 번씩 뜬다(캔버스 자동화에 아직 precheck 가 없다).",
+        "kind": "note"
+      }
+    },
+    {
+      "id": "sheet",
+      "type": "stage",
+      "position": {
+        "x": 328.3381818181818,
+        "y": -211.63272727272727
+      },
+      "data": {
+        "label": "TC 시트 진행도 갱신",
+        "description": "TC 스프레드시트의 「Test Summary」 탭을 agent-dashboard 에 넘겨 QA 진행도를 갱신한다. 코드와 시트는 고치지 않는다.\n\nTC 시트 링크: {{tc_sheet}}\n에픽: {{epic}} (링크면 마지막 경로의 키. 아래 <EPIC>)\n\n1. 위 TC 시트 링크 자리가 중괄호 그대로(값이 주어지지 않음)면 아무것도 하지 않고 「TC 시트 없음 — 건너뜀」 한 줄을 보고하고 끝낸다.\n2. 링크의 `/d/<fileId>/` 에서 fileId 를 뽑는다.\n3. Google Drive 커넥터의 download_file_content 를 그 fileId 로(exportMimeType 없이) 호출하고, 받은 content 문자열을 그대로 `<agent-dashboard 체크아웃>/server/aqa sheet <EPIC> -` 의 표준 입력으로 넘긴다.\n4. aqa 의 출력 한 줄을 산출물과 터미널에 보고한다. 커넥터가 없거나 실패하면 사유를 보고하고 끝낸다 — 티켓 선별은 이 단계와 무관하게 진행된다.",
+        "kind": "worker",
+        "effort": "low"
+      }
+    }
+  ],
+  "edges": [
+    {
+      "id": "pick--solve",
+      "source": "pick",
+      "target": "solve"
+    },
+    {
+      "id": "solve--wrap",
+      "source": "solve",
+      "target": "wrap"
+    }
+  ],
+  "variables": [
+    {
+      "key": "epic",
+      "label": "QA 에픽",
+      "description": "QA 부모 에픽 티켓 키나 링크 (예: ABC-100 또는 https://<사이트>.atlassian.net/browse/ABC-100)",
+      "required": true
+    },
+    {
+      "key": "tc_sheet",
+      "label": "TC 스프레드시트",
+      "description": "QA 진행도를 대시보드에 띄울 TC 시트 링크(Google Sheets). 비우면 시트 갱신을 건너뛴다. 첫 탭이 「Test Summary」 양식이어야 한다."
+    }
+  ],
+  "cleanup": {
+    "coordinator": true,
+    "worktrees": false,
+    "sessions": true
+  }
+}
