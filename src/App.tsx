@@ -18,6 +18,8 @@ import {
 } from './model';
 import { RunLogDialog } from './RunLog';
 
+/** Background tabs skip Orca polls: each one costs the server CLI processes. */
+const hidden = () => typeof document !== 'undefined' && document.visibilityState === 'hidden';
 async function api<T>(url: string, options?: RequestInit): Promise<T> {
   const response = await fetch(url, { ...options, headers: { 'Content-Type': 'application/json', ...options?.headers } });
   const result = await response.json();
@@ -414,6 +416,8 @@ function Workspace() {
     let timer: ReturnType<typeof setTimeout>;
     const controller = new AbortController();
     async function refresh() {
+      // A hidden tab still loads once (startup), then waits: every Orca read starts a CLI process on the server.
+      if (restored.current && hidden()) { timer = setTimeout(refresh, 15000); return; }
       const results = await Promise.allSettled([
         api<{ connected: boolean; version: string }>('/api/status', { signal: controller.signal }),
         api<RunSummary[]>('/api/runs', { signal: controller.signal }),
@@ -451,18 +455,20 @@ function Workspace() {
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout>;
     const controller = new AbortController();
+    let first = true;
     async function refresh() {
-      try {
+      if (first || !hidden()) try {
         const result = await api<RunSnapshot>(`/api/runs/${encodeURIComponent(workflow.runId)}`, { signal: controller.signal });
         if (!cancelled) { setSnapshot(result); setSnapshotError(''); }
       } catch (error) { if (!cancelled) setSnapshotError((error as Error).message); }
-      if (!cancelled) timer = setTimeout(refresh, 3000);
+      first = false;
+      if (!cancelled) timer = setTimeout(refresh, 5000);
     }
     void refresh();
     return () => { cancelled = true; controller.abort(); clearTimeout(timer); };
   }, [workflow.runId]);
 
-  // The other Runs: polled like the selected one until every execution in them has finished, then left as last seen.
+  // The other Runs: polled (less often than the selected one) until every execution in them has finished, then left as last seen.
   const executionsRef = useRef(executions);
   executionsRef.current = executions;
   const nodesRef = useRef(nodes);
@@ -476,7 +482,10 @@ function Workspace() {
     let timer: ReturnType<typeof setTimeout>;
     const controller = new AbortController();
     const settled = new Set<string>();
+    let first = true;
     async function refresh() {
+      if (!first && hidden()) { timer = setTimeout(refresh, 10000); return; }
+      first = false;
       await Promise.all(runIds.filter((runId) => !settled.has(runId)).map(async (runId) => {
         try {
           const result = await api<RunSnapshot>(`/api/runs/${encodeURIComponent(runId)}`, { signal: controller.signal });
@@ -486,7 +495,7 @@ function Workspace() {
           if (mine.every((execution) => executionFinished(computeExecutionStatuses(nodesRef.current, execution, result, false)))) settled.add(runId);
         } catch { /* keep the last snapshot; Tasks never seen read as 상태 미확인 */ }
       }));
-      if (!cancelled && settled.size < runIds.length) timer = setTimeout(refresh, 3000);
+      if (!cancelled && settled.size < runIds.length) timer = setTimeout(refresh, 10000);
     }
     void refresh();
     return () => { cancelled = true; controller.abort(); clearTimeout(timer); };
@@ -534,11 +543,13 @@ function Workspace() {
     if (!workflow.automations?.length) { setAutomationStates({}); return; }
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout>;
+    let first = true;
     async function refresh() {
-      try {
+      if (first || !hidden()) try {
         const result = await api<{ automations: (AutomationConfig & { state: AutomationState | null })[] }>(`/api/workflows/${workflow.id}/automations`);
         if (!cancelled) setAutomationStates(Object.fromEntries(result.automations.map((item) => [item.id, item.state])));
       } catch { /* keep the last view */ }
+      first = false;
       if (!cancelled) timer = setTimeout(refresh, 30000);
     }
     void refresh();

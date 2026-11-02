@@ -12,21 +12,83 @@ export function commandForEnvironment(env: NodeJS.ProcessEnv = process.env): str
   return process.platform === 'linux' && !env.ORCA_TERMINAL_HANDLE && !env.ORCA_WORKSPACE_ID ? 'orca-ide' : 'orca';
 }
 
-export const orcaCommand: Command = async (args) => {
+/** Each CLI call starts a whole Orca (Electron) process: under load, unbounded parallel calls starve each other past the timeout. */
+export const maxConcurrentCalls = 4;
+export const callTimeoutMs = 12_000;
+
+/** Runs at most `limit` tasks at a time, first come first served. The wait in line does not count toward a call's timeout. */
+export function createLimiter(limit: number) {
+  let running = 0;
+  const waiting: (() => void)[] = [];
+  return async function limited<T>(task: () => Promise<T>): Promise<T> {
+    if (running >= limit) await new Promise<void>((resolve) => waiting.push(resolve));
+    else running++;
+    try { return await task(); }
+    finally { const next = waiting.shift(); if (next) next(); else running--; }
+  };
+}
+const limited = createLimiter(maxConcurrentCalls);
+
+/** Slow calls are logged (command words and timings only, never arguments that could carry paths or task text). */
+const slowCallMs = 3000;
+let queued = 0;
+export const orcaCommand: Command = (args) => {
+  const asked = Date.now();
+  queued++;
+  return limited(async () => {
+  const started = Date.now();
+  const waiting = --queued;
+  let outcome = 'ok';
   try {
     const { stdout } = await exec(commandForEnvironment(), [...args, '--json'], {
-      timeout: 12000, maxBuffer: 8 * 1024 * 1024, windowsHide: true,
+      timeout: callTimeoutMs, maxBuffer: 8 * 1024 * 1024, windowsHide: true,
     });
     const response = JSON.parse(stdout);
     if (response.ok !== true || !response.result) throw new Error(response.error?.message ?? 'Orca 응답을 확인할 수 없습니다.');
     return response.result;
   } catch (error) {
     // Never return raw stdout/stderr: these can contain local paths or task contents.
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code === 'ENOENT') throw new Error('Orca CLI를 찾지 못했습니다. ORCA_CLI_COMMAND를 실행 파일 경로로 설정하세요.');
+    const failure = error as NodeJS.ErrnoException & { killed?: boolean; signal?: string };
+    if (failure.code === 'ENOENT') throw new Error('Orca CLI를 찾지 못했습니다. ORCA_CLI_COMMAND를 실행 파일 경로로 설정하세요.');
+    outcome = failure.killed || failure.signal === 'SIGTERM' ? 'timeout' : 'fail';
+    if (failure.killed || failure.signal === 'SIGTERM') throw new Error(`Orca CLI가 ${callTimeoutMs / 1000}초 안에 응답하지 않았습니다. 시스템 부하나 동시에 돌고 있는 에이전트 수를 확인하세요.`);
     throw new Error('Orca CLI 조회에 실패했습니다. Orca 앱 실행 상태와 CLI 버전을 확인하세요.');
+  } finally {
+    const done = Date.now();
+    if (done - asked >= slowCallMs) console.log(`[orca] ${new Date(done).toISOString()} ${args.slice(0, 2).join(' ')} wait=${((started - asked) / 1000).toFixed(1)}s run=${((done - started) / 1000).toFixed(1)}s queue=${waiting} ${outcome}`);
   }
+  });
 };
+
+/** How long a read is reused (`fresh`) and how long the last good value stands in for a failed read (`stale`). */
+export type CacheTimes = Partial<Record<'status' | 'locations' | 'runs' | 'automations' | 'snapshot', number>> & { staleMs?: number };
+export const defaultCacheTimes: CacheTimes = { status: 4000, locations: 10_000, runs: 30_000, automations: 10_000, snapshot: 2000, staleMs: 60_000 };
+
+/**
+ * Reads shared by the canvas polls, several tabs and the background watcher: one CLI call per key at a time (callers
+ * join the call in flight), reused for a short time, and on failure answered with the last good value while it is recent.
+ */
+function createReadCache(times: CacheTimes) {
+  const entries = new Map<string, { value?: unknown; at?: number; pending?: Promise<unknown> }>();
+  return {
+    read<T>(kind: Exclude<keyof CacheTimes, 'staleMs'>, key: string, load: () => Promise<T>, { stale = true } = {}): Promise<T> {
+      const id = `${kind}:${key}`;
+      const entry = entries.get(id) ?? {};
+      entries.set(id, entry);
+      if (entry.at !== undefined && Date.now() - entry.at < (times[kind] ?? 0)) return Promise.resolve(entry.value as T);
+      if (entry.pending) return entry.pending as Promise<T>;
+      const pending = load().then((value) => { entry.value = value; entry.at = Date.now(); return value; }, (error) => {
+        if (stale && entry.at !== undefined && Date.now() - entry.at < (times.staleMs ?? 0)) return entry.value as T;
+        throw error;
+      }).finally(() => { entry.pending = undefined; });
+      entry.pending = pending;
+      return pending;
+    },
+    forget(kind: Exclude<keyof CacheTimes, 'staleMs'>) {
+      for (const id of entries.keys()) if (id.startsWith(`${kind}:`)) entries.delete(id);
+    },
+  };
+}
 
 function runSummary(row: Row): RunSummary {
   return { id: String(row.id), objective: String(row.objective ?? 'Untitled run'), updatedAt: String(row.updated_at ?? '') };
@@ -50,15 +112,18 @@ function normalizeWorker(row: Row): WorkerSummary {
     terminalState: typeof row.terminalState === 'string' ? row.terminalState : undefined };
 }
 
-export function createOrcaBridge(command: Command = orcaCommand) {
+/** Injected commands (tests) get no reuse window unless they ask for one; calls in flight are always joined. */
+export function createOrcaBridge(command: Command = orcaCommand, cacheTimes: CacheTimes = command === orcaCommand ? defaultCacheTimes : {}) {
+  const cache = createReadCache(cacheTimes);
   const bridge = {
     async status() {
-      const result = await command(['status']);
+      const result = await cache.read('status', '', () => command(['status']), { stale: false });
       return { connected: result.runtime?.reachable === true && result.runtime?.state === 'ready',
         version: String(result.runtime?.appVersion ?? ''), observedAt: new Date().toISOString() };
     },
     /** Projects (repos) open in Orca and their worktrees, for group nodes. Paths only; no git state. */
-    async locations(): Promise<Locations> {
+    locations(): Promise<Locations> { return cache.read('locations', '', () => bridge.loadLocations()); },
+    async loadLocations(): Promise<Locations> {
       const [repos, worktrees] = await Promise.all([command(['repo', 'list']), command(['worktree', 'list', '--limit', '500'])]);
       const absolute = (value: unknown): value is string => typeof value === 'string' && value.startsWith('/') && !/[\u0000-\u001f]/.test(value);
       return {
@@ -69,7 +134,8 @@ export function createOrcaBridge(command: Command = orcaCommand) {
           branch: typeof row.branch === 'string' ? row.branch.replace(/^refs\/heads\//, '') : undefined })),
       };
     },
-    async automations(): Promise<AutomationState[]> {
+    automations(): Promise<AutomationState[]> { return cache.read('automations', '', () => bridge.loadAutomations()); },
+    async loadAutomations(): Promise<AutomationState[]> {
       const result = await command(['automations', 'list']);
       return (result.automations ?? []).map((row: Row) => ({ orcaId: String(row.id), name: String(row.name ?? ''), enabled: row.enabled === true,
         ...(typeof row.nextRunAt === 'number' ? { nextRunAt: row.nextRunAt } : {}), ...(typeof row.lastRunAt === 'number' ? { lastRunAt: row.lastRunAt } : {}),
@@ -81,18 +147,22 @@ export function createOrcaBridge(command: Command = orcaCommand) {
         ...(input.time ? ['--time', input.time] : []), ...(input.day !== undefined ? ['--day', String(input.day)] : []),
         '--prompt', input.prompt, '--provider', 'claude', '--repo', `path:${input.project}`, '--workspace-mode', 'existing', '--fresh-session', '--enabled']);
       const id = result.automation?.id ?? result.id;
+      cache.forget('automations');
       if (typeof id !== 'string' || !/^[a-zA-Z0-9-]{1,128}$/.test(id)) throw new Error('Orca가 만든 자동화의 ID를 확인할 수 없습니다.');
       return id;
     },
     async runAutomation(orcaId: string) {
       if (!/^[a-zA-Z0-9-]{1,128}$/.test(orcaId)) throw new Error('올바르지 않은 자동화 ID입니다.');
       await command(['automations', 'run', orcaId]);
+      cache.forget('automations');
     },
     async removeAutomation(orcaId: string) {
       if (!/^[a-zA-Z0-9-]{1,128}$/.test(orcaId)) throw new Error('올바르지 않은 자동화 ID입니다.');
       await command(['automations', 'remove', orcaId]);
+      cache.forget('automations');
     },
-    async runs(): Promise<RunSummary[]> {
+    runs(): Promise<RunSummary[]> { return cache.read('runs', '', () => bridge.loadRuns()); },
+    async loadRuns(): Promise<RunSummary[]> {
       const runs: RunSummary[] = [];
       let cursor: unknown;
       const visited = new Set<string>();
@@ -107,6 +177,9 @@ export function createOrcaBridge(command: Command = orcaCommand) {
     },
     async snapshot(runId: string): Promise<RunSnapshot> {
       if (!/^[a-zA-Z0-9_-]{1,128}$/.test(runId)) throw new Error('올바르지 않은 Run ID입니다.');
+      return cache.read('snapshot', runId, () => bridge.loadSnapshot(runId));
+    },
+    async loadSnapshot(runId: string): Promise<RunSnapshot> {
       const [detail, tasks] = await Promise.all([
         command(['orchestration', 'run-show', '--id', runId]),
         command(['orchestration', 'task-list', '--run', runId]),
@@ -148,7 +221,9 @@ export function createOrcaBridge(command: Command = orcaCommand) {
     },
     async openTask(runId: string, taskId: string): Promise<{ opened: boolean; reason?: string }> {
       if (!/^[a-zA-Z0-9_-]{1,128}$/.test(taskId)) throw new Error('올바르지 않은 Task ID입니다.');
-      const snapshot = await bridge.snapshot(runId);
+      if (!/^[a-zA-Z0-9_-]{1,128}$/.test(runId)) throw new Error('올바르지 않은 Run ID입니다.');
+      // Read fresh, never a reused or stand-in snapshot: an older one could point at a released attempt.
+      const snapshot = await bridge.loadSnapshot(runId);
       // worker-list returns newest attempts first; never open an older attempt's terminal.
       const latest = snapshot.workers.find((worker) => worker.taskId === taskId);
       if (!latest) return { opened: false, reason: '이 Task에는 아직 워커가 없습니다.' };
