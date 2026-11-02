@@ -34,6 +34,11 @@ const limited = createLimiter(maxConcurrentCalls);
 /** Slow calls are logged (command words and timings only, never arguments that could carry paths or task text). */
 const slowCallMs = 3000;
 let queued = 0;
+/** Orca's machine error code (e.g. terminal_handle_stale) from a failed JSON response, if it gave one. */
+function errorCode(response: { error?: { code?: unknown } } | undefined): string | undefined {
+  const code = response?.error?.code;
+  return typeof code === 'string' && /^[a-z0-9_]{1,64}$/.test(code) ? code : undefined;
+}
 export const orcaCommand: Command = (args, options) => {
   const asked = Date.now();
   const timeoutMs = options?.timeoutMs ?? callTimeoutMs;
@@ -48,15 +53,18 @@ export const orcaCommand: Command = (args, options) => {
       timeout: timeoutMs, maxBuffer: 8 * 1024 * 1024, windowsHide: true,
     });
     const response = JSON.parse(stdout);
-    if (response.ok !== true || !response.result) throw new Error(response.error?.message ?? 'Orca 응답을 확인할 수 없습니다.');
+    if (response.ok !== true || !response.result) throw Object.assign(new Error(response.error?.message ?? 'Orca 응답을 확인할 수 없습니다.'), { orcaCode: errorCode(response) });
     return response.result;
   } catch (error) {
-    // Never return raw stdout/stderr: these can contain local paths or task contents.
-    const failure = error as NodeJS.ErrnoException & { killed?: boolean; signal?: string };
+    // Never return raw stdout/stderr: these can contain local paths or task contents. Only Orca's error code is kept.
+    const failure = error as NodeJS.ErrnoException & { killed?: boolean; signal?: string; stdout?: string; orcaCode?: string };
+    if (failure.orcaCode !== undefined) { outcome = 'fail'; throw error; }
+    let orcaCode: string | undefined;
+    try { orcaCode = errorCode(JSON.parse(failure.stdout ?? '')); } catch { /* not JSON */ }
     if (failure.code === 'ENOENT') throw new Error('Orca CLI를 찾지 못했습니다. ORCA_CLI_COMMAND를 실행 파일 경로로 설정하세요.');
     outcome = failure.killed || failure.signal === 'SIGTERM' ? 'timeout' : 'fail';
     if (failure.killed || failure.signal === 'SIGTERM') throw new Error(`Orca CLI가 ${timeoutMs / 1000}초 안에 응답하지 않았습니다. 시스템 부하나 동시에 돌고 있는 에이전트 수를 확인하세요.`);
-    throw new Error('Orca CLI 조회에 실패했습니다. Orca 앱 실행 상태와 CLI 버전을 확인하세요.');
+    throw Object.assign(new Error('Orca CLI 조회에 실패했습니다. Orca 앱 실행 상태와 CLI 버전을 확인하세요.'), orcaCode ? { orcaCode } : {});
   } finally {
     const done = Date.now();
     if (done - asked >= slowCallMs) console.log(`[orca] ${new Date(done).toISOString()} ${args.slice(0, 2).join(' ')} wait=${((started - asked) / 1000).toFixed(1)}s run=${((done - started) / 1000).toFixed(1)}s queue=${waiting} ${outcome}`);
@@ -238,6 +246,23 @@ export function createOrcaBridge(command: Command = orcaCommand, cacheTimes: Cac
       const result = await command(['agent', 'launch', '--agent', 'claude', '--model', 'claude-opus-5-5',
         '--worktree', `path:${workspaceRoot}`, '--prompt', prompt]);
       return { terminal: JSON.stringify(result).match(/term_[a-zA-Z0-9-]{1,128}/)?.[0] };
+    },
+    /** Whether a terminal is still open in Orca. */
+    async terminalOpen(terminal: string): Promise<boolean> {
+      if (!/^term_[a-zA-Z0-9-]{1,128}$/.test(terminal)) return false;
+      try {
+        const result = await command(['terminal', 'show', '--terminal', terminal]);
+        return result?.terminal?.handle === terminal;
+      } catch (error) {
+        // A closed terminal's handle is stale; anything else (Orca unreachable) is not an answer.
+        const code = (error as { orcaCode?: string }).orcaCode;
+        if (code && /stale|not_found/.test(code)) return false;
+        throw error;
+      }
+    },
+    async closeTerminal(terminal: string) {
+      if (!/^term_[a-zA-Z0-9-]{1,128}$/.test(terminal)) return;
+      await command(['terminal', 'close', '--terminal', terminal]);
     },
     async renameTerminal(terminal: string, title: string) {
       if (!/^term_[a-zA-Z0-9-]{1,128}$/.test(terminal)) return;

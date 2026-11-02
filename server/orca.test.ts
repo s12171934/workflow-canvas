@@ -102,3 +102,12 @@ test('injected commands get no reuse window by default, but calls in flight are 
   await bridge.status();
   assert.equal(calls, 2);
 });
+test('a closed terminal reads as closed; an unreachable Orca is not an answer', async () => {
+  const stale = createOrcaBridge(async () => { throw Object.assign(new Error('x'), { orcaCode: 'terminal_handle_stale' }); });
+  assert.equal(await stale.terminalOpen('term_gone'), false);
+  const open = createOrcaBridge(async () => ({ terminal: { handle: 'term_live' } }));
+  assert.equal(await open.terminalOpen('term_live'), true);
+  const down = createOrcaBridge(async () => { throw new Error('Orca CLI 조회에 실패했습니다.'); });
+  await assert.rejects(down.terminalOpen('term_live'));
+  assert.equal(await open.terminalOpen('not a handle'), false);
+});

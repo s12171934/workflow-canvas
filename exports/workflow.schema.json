@@ -261,9 +261,10 @@
               "asker": {
                 "enum": [
                   "coordinator",
-                  "previous"
+                  "previous",
+                  "auto"
                 ],
-                "description": "kind gate 전용. 사용자에게 묻는 곳. coordinator(기본): 캔버스 결정 대기 카드·코디네이터 터미널. previous: 앞에 연결된 워커 하나가 작업을 마친 뒤 자기 터미널에서 묻고 decision: approve|reject 로 보고한다(캔버스 카드에서도 고를 수 있다)."
+                "description": "kind gate 전용. 사용자에게 묻는 곳. coordinator(기본): 캔버스 결정 대기 카드·코디네이터 터미널. previous: 앞에 연결된 워커 하나가 작업을 마친 뒤 자기 터미널에서 묻고 decision: approve|reject 로 보고한다(캔버스 카드에서도 고를 수 있다). auto: 묻지 않고 앞 단계가 끝나면 코디네이터가 통과로 등록한다(실행 로그에 남는다)."
               },
               "linkMode": {
                 "enum": [

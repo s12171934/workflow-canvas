@@ -209,6 +209,29 @@ export function createRunLog(root: string) {
       return () => { stopped = true; clearTimeout(timer); };
     },
     async meta(id: string) { return readMeta(id); },
+    async patchMeta(id: string, patch: Partial<RunLogMeta>) {
+      const meta = await readMeta(id);
+      if (meta) await writeMeta(id, { ...meta, ...patch });
+    },
+    /**
+     * Recent launches whose run has ended but whose coordinator, told to close itself, may still be open: due once its
+     * closing report is a minute old, or `graceMs` after the run ended without one. Each is returned until it is marked.
+     */
+    async coordinatorsToClose(now: number, graceMs: number): Promise<{ id: string; terminal: string }[]> {
+      const due: { id: string; terminal: string }[] = [];
+      for (const id of await launches()) {
+        if (!recent(id)) continue;
+        const meta = await readMeta(id);
+        if (!meta?.closeCoordinator || !meta.coordinatorTerminal) continue;
+        const events = await readEvents(id);
+        const finished = lastOf(events, 'finished');
+        if (finished < 0 || lastOf(events, 'coordinator-closed') >= 0 || lastOf(events, 'task') > finished) continue;
+        const report = events.slice(finished).find((event) => event.type === 'report');
+        const since = (event: RunEvent) => now - Date.parse(event.at);
+        if (report ? since(report) >= 60_000 : since(events[finished]) >= graceMs) due.push({ id, terminal: meta.coordinatorTerminal });
+      }
+      return due;
+    },
     /** meta.json of the launch that owns a Run, if any. */
     async metaOfRun(runId: string) {
       await index();

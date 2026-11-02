@@ -906,3 +906,57 @@ test('the brief marks the coordinator worktree prepared only when the server sta
   assert.match(buildBrief(common), /"parentPath": "\/epic"/);
   assert.match(buildBrief({ ...common, preparedGroup: 'wt' }), /"prepared": true/);
 });
+test('a gate set to approve automatically is never asked: the coordinator registers approve and logs it', async () => {
+  const { buildBrief, checkBranches, flowOf } = await import('./execute.ts');
+  const { pendingDecisions } = await import('../src/model.ts');
+  const stage = (id: string, kind = 'worker', extra = {}) => ({ id, type: 'stage' as const, position: { x: 0, y: 0 }, data: { label: id, description: `${id} 지침`, kind, ...extra } });
+  const edge = (source: string, target: string) => ({ id: `${source}-${target}`, source, target });
+  const graph = { ...newWorkflow(), id: 'wf-auto', nodes: [stage('analyze'), stage('direction', 'gate', { asker: 'auto' }), stage('impl')],
+    edges: [edge('analyze', 'direction'), edge('direction', 'impl')] } as never as Parameters<typeof buildBrief>[0]['graph'];
+  checkBranches([graph]);
+  const brief = buildBrief({ graph, count: 1, apiBase: 'http://127.0.0.1:1', workspace: '/example/repo', artifactDir: '/tmp/x' });
+  const stages = JSON.parse(brief.match(/```json\n(\[[\s\S]*?\])\n```/)![1]) as { nodeId: string; branch?: { judge: string }; decides?: unknown[] }[];
+  assert.equal(stages[1].branch?.judge, 'auto');
+  assert.equal(stages[0].decides, undefined); // no worker asks it
+  assert.match(brief, /자동 승인 게이트\(kind `gate`, judge `auto`\)/);
+  // It never shows up as a decision waiting for the user.
+  const flow = flowOf(graph, new Map());
+  const execution = { id: 'e-1', label: '#1', bindings: { analyze: 'task-a', direction: 'task-d', impl: 'task-i' } };
+  const snapshot = { run: { id: 'run-a', objective: 'A', updatedAt: '' }, workers: [], observedAt: '',
+    tasks: [{ id: 'task-a', title: 'a', spec: '', status: 'completed', deps: [] }, { id: 'task-d', title: 'd', spec: '', status: 'pending', deps: [] }] };
+  assert.deepEqual(pendingDecisions(flow, execution, snapshot), []);
+});
+test('the brief makes the coordinator stop waiting on a dead worker and close itself once every run has ended', async () => {
+  const { buildBrief } = await import('./execute.ts');
+  const graph = { ...newWorkflow(), id: 'wf-close' } as never as Parameters<typeof buildBrief>[0]['graph'];
+  const brief = buildBrief({ graph, count: 1, apiBase: 'http://127.0.0.1:1', workspace: '/example/repo', artifactDir: '/tmp/x',
+    cleanup: { sessions: true, worktrees: false, coordinator: true } });
+  assert.match(brief, /\*\*죽은 워커\*\*/);
+  assert.match(brief, /실패한 단계·남은 확인·남긴 워크트리가 있어도 닫는다/);
+  assert.doesNotMatch(brief, /남은 것이 있으면 닫지 않고 사용자를 기다린다/);
+  assert.match(brief, /자기 `location` 워크트리를 지우거나/);
+  assert.match(brief, /판정이 이미 등록됐는지 본다/);
+});
+test('a coordinator still open after its run ended is due for closing: a minute after its report, or after the grace without one', async () => {
+  const { createRunLog } = await import('./runlog.ts');
+  const root = await mkdtemp(join(process.cwd(), '.tmp-runlog-'));
+  try {
+    const runlog = createRunLog(root);
+    const id = `${new Date().toISOString().replace(/[:.]/g, '-')}-wf-close`;
+    await mkdir(join(root, id));
+    await runlog.start(id, { workflowId: 'wf-close', workflowName: 'W', startedAt: new Date().toISOString(), closeCoordinator: true });
+    await runlog.patchMeta(id, { coordinatorTerminal: 'term_coord' });
+    const t0 = Date.now();
+    const at = (ms: number) => new Date(t0 + ms).toISOString();
+    await runlog.append(id, { at: at(0), type: 'task', taskId: 'task-a', status: 'completed', message: 'a' });
+    assert.deepEqual(await runlog.coordinatorsToClose(t0 + 3600_000, 600_000), []); // not finished yet
+    await runlog.append(id, { at: at(1000), type: 'finished', status: 'completed', message: '끝' });
+    assert.deepEqual(await runlog.coordinatorsToClose(t0 + 5 * 60_000, 600_000), []); // no report, within the grace
+    assert.deepEqual(await runlog.coordinatorsToClose(t0 + 11 * 60_000, 600_000), [{ id, terminal: 'term_coord' }]);
+    await runlog.append(id, { at: at(2000), type: 'report', message: '보고' });
+    assert.deepEqual(await runlog.coordinatorsToClose(t0 + 30_000, 600_000), []);
+    assert.deepEqual(await runlog.coordinatorsToClose(t0 + 63_000, 600_000), [{ id, terminal: 'term_coord' }]);
+    await runlog.append(id, { at: at(70_000), type: 'coordinator-closed', message: '닫음' });
+    assert.deepEqual(await runlog.coordinatorsToClose(t0 + 3600_000, 600_000), []);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});

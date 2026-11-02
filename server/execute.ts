@@ -267,7 +267,7 @@ function stagesOf(graph: Workflow, ctx: BriefContext, fallback: string, prefix =
           });
           return loops.length ? { loops } : {};
         })() } } : {}),
-      ...(node.data.kind === 'gate' ? { branch: { mode: 'exclusive', judge: node.data.asker === 'previous' ? 'previous' : 'user', outputs: gateOutputs } } : {}),
+      ...(node.data.kind === 'gate' ? { branch: { mode: 'exclusive', judge: node.data.asker === 'previous' ? 'previous' : node.data.asker === 'auto' ? 'auto' : 'user', outputs: gateOutputs } } : {}),
       ...(node.data.join === 'any' ? { join: 'any' as const } : {}),
       ...(() => {
         const decides = stageEdges.filter((edge) => edge.source === node.id).map((edge) => byId.get(edge.target)!)
@@ -305,7 +305,7 @@ function flatten(stages: BriefStage[]): FlowStage[] {
     ? expanded.get(stage.nodeId)!.map((item) => item.after.length ? item : { ...item, after: resolve(stage.after) })
     : [{ id: stage.nodeId, after: resolve(stage.after), label: stage.label, question: stage.instructions,
       ...(stage.branch ? { branch: { mode: stage.branch.mode as 'exclusive' | 'inclusive', outputs: stage.branch.outputs.map((output) => output.id) },
-        judge: stage.branch.judge as 'previous' | 'worker' | 'user', outputLabels: Object.fromEntries(stage.branch.outputs.map((output) => [output.id, output.label])) } : {}),
+        judge: stage.branch.judge as 'previous' | 'worker' | 'user' | 'auto', outputLabels: Object.fromEntries(stage.branch.outputs.map((output) => [output.id, output.label])) } : {}),
       ...(stage.kind === 'gate' ? { veto: ['reject'] } : {}), ...(stage.join ? { join: stage.join } : {}),
       ...(stage.branch?.loops ? { loops: stage.branch.loops } : {}) }]);
 }
@@ -368,7 +368,7 @@ ${graph.variables.map((item) => `  - \`${item.key}\` ${item.label}: ${settings[i
 - 단계 종류(\`kind\`):
   - \`worker\`: 워커 하나가 지침을 수행한다.
   - 들어오는 연결이 여럿인 단계: 기본은 **모두 필요**다. 앞 경로 중 하나라도 건너뛰어지면(고르지 않은 분기 출력, 건너뛴 단계) 이 단계도 건너뛴다. \`join: any\` 인 단계는 분기에서 갈라진 경로가 다시 모이는 곳이라 하나라도 오면 진행한다. 어느 쪽이든 건너뜀 계산은 캔버스가 하고, 너는 건너뛰지 않은 선행이 모두 끝났을 때 띄운다.
-  - \`gate\`: 사용자 개입 게이트. 워커를 띄우지 않는다. 출력이 \`approve\`(통과)·\`reject\`(거절) 두 개인 사용자 결정이다. 게이트에서 나가는 연결은 모두 \`approve\` 출력이다. \`branch.judge\` 가 \`user\` 면 코디네이터(캔버스 결정 대기 카드)가 묻고, \`previous\` 면 직전 워커가 자기 터미널에서 사용자에게 묻는다(그 워커의 \`decides\` 에 \`ask\` 로 들어 있다).
+  - \`gate\`: 사용자 개입 게이트. 워커를 띄우지 않는다. 출력이 \`approve\`(통과)·\`reject\`(거절) 두 개인 사용자 결정이다. 게이트에서 나가는 연결은 모두 \`approve\` 출력이다. \`branch.judge\` 가 \`user\` 면 코디네이터(캔버스 결정 대기 카드)가 묻고, \`previous\` 면 직전 워커가 자기 터미널에서 사용자에게 묻는다(그 워커의 \`decides\` 에 \`ask\` 로 들어 있다). \`auto\` 면 묻지 않는다 — 자동 승인 게이트다.
   - \`branch\`: 분기. 어느 출력으로 갈지 판정만 한다. \`branch.mode\` 가 \`exclusive\` 면 출력 하나, \`inclusive\` 면 조건에 맞는 출력 모두(하나 이상)를 고른다. \`branch.judge\` 가 판정 주체다: \`previous\` 직전 워커, \`worker\` 판정 전용 워커, \`user\` 사용자. \`after\` 항목에 \`output\` 이 있으면 그 분기가 그 출력을 골랐을 때만 이어지는 연결이다.
   - \`workflow\` 이고 \`spawn\` 이 있는 단계: **펼치지 않는다.** 대상 워크플로를 항목마다 **따로 실행 요청**하는 단계다. 워커를 띄우지 않는다. 아래 "항목마다 따로 실행" 을 따른다.
   - \`workflow\`: 다른 워크플로로의 링크. \`workflow.stages\` 를 그 자리에 펼쳐 실행한다. 펼친 첫 단계들은 링크의 선행 단계를 deps 로 갖는다. \`workflow.wait\` 가 \`true\` 면 링크의 후행 단계는 펼친 마지막 단계들을 deps 로 갖고(끝날 때까지 대기), \`false\` 면 펼친 단계를 기다리지 않고 링크의 선행 단계를 deps 로 갖는다(시작만 하고 진행. 펼친 단계는 따로 끝까지 돌고, 실행은 그것까지 끝나야 끝난다). 펼친 단계의 \`nodeId\` 는 \`<링크 nodeId>.<하위 nodeId>\` 꼴이다.
@@ -397,6 +397,7 @@ ${worktreeSection}
 5. \`check --wait --timeout-ms 30000\` 을 반복하며 각 \`worker_done\` 을 처리한다. 진행 규칙은 정해져 있다. 네가 조건을 해석해 바꾸지 않는다.
    - **병렬·합류**: 분기가 아닌 연결은 모두 병렬이다. 한 단계는 \`after\` 의 선행 단계 Task 가 **모두 completed** 일 때 띄운다(건너뜀으로 닫힌 Task 도 completed 다). 선행이 여럿이면 마지막 것이 끝날 때까지 기다린다.
    - 단계를 띄울 때 \`location\`·\`model\`·\`effort\` 가 모두 직전 단계와 같으면 같은 터미널을 재사용하고(\`--terminal\`), 하나라도 다르면 새로 띄운다(\`--worktree path:<location> --model <model> [--effort <effort>]\`. \`--model\`·\`--effort\` 는 \`--terminal\` 과 함께 쓸 수 없다). 탭 이름을 바꾼다. 이어서 띄울 단계가 없는 워커는 release 한다.
+   - **죽은 워커**: \`check\` 가 시간이 다 될 때마다 \`worker-list\` 로 진행 중(dispatched) Task 의 워커 터미널이 살아 있는지 본다. 터미널이 닫혔거나(exited·없음) 워크트리가 사라졌는데 worker_done 이 없으면 **더 기다리지 않는다.** 그 Task 를 \`task-update --status failed --result "<사유>"\` 로 닫고 실행 로그 \`error\` 에 남긴 뒤, 그 단계에 의존하는 단계는 띄우지 않는다(그 실행은 실패로 끝난다). 산출물 파일이 이미 있으면 사유에 경로를 적는다. 같은 단계를 다시 띄우지 않는다.
    - **워커 판정 분기(kind \`branch\`, judge \`previous\`·\`worker\`)**: 선행 단계가 끝나면 판정을 받는다.
      - \`previous\`: 직전 워커의 worker_done 첫 줄 \`decision: <출력 id>[,<출력 id>...]\` 를 쓴다. 분기 Task 에는 워커를 띄우지 않는다.
      - \`worker\`: 분기 Task 에 그 단계의 \`model\`·\`effort\` 로 워커를 띄운다. spec 은 분기 지침과 출력 목록(id·조건)이고, 근거로 선행 단계의 산출물을 읽게 한다. 그 워커의 worker_done 첫 줄 \`decision:\` 을 쓴다.
@@ -406,8 +407,10 @@ ${worktreeSection}
      - 워커의 worker_done 첫 줄 \`decision: approve|reject\` 를 "판정 등록" 으로 보내고 "판정 반영" 을 한다. 409 면 사용자가 캔버스에서 먼저 고른 것이므로 등록된 판정을 따른다.
      - 반복 중 등록된 판정을 확인할 때, 이런 게이트에 판정이 먼저 생겼으면(사용자가 캔버스 카드에서 고름) 그 워커에게 "사용자가 캔버스에서 <출력 id> 를 골랐다. 묻기를 멈추고 그 결정으로 worker_done 을 보내라" 를 메시지로 보낸다. 워커 보고를 기다렸다가 "판정 반영" 을 한다.
      - 워커가 \`decision:\` 없이 끝나면 추측하지 않고, 이 게이트를 아래 사용자 결정과 같은 방법으로 다시 묻는다.
+   - **자동 승인 게이트(kind \`gate\`, judge \`auto\`)**: 사용자가 묻지 않기로 정한 게이트다. 묻지 않고 게이트도 걸지 않는다. 선행 단계가 끝나면 곧바로 \`approve\` 를 "판정 등록" 으로 보내고 "판정 반영" 을 한 뒤, 실행 로그 \`gate\` 에 "<단계 이름> #<n>: 자동 승인" 을 남긴다. 등록이 409 면(사용자가 캔버스에서 먼저 고름) 등록된 판정을 따른다.
    - **사용자 결정(kind \`gate\` judge \`user\`, 그리고 judge \`user\` 인 \`branch\`)**: 자동으로 고르지 않는다. 그리고 **답을 기다리며 멈추지 않는다.** 결정은 여러 실행·여러 단계에서 서로 다른 시점에 생기므로, 하나를 묻고 기다리면 그동안 다른 워커 보고와 다른 결정이 모두 막힌다.
-     - 선행 단계가 끝나면 그 Task 에 \`gate-create\` 로 결정 게이트를 건다(질문은 단계 지침, 선택지는 \`branch.outputs\` 의 조건). 실행 로그에 \`gate\` 를 남기고, 이 터미널에 "결정 대기 · <단계 이름> #<n> · 캔버스에서 고르거나 여기에 답하세요" 한 줄을 출력한다.
+     - 선행 단계가 끝나면 먼저 아래 decisions 조회로 판정이 이미 등록됐는지 본다(대시보드 등 캔버스 밖에서 미리 고를 수 있다). 있으면 게이트를 걸지 않고 곧바로 "판정 반영" 을 한다.
+     - 없으면 그 Task 에 \`gate-create\` 로 결정 게이트를 건다(질문은 단계 지침, 선택지는 \`branch.outputs\` 의 조건). 실행 로그에 \`gate\` 를 남기고, 이 터미널에 "결정 대기 · <단계 이름> #<n> · 캔버스에서 고르거나 여기에 답하세요" 한 줄을 출력한다.
      - **질문 도구(AskUserQuestion 등)로 묻거나, 답을 받으려고 턴을 끝내지 않는다.** 곧바로 \`check --wait --timeout-ms 30000\` 반복으로 돌아간다.
      - 사용자는 캔버스의 결정 대기 카드에서 고른다. 캔버스가 판정을 등록한다. \`check\` 가 깨거나 시간이 다 될 때마다, 결정 대기 중인 실행마다 등록된 판정을 확인한다:
        \`\`\`sh
@@ -434,7 +437,7 @@ ${worktreeSection}
        --data '{"node":"<분기·게이트 nodeId>","outputs":["<출력 id>"]}'
      \`\`\`
    - **판정 반영**: \`skippedTasks\` 의 Task 를 모두 \`task-update --status completed --result skipped\` 로 닫고(합류 단계의 deps 를 풀기 위해서다. 캔버스는 이 Task 들을 건너뜀으로 표시한다. 이미 닫은 것은 넘어간다), 분기·게이트 Task 를 \`task-update --status completed --result "decision: <출력 id>"\` 로 닫은 뒤 진행 규칙대로 다음 단계를 띄운다. 게이트를 거절(\`reject\`)하면 뒤 단계가 모두 건너뜀이 된다.
-6. 모든 실행의 모든 단계가 completed(건너뜀 포함)가 되면 아래 "완료 시 정리" 를 따른 뒤 마무리 보고를 한다. 사용자 결정이 남아 있으면 끝내지 않고 5의 반복을 계속한다.
+6. 모든 실행이 끝나면(모든 단계가 completed(건너뜀 포함)이거나, 실패한 Task 때문에 더 띄울 단계가 없으면) 아래 "완료 시 정리" 를 따른 뒤 마무리 보고를 한다. 사용자 결정이 남아 있으면 끝내지 않고 5의 반복을 계속한다. 마무리 보고 뒤에는 사용자에게 후속 작업을 묻거나 제안하지 않는다 — 남은 확인은 보고에만 적는다.
 
 ${logUrl ? `## 실행 로그
 캔버스가 실행 로그를 남긴다. Task 상태 변화는 캔버스가 직접 기록하므로, 너는 **판단과 사람 개입**만 기록한다. 아래 때마다 한 번씩 보낸다:
@@ -452,7 +455,7 @@ curl -s -X POST -H 'Content-Type: application/json' ${logUrl} \\
 
 ` : ''}## 워커 spec 규칙
 - 단계 지침을 그대로 Change 로 쓰고, Target·Constraints·Ownership·Acceptance 를 채운다.
-- 작업 위치: 그 단계의 \`location\`. 그 밖의 파일은 수정하지 않는다.
+- 작업 위치: 그 단계의 \`location\`. 그 밖의 파일은 수정하지 않는다. 워커는 자기 \`location\` 워크트리를 지우거나 그 안의 터미널을 닫지 않는다(자기 터미널이 함께 닫혀 worker_done 을 보낼 수 없다). 지침이 그런 정리를 요구하면 하지 말고 worker_done 에 "코디네이터 정리 필요" 로 보고한다.
 - 단계에 \`namesWorktree\` 가 있으면 spec 에 "작업을 마치면 이후 단계가 쓸 워크트리 이름(영문·숫자·\`.\`·\`_\`·\`-\`)을 정하거나 직접 만들고, worker_done 첫 줄에 \`worktree: <이름 또는 절대 경로>\` 로 보고한다" 를 넣는다.
 - 산출물·로그는 \`${artifactDir}/<n>-<nodeId>.txt\` 에 쓴다.
 - 단계에 \`decides\` 가 있으면 spec 에 그 분기의 출력 목록(id·조건)과 "작업을 마치면 조건에 맞는 출력을 고르고(\`mode: exclusive\` 면 하나만) worker_done 첫 줄에 \`decision: <출력 id>\` 로 보고한다. 판정은 한 번만 내고 재실행해 결과를 고르지 않는다" 를 넣는다. \`namesWorktree\` 도 있으면 \`worktree:\` 줄을 그다음 줄에 쓴다.
@@ -463,8 +466,8 @@ curl -s -X POST -H 'Content-Type: application/json' ${logUrl} \\
 
 ## 완료 시 정리 (사용자가 실행할 때 고른 설정)
 - 워커 세션: ${cleanup.sessions ? '**정리한다.** 끝난 워커는 \`worker-release\` 로 터미널을 정리하고, \`worker-list --terminal-state reclaimable\` 이 빌 때까지 확인한다.' : '**남겨 둔다.** 끝난 워커는 \`worker-retain\` 으로 터미널을 남겨 사용자가 볼 수 있게 한다. 진행하지 않은 분기의 워커만 release 한다.'}
-- 워크트리: ${cleanup.worktrees ? '**이번 Run 에서 새로 만든 워크트리만 지운다.** 모든 실행이 끝난 뒤 \`orca worktree rm --worktree path:<경로>\` 로 지운다. 재사용한 워크트리와 기존 선택 워크트리는 지우지 않는다. 커밋·푸시되지 않은 변경이 있거나 실패·확인 필요로 끝난 실행의 워크트리는 지우지 않고(\`--force\` 금지) 보고에 남긴다.' : '**남겨 둔다.** 만든 워크트리는 지우지 않는다.'}
-- 코디네이터: ${cleanup.coordinator ? '**마무리 보고 뒤 종료한다.** 보고를 \`' + artifactDir + '/report.md\` 에도 저장하고, 해결되지 않은 것(실패·확인 필요·남긴 워크트리)이 없을 때만 자기 터미널(\`$ORCA_TERMINAL_HANDLE\`)을 \`orca terminal close --terminal <handle>\` 로 닫는다. 남은 것이 있으면 닫지 않고 사용자를 기다린다.' : '**남겨 둔다.** 마무리 보고 뒤 터미널을 닫지 않는다.'}
+- 워크트리: ${cleanup.worktrees ? '**이번 Run 에서 새로 만든 워크트리만 지운다.** 모든 실행이 끝난 뒤 \`orca worktree rm --worktree path:<경로>\` 로 지운다. 재사용한 워크트리와 기존 선택 워크트리는 지우지 않는다. 커밋·푸시되지 않은 변경이 있거나 실패·확인 필요로 끝난 실행의 워크트리는 지우지 않고(\`--force\` 금지) 보고에 남긴다. 네가 그 워크트리 안에서 시작했다면 그 삭제는 마무리 보고와 \`report\` 기록 뒤 맨 마지막에 한다(지우면 네 터미널도 닫힌다).' : '**남겨 둔다.** 만든 워크트리는 지우지 않는다. 워크트리 정리는 이 실행 밖(다른 플로·드라이버)의 몫이다.'}
+- 코디네이터: ${cleanup.coordinator ? '**마무리 보고 뒤 종료한다.** 보고를 \`' + artifactDir + '/report.md\` 에도 저장하고 실행 로그 \`report\` 를 보낸 뒤, 자기 터미널(\`$ORCA_TERMINAL_HANDLE\`)을 \`orca terminal close --terminal <handle>\` 로 닫는다. 실패한 단계·남은 확인·남긴 워크트리가 있어도 닫는다 — 그것은 보고와 실행 로그에 남고, 사용자는 캔버스에서 다시 실행한다. 닫지 않고 기다리는 것은 사용자 결정이 아직 열려 있을 때뿐이다(그때는 실행이 끝나지 않았다). 닫지 못하면 캔버스 서버가 실행 종료 뒤 대신 닫는다.' : '**남겨 둔다.** 마무리 보고 뒤 터미널을 닫지 않는다.'}
 
 ## 마무리 보고 (이 터미널에)
 실행별 한 줄 표(실행 · 단계별 결과 · 근거 파일). 해결되지 않은 것이 있으면 따로 적는다.

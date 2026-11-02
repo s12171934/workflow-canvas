@@ -100,7 +100,7 @@
       "parentId": "wt",
       "data": {
         "label": "설정 체크리스트",
-        "description": "티켓 하나를 머지까지 처리하는 플로. 보통은 「QA 티켓 선별」 플로가 티켓마다 이 플로를 실행 요청한다(실행 시 입력 = 티켓 키). 티켓 키를 직접 넣어 손으로 돌려도 된다.\n\n- 상태 디렉터리 ~/.qa-driver/<에픽>/ (qa-ticket-driver 형식)가 있어야 한다 — 설정은 선별 플로의 체크리스트를 따른다.\n- 실행 프로젝트는 QA_REPO 와 같은 저장소. 완료 시 정리의 「만든 워크트리 삭제」는 끈다(마지막 단계가 머지 확인 뒤 정리한다).\n- 같은 티켓이 진행 중이면 캔버스가 새 실행을 거부하고, 다른 티켓은 동시에 진행한다.\n- 상태 신호는 드라이버와 같은 계약으로 남으므로 agent-dashboard QA 화면이 그대로 읽는다. 반출 승인·머지 지시는 캔버스 게이트로 한다.",
+        "description": "티켓 하나를 머지까지 처리하는 플로. 보통은 「QA 티켓 선별」 플로가 티켓마다 이 플로를 실행 요청한다(실행 시 입력 = 티켓 키). 티켓 키를 직접 넣어 손으로 돌려도 된다.\n\n- 상태 디렉터리 ~/.qa-driver/<에픽>/ (qa-ticket-driver 형식)가 있어야 한다 — 설정은 선별 플로의 체크리스트를 따른다.\n- 실행 프로젝트는 QA_REPO 와 같은 저장소. 완료 시 정리의 「만든 워크트리 삭제」는 끈다. 워크트리는 이 실행이 끝난 뒤 선별 플로의 「끝난 티켓 정리」(`qa-driver sweep`)가 지운다 — 이 실행 안에서 지우면 그 안의 워커·코디네이터 터미널이 함께 닫혀 실행이 끝나지 않는다.\n- 같은 티켓이 진행 중이면 캔버스가 새 실행을 거부하고, 다른 티켓은 동시에 진행한다.\n- 상태 신호는 드라이버와 같은 계약으로 남으므로 agent-dashboard QA 화면이 그대로 읽는다. 반출 승인·머지 지시는 캔버스 게이트로 한다.\n- 구현 방향 승인은 지금 자동 승인이다(게이트의 묻는 곳 = 묻지 않음). 반출 승인·머지 지시는 캔버스 카드나 QA 대시보드에서 고른다.",
         "kind": "note"
       }
     },
@@ -200,8 +200,9 @@
       "parentId": "wt",
       "data": {
         "label": "구현 방향 승인",
-        "description": "분석 산출물과 기록 파일의 원인·소유 저장소·수정 방향을 보고 「이 방향으로 구현할까요?」. 거절하면 구현 없이 이 실행을 끝낸다(티켓은 claim 된 채 남고, 기록을 고친 뒤 다시 돌린다).",
-        "kind": "gate"
+        "description": "분석 산출물과 기록 파일의 원인·소유 저장소·수정 방향을 보고 「이 방향으로 구현할까요?」. 지금은 자동 승인이다 — 묻지 않고 구현으로 넘어가며 실행 로그에 「자동 승인」이 남는다. 다시 묻게 하려면 묻는 곳을 코디네이터로 바꾼다(거절하면 구현 없이 이 실행을 끝낸다 — 티켓은 claim 된 채 남고, 기록을 고친 뒤 다시 돌린다).",
+        "kind": "gate",
+        "asker": "auto"
       }
     },
     {
@@ -341,9 +342,8 @@
       "parentId": "wt",
       "data": {
         "label": "반출 승인",
-        "description": "ready 요약과 STATE/ready/<KEY>.md 를 보여 주고 「push 와 PR 생성을 승인할까요?」 검증의 red 확인을 특히 보게 한다. 거절하면 커밋은 이 워크트리에 남고 이 실행은 끝난다.",
-        "kind": "gate",
-        "asker": "previous"
+        "description": "ready 요약과 STATE/ready/<KEY>.md 를 보여 주고 「push 와 PR 생성을 승인할까요?」 검증의 red 확인을 특히 보게 한다. 캔버스 결정 대기 카드나 QA 대시보드(리뷰 완료 → `qa-driver approve` 가 이 게이트에 넣는다)에서 고른다 — 게이트가 열리기 전에 대시보드에서 먼저 골라도 코디네이터가 그 판정을 쓴다. 거절하면 커밋은 이 워크트리에 남고 이 실행은 끝난다.",
+        "kind": "gate"
       }
     },
     {
@@ -385,7 +385,7 @@
       "parentId": "wt",
       "data": {
         "label": "머지·Jira 완료",
-        "description": "공통 — 먼저 같은 산출물 폴더의 준비 산출물 `<실행 번호>-prepare.txt` 를 읽어 parent·key·round·reopen·state_dir(아래 STATE)·record_file·설정 값을 확인한다. 상태 디렉터리 규칙은 `~/.claude/skills/qa-ticket-driver/exports/state-contract.md` 가, 단계별 세부 절차는 `~/.claude/skills/qa-ticket-driver/references/brief-coordinator.md` 가 정본이다(@@KEY@@ 등 자리는 준비 산출물 값, @@STATE_DIR@@ 은 STATE, @@RECORD_DIR@@ 은 record_file 의 폴더). 다른 티켓의 신호·기록은 건드리지 않는다. 임시 파일은 STATE/scratch/<KEY>/ 에 둔다.\n\n사용자가 머지가 지시됐다(캔버스 게이트·QA 대시보드 중 어디서든 — 대시보드에서 고른 것도 `qa-driver merge` 가 이 게이트로 넣는다). STATE/merge/<KEY>.md 가 없으면 지시 시각을 적는다(대시보드가 먼저 적었으면 그대로 둔다). 그다음 brief-coordinator.md 6단계를 따른다: delivered 의 PR 을 의존 저장소부터 머지하고, 소비처의 핀은 의존 저장소의 머지된 해시로 갱신해 push 한 뒤 머지한다. 체크 실패·충돌·리뷰 요구로 머지할 수 없으면 머지하지 않고 STATE/blocked/<KEY>.md 에 사유를 쓴다. PR 이 모두 머지된 것을 확인한 뒤에만 ticket_skills 규칙대로 「개발 완료」 전이와 전달 코멘트를 한다.\n\n판정 — merged: 모든 PR 머지와 Jira 전이 완료 / blocked: 하나라도 머지하지 못했다",
+        "description": "공통 — 먼저 같은 산출물 폴더의 준비 산출물 `<실행 번호>-prepare.txt` 를 읽어 parent·key·round·reopen·state_dir(아래 STATE)·record_file·설정 값을 확인한다. 상태 디렉터리 규칙은 `~/.claude/skills/qa-ticket-driver/exports/state-contract.md` 가, 단계별 세부 절차는 `~/.claude/skills/qa-ticket-driver/references/brief-coordinator.md` 가 정본이다(@@KEY@@ 등 자리는 준비 산출물 값, @@STATE_DIR@@ 은 STATE, @@RECORD_DIR@@ 은 record_file 의 폴더). 다른 티켓의 신호·기록은 건드리지 않는다. 임시 파일은 STATE/scratch/<KEY>/ 에 둔다.\n\n사용자가 머지가 지시됐다(캔버스 게이트·QA 대시보드 중 어디서든 — 대시보드에서 고른 것도 `qa-driver merge` 가 이 게이트로 넣는다). STATE/merge/<KEY>.md 가 없으면 지시 시각을 적는다(대시보드가 먼저 적었으면 그대로 둔다). 그다음 brief-coordinator.md 6단계를 따른다: delivered 의 PR 을 의존 저장소부터 머지하고, 소비처의 핀은 의존 저장소의 머지된 해시로 갱신해 push 한 뒤 머지한다. 체크 실패·충돌·리뷰 요구로 머지할 수 없으면 머지하지 않고 STATE/blocked/<KEY>.md 에 사유를 쓴다. PR 이 모두 머지된 것을 확인한 뒤에만 ticket_skills 규칙대로 「개발 완료」 전이와 전달 코멘트를 한다.\n\n워크트리 정리는 하지 않는다 — 이 실행이 끝난 뒤 선별 플로의 「끝난 티켓 정리」(`qa-driver sweep`)가 지운다.\n\n판정 — merged: 모든 PR 머지와 Jira 전이 완료 / blocked: 하나라도 머지하지 못했다",
         "kind": "worker",
         "effort": "medium"
       }
@@ -430,21 +430,6 @@
         "kind": "worker",
         "effort": "low",
         "join": "any"
-      }
-    },
-    {
-      "id": "cleanup",
-      "type": "stage",
-      "position": {
-        "x": 1822.331005380553,
-        "y": 1237.7859271870338
-      },
-      "parentId": "wt",
-      "data": {
-        "label": "워크트리 정리",
-        "description": "공통 — 먼저 같은 산출물 폴더의 준비 산출물 `<실행 번호>-prepare.txt` 를 읽어 parent·key·round·reopen·state_dir(아래 STATE)·record_file·설정 값을 확인한다. 상태 디렉터리 규칙은 `~/.claude/skills/qa-ticket-driver/exports/state-contract.md` 가, 단계별 세부 절차는 `~/.claude/skills/qa-ticket-driver/references/brief-coordinator.md` 가 정본이다(@@KEY@@ 등 자리는 준비 산출물 값, @@STATE_DIR@@ 은 STATE, @@RECORD_DIR@@ 은 record_file 의 폴더). 다른 티켓의 신호·기록은 건드리지 않는다. 임시 파일은 STATE/scratch/<KEY>/ 에 둔다.\n\n머지가 끝난 티켓의 워크트리를 정리한다. `~/.claude/skills/qa-ticket-driver/bin/qa-driver cleanup <parent> <KEY> --dry-run` 으로 확인하고, 남길 것(커밋하지 않은 변경·머지되지 않은 커밋)이 없을 때만 `qa-driver cleanup <parent> <KEY>` 로 서브모듈 deinit·워크트리 삭제·cleaned/<KEY> 기록을 한다. 남길 것이 있으면 지우지 않고 사유를 보고한다. --force 는 쓰지 않는다.",
-        "kind": "worker",
-        "effort": "low"
       }
     }
   ],
@@ -551,12 +536,6 @@
       "source": "merge-result",
       "target": "blocked",
       "sourceHandle": "blocked"
-    },
-    {
-      "id": "merge-result--cleanup--merged",
-      "source": "merge-result",
-      "target": "cleanup",
-      "sourceHandle": "merged"
     },
     {
       "id": "review-result--implement--loop",

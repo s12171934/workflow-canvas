@@ -13,6 +13,8 @@ import { defaultCleanup, type AutomationConfig, type AutomationState, type Clean
 
 /** Minimum gap between two 실행 requests for the same workflow, so a double click cannot start two coordinators. */
 const launchCooldownMs = 60_000;
+/** How long a coordinator may stay open after its run ended without a closing report before the server closes it. */
+const coordinatorGraceMs = 10 * 60_000;
 
 export function createApp(directory: string, bridge = createOrcaBridge(), options: { root?: string; watchMs?: number } = {}) {
   void options; // root is no longer used: every run names its project.
@@ -30,6 +32,21 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
   const runlog = createRunLog(join(directory, '.executions'));
   // Background observer: results of open Runs are logged even while no canvas is open.
   if (options.watchMs) runlog.watch((runId) => bridge.snapshot(runId), options.watchMs);
+  // Safety net for 완료 시 정리 「코디네이터 종료」: a coordinator still open after its run ended is closed here, so
+  // finished runs never leave an idle agent behind (it may be waiting on a dead worker or on a question nobody answers).
+  if (options.watchMs) {
+    const reap = async () => {
+      for (const { id, terminal } of await runlog.coordinatorsToClose(Date.now(), coordinatorGraceMs).catch(() => [])) {
+        try {
+          const open = await bridge.terminalOpen(terminal);
+          if (open) await bridge.closeTerminal(terminal);
+          await runlog.append(id, { type: 'coordinator-closed', message: open ? `실행이 끝나 캔버스 서버가 코디네이터 터미널을 닫음 · ${terminal}` : `코디네이터 터미널이 이미 닫혀 있음 · ${terminal}` });
+        } catch { /* Orca unreachable: try again next time */ }
+      }
+    };
+    const timer = setInterval(() => { void reap(); }, Math.max(options.watchMs, 30_000));
+    timer.unref?.();
+  }
   app.disable('x-powered-by');
   app.use('/api', (req, res, next) => {
     res.setHeader('Cache-Control', 'no-store');
@@ -297,7 +314,8 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
       await runlog.start(logId, { workflowId: id, workflowName: graph.name, startedAt: startedAt.toISOString(), count: settings.count,
         project: settings.project, ...(settings.automation ? { automation: settings.automation } : {}),
         ...(inputs !== '[]' ? { inputs: Object.fromEntries(Object.entries(settings.inputs).filter(([, value]) => value)) } : {}),
-        ...(Object.keys(settings.values).length ? { values: settings.values } : {}) });
+        ...(Object.keys(settings.values).length ? { values: settings.values } : {}),
+        ...(settings.cleanup.coordinator && !settings.automation ? { closeCoordinator: true } : {}) });
       await runlog.append(logId, { type: 'requested', message: `${settings.origin ?? (settings.automation ? `자동화 「${settings.automation.name}」` : '실행 버튼')} · ${settings.count}회 · ${settings.project}`
         + (Object.values(settings.inputs).some(Boolean) ? ` · 입력 ${Object.values(settings.inputs).filter(Boolean).join('·')}` : '') });
       const briefPath = join(artifactDir, 'brief.md');
@@ -347,6 +365,7 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
       const where = target.group ? ` 너는 이 워크플로의 「${target.group}」 워크트리(${workspace})에서 시작했다.` : '';
       const { terminal } = await bridge.launchCoordinator(workspace, `${briefPath} 파일의 브리프를 읽고 그대로 수행해줘. 워크플로 "${graph.name}"을(를) ${settings.count}회 실행하는 코디네이터 역할이다.${where}`);
       await runlog.append(logId, { type: 'coordinator', message: `코디네이터 기동${target.group ? ` (${workspace})` : ''}${terminal ? ` · ${terminal}` : ''}` }).catch(() => {});
+      if (terminal) await runlog.patchMeta(logId, { coordinatorTerminal: terminal }).catch(() => {});
       const given = Object.values(settings.inputs).filter(Boolean).join('·');
       if (terminal) await bridge.renameTerminal(terminal, `${graph.name}${given ? ` ${given}` : ''} ×${settings.count} · 코디네이터`).catch(() => {});
     };

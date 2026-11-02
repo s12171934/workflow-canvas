@@ -57,7 +57,7 @@
       },
       "data": {
         "label": "설정 체크리스트",
-        "description": "에픽마다 한 번:\n1. `~/.claude/skills/qa-ticket-driver/bin/qa-driver init <EPIC>` 로 ~/.qa-driver/<epic>/ 을 만들고 config.env(JIRA_SITE·JIRA_EMAIL·QA_REPO·QA_STATUS_NEW·QA_STATUS_REOPEN·QA_AUTO_HANDOFF·QA_TICKET_SKILLS·QA_SCREEN_SKILLS·QA_RECORD_DIR·QA_JIRA_TOKEN_KEYCHAIN_SERVICE·QA_MAX_ACTIVE)와 context.md 를 채운다. QA_AUTO_HANDOFF 는 추측하지 말고 직접 정한다.\n2. `qa-driver run <EPIC> --dry-run` 이 후보를 내는지 확인한다.\n3. QA_REPO 를 Orca 에 프로젝트로 열어 두고, 실행 프로젝트도 그 저장소로 고른다 — 링크가 띄우는 해결 실행도 같은 프로젝트에서 돈다.\n4. 같은 에픽에 qa-driver 자동화가 켜져 있으면 끈다.\n5. 실행 창 → 설정값 「QA 에픽」(필수)·「TC 스프레드시트」(선택)를 넣고 「자동화로 예약」(예: */10 * * * *). 에픽마다 자동화를 하나씩 만들면 서로 막지 않고 동시에 돈다. 예약 시각에 캔버스 서버(127.0.0.1:4318)가 떠 있어야 한다.\n6. TC 시트를 쓰면 agent-dashboard 의 server/prefs.json `qa_sets` 에 이 에픽의 `sheet` 링크를 넣고 대시보드를 재시작한다(qa-ticket-driver SKILL.md 설정 5).\n\n할 일이 없는 회차에도 코디네이터와 선별 워커가 한 번씩 뜬다(캔버스 자동화에 아직 precheck 가 없다).",
+        "description": "에픽마다 한 번:\n1. `~/.claude/skills/qa-ticket-driver/bin/qa-driver init <EPIC>` 로 ~/.qa-driver/<epic>/ 을 만들고 config.env(JIRA_SITE·JIRA_EMAIL·QA_REPO·QA_STATUS_NEW·QA_STATUS_REOPEN·QA_AUTO_HANDOFF·QA_TICKET_SKILLS·QA_SCREEN_SKILLS·QA_RECORD_DIR·QA_JIRA_TOKEN_KEYCHAIN_SERVICE·QA_MAX_ACTIVE)와 context.md 를 채운다. QA_AUTO_HANDOFF 는 추측하지 말고 직접 정한다.\n2. `qa-driver run <EPIC> --dry-run` 이 후보를 내는지 확인한다.\n3. QA_REPO 를 Orca 에 프로젝트로 열어 두고, 실행 프로젝트도 그 저장소로 고른다 — 링크가 띄우는 해결 실행도 같은 프로젝트에서 돈다.\n4. 같은 에픽에 qa-driver 자동화가 켜져 있으면 끈다.\n5. 실행 창 → 설정값 「QA 에픽」(필수)·「TC 스프레드시트」(선택)를 넣고 「자동화로 예약」(예: */10 * * * *). 에픽마다 자동화를 하나씩 만들면 서로 막지 않고 동시에 돈다. 예약 시각에 캔버스 서버(127.0.0.1:4318)가 떠 있어야 한다.\n6. TC 시트를 쓰면 agent-dashboard 의 server/prefs.json `qa_sets` 에 이 에픽의 `sheet` 링크를 넣고 대시보드를 재시작한다(qa-ticket-driver SKILL.md 설정 5).\n\n할 일이 없는 회차에도 코디네이터와 선별 워커가 한 번씩 뜬다(캔버스 자동화에 아직 precheck 가 없다).\n\n워크트리 정리는 이 플로의 「끝난 티켓 정리」 단계가 회차마다 한다(`qa-driver sweep`). 해결 플로 안에서는 지우지 않는다.",
         "kind": "note"
       }
     },
@@ -71,6 +71,20 @@
       "data": {
         "label": "TC 시트 진행도 갱신",
         "description": "TC 스프레드시트의 「Test Summary」 탭을 agent-dashboard 에 넘겨 QA 진행도를 갱신한다. 코드와 시트는 고치지 않는다.\n\nTC 시트 링크: {{tc_sheet}}\n에픽: {{epic}} (링크면 마지막 경로의 키. 아래 <EPIC>)\n\n1. 위 TC 시트 링크 자리가 중괄호 그대로(값이 주어지지 않음)면 아무것도 하지 않고 「TC 시트 없음 — 건너뜀」 한 줄을 보고하고 끝낸다.\n2. 링크의 `/d/<fileId>/` 에서 fileId 를 뽑는다.\n3. Google Drive 커넥터의 download_file_content 를 그 fileId 로(exportMimeType 없이) 호출하고, 받은 content 문자열을 그대로 `<agent-dashboard 체크아웃>/server/aqa sheet <EPIC> -` 의 표준 입력으로 넘긴다.\n4. aqa 의 출력 한 줄을 산출물과 터미널에 보고한다. 커넥터가 없거나 실패하면 사유를 보고하고 끝낸다 — 티켓 선별은 이 단계와 무관하게 진행된다.",
+        "kind": "worker",
+        "effort": "low"
+      }
+    },
+    {
+      "id": "sweep",
+      "type": "stage",
+      "position": {
+        "x": 0,
+        "y": -254
+      },
+      "data": {
+        "label": "끝난 티켓 정리",
+        "description": "에픽 키 = 설정값 「QA 에픽」(`{{epic}}`). 링크(…/browse/ABC-100)로 주어졌으면 마지막 경로의 키(ABC-100)를 쓴다. 아래 <EPIC> 은 그 키다.\n\n「QA 티켓 해결」 실행이 끝난 티켓의 워크트리를 정리한다. qa-ticket-driver 의 `run` 회차가 하던 정리를 이 플로가 맡는다 — 해결 실행 안에서 지우면 그 워크트리의 터미널(정리하는 워커·코디네이터 자신)이 함께 닫혀 실행이 끝나지 않는다. 이 단계는 그룹 밖이라 실행 프로젝트(티켓 워크트리 밖)에서 돈다. 코드는 건드리지 않는다.\n\n1. `~/.claude/skills/qa-ticket-driver/bin/qa-driver sweep <EPIC>` 를 한 번 실행한다. 반출 PR 이 모두 머지됐고 그 티켓의 해결 실행이 끝난(완료·실패) 티켓만, 남길 것(커밋하지 않은 변경·머지되지 않은 커밋)이 없을 때 서브모듈 deinit·워크트리 삭제·cleaned/<KEY> 기록을 한다. 이미 지워진 워크트리는 정리 표시만 남긴다.\n2. 출력의 `정리:`·`정리 보류:`·`정리 실패:` 줄을 그대로 산출물과 터미널에 보고한다. 없으면 「정리할 티켓 없음」 한 줄. --force 는 쓰지 않고, 보류된 티켓을 손으로 지우지 않는다.",
         "kind": "worker",
         "effort": "low"
       }

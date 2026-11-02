@@ -76,6 +76,7 @@ function StageCard({ data, selected }: NodeProps<StageNode>) {
     <div className="stage-kind"><KindIcon size={14} /><span>{kindNames[data.kind]}</span><RelationBadge relation={data.relation} />
       {data.join === 'any' && <span className="branch-meta join-meta" title="분기에서 갈라진 경로가 다시 모이는 곳">합류: 하나라도</span>}
       {data.kind === 'gate' && data.asker === 'previous' && <span className="branch-meta">{gateAskerNames.previous}이 물음</span>}
+      {data.kind === 'gate' && data.asker === 'auto' && <span className="branch-meta">{gateAskerNames.auto}</span>}
       {data.kind === 'branch' && <span className="branch-meta">{branchModeNames[data.mode ?? 'exclusive']} · {branchJudgeNames[data.judge ?? 'previous']}</span>}
       {data.round && <span className="round-badge" title="되돌아가기로 다시 도는 회차">{data.round}회차</span>}
       <span className={`status-dot ${status}`} /></div>
@@ -1282,9 +1283,11 @@ function Workspace() {
                   : <p className="field-help">실행이 항목을 요청하면 항목별 결과가 여기에 보입니다. 항목을 누르면 대상 워크플로를 엽니다.</p>}</>}</>}
             {selected.data.kind === 'gate' && <>
               <label className="field-label" htmlFor="gate-asker">묻는 곳</label>
-              <select id="gate-asker" value={selected.data.asker ?? 'coordinator'} onChange={(event) => updateNode({ asker: event.target.value === 'previous' ? 'previous' as GateAsker : undefined })}>
-                <option value="coordinator">코디네이터 (캔버스 결정 대기 카드)</option><option value="previous">직전 단계 워커의 터미널</option></select>
-              <p className="field-help">{selected.data.asker === 'previous'
+              <select id="gate-asker" value={selected.data.asker ?? 'coordinator'} onChange={(event) => updateNode({ asker: event.target.value === 'coordinator' ? undefined : event.target.value as GateAsker })}>
+                <option value="coordinator">코디네이터 (캔버스 결정 대기 카드)</option><option value="previous">직전 단계 워커의 터미널</option><option value="auto">묻지 않음 (자동 승인)</option></select>
+              <p className="field-help">{selected.data.asker === 'auto'
+                ? '묻지 않습니다. 앞 단계가 끝나면 코디네이터가 통과로 등록하고 실행 로그에 「자동 승인」을 남깁니다. 다시 묻게 하려면 묻는 곳을 바꾸세요.'
+                : selected.data.asker === 'previous'
                 ? '앞에 연결된 워커 하나가 작업을 마친 뒤 자기 터미널에서 묻고, 답을 받아 decision: approve|reject 로 보고합니다. 작업 맥락을 가진 워커에게 되묻거나 수정을 요청할 수 있습니다. 캔버스 카드에서 골라도 됩니다.'
                 : '앞 단계가 끝나면 캔버스 오른쪽 위 결정 대기 카드에 뜹니다. 코디네이터 터미널에 답해도 됩니다.'}</p></>}
             {isBranch(selected) && <>

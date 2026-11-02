@@ -11,7 +11,7 @@ export type BranchOutput = { id: string; label: string };
 export const branchModeNames: Record<BranchMode, string> = { exclusive: '하나만', inclusive: '해당하는 것 모두' };
 export const branchJudgeNames: Record<BranchJudge, string> = { previous: '직전 단계 워커', worker: '판정 워커', user: '사용자' };
 /** Where a gate asks the user: the coordinator (decision card / its terminal), or the terminal of the worker right before it. */
-export type GateAsker = 'coordinator' | 'previous';
+export type GateAsker = 'coordinator' | 'previous' | 'auto';
 /**
  * Workflow link: 'wait' — what follows the link waits for its whole sub-graph; 'start' — the sub-graph starts and what follows
  * goes on without it; 'spawn' — not expanded: one separate 실행 of the target per item the worker before it reports
@@ -26,7 +26,7 @@ export const spawnsRuns = (node: Pick<StageNode, 'data'>) => node.data.kind === 
 export const maxSpawnItems = 20;
 /** One item a spawn link asked to run: the launch it started, or why it could not. */
 export type SpawnResult = { item: string; at: string; workflowId: string; launch?: string; error?: string };
-export const gateAskerNames: Record<GateAsker, string> = { coordinator: '코디네이터', previous: '직전 워커' };
+export const gateAskerNames: Record<GateAsker, string> = { coordinator: '코디네이터', previous: '직전 워커', auto: '자동 승인' };
 export const maxBranchOutputs = 8;
 export type JoinMode = 'all' | 'any';
 export const joinNames: Record<JoinMode, string> = { all: '모두 필요', any: '하나라도 오면 진행' };
@@ -108,7 +108,7 @@ export type StageData = {
   /** kind 'branch': how many outputs it takes, who decides, and its outputs (each a source handle). */
   mode?: BranchMode;
   judge?: BranchJudge;
-  /** kind 'gate': where the user is asked. Unset means 'coordinator'. */
+  /** kind 'gate': where the user is asked. Unset means 'coordinator'; 'auto' approves without asking (the run log records it). */
   asker?: GateAsker;
   outputs?: BranchOutput[];
   /**
@@ -515,7 +515,7 @@ export function serializableWorkflow(workflow: Workflow): Workflow {
     else if (node.data.taskId) data.taskId = node.data.taskId;
     if (launchesWorker(node)) Object.assign(data, { ...(node.data.workerModel ? { workerModel: node.data.workerModel } : {}), ...(node.data.effort ? { effort: node.data.effort } : {}) });
     if (!group && isExecutable(node) && node.data.join === 'any') data.join = 'any';
-    if (node.data.kind === 'gate' && node.data.asker === 'previous') data.asker = 'previous';
+    if (node.data.kind === 'gate' && (node.data.asker === 'previous' || node.data.asker === 'auto')) data.asker = node.data.asker;
     const width = node.width ?? node.measured?.width;
     const height = node.height ?? node.measured?.height;
     return { id: node.id, type: group ? 'group' : frame ? 'frame' : 'stage', position: node.position, ...(parentId ? { parentId } : {}),
@@ -681,6 +681,10 @@ export type RunLogMeta = {
   executions?: LoggedExecution[];
   /** The Run was attached after the fact (a launch from before execution logs existed); events are observation times, not real times. */
   adopted?: boolean;
+  /** Terminal of the coordinator the server started for this launch (absent: an automation's own agent). */
+  coordinatorTerminal?: string;
+  /** 완료 시 정리 asked the coordinator to close itself: the server closes it when it is still open after the run ends. */
+  closeCoordinator?: boolean;
 };
 export type LoggedExecution = { id: string; label: string; tasks: string[];
   /** Tasks of stages no taken branch reaches; the coordinator closes them as completed, the log shows them as skipped. */
@@ -700,7 +704,7 @@ export type RunLogFile = { name: string; size: number; truncated: boolean; text:
 export const coordinatorEventTypes = ['note', 'gate', 'worker', 'error', 'report'] as const;
 export const runEventNames: Record<string, string> = {
   execution: '실행 결과', finished: '전체 종료', adopted: 'Run 연결',
-  requested: '실행 요청', brief: '브리프', coordinator: '코디네이터', 'coordinator-failed': '기동 실패', registered: '실행 등록',
+  requested: '실행 요청', brief: '브리프', coordinator: '코디네이터', 'coordinator-failed': '기동 실패', 'coordinator-closed': '코디네이터 종료', registered: '실행 등록',
   task: 'Task', note: '메모', gate: '게이트', worker: '워커 보고', error: '오류', report: '마무리 보고',
 };
 /** Results of each logged execution in a Run snapshot. A Task missing from the snapshot counts as unknown. */
@@ -744,7 +748,7 @@ export function executionTasks(execution: Execution, paths: string[]): string[] 
 /** One stage of the flattened execution graph (workflow links expanded, ids link-prefixed). */
 export type FlowStage = { id: string; after: { id: string; output?: string }[]; branch?: { mode: BranchMode; outputs: string[] };
   /** Display: stage name, what to ask, and who decides (gates and user branches are decided by the user). */
-  label?: string; question?: string; judge?: BranchJudge; outputLabels?: Record<string, string>;
+  label?: string; question?: string; judge?: BranchJudge | 'auto'; outputLabels?: Record<string, string>;
   /** Outputs that stop everything after this stage, even a join that another live path reaches (a rejected gate). */
   veto?: string[];
   /** 'any': runs when at least one incoming path is alive (paths meeting again after a branch). Default: every path. */
