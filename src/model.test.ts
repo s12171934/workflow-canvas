@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { pendingDecisions, frameContents, orderNodes, decisionError, skippedStages, topologicalOrder, waves, nodeExecutionStatus, type FlowStage, type StageNode, membershipOf, nodeLocation, aggregateStatus, executionFinished, taskStatus, projectNodes, serializableWorkflow, newWorkflow, fromSnapshot, type TaskSummary, type WorkerSummary, type RunSnapshot, executionRun, inputsKey, mergeSnapshots, workflowRuns, variableRefs, substituteVariables, resolveVariables, applyDecision, canNest, loopBody, stageRound, loggedExecutions, neighbors, relationTo, type Execution } from './model.ts';
+import { pendingDecisions, frameContents, orderNodes, decisionError, skippedStages, topologicalOrder, waves, nodeExecutionStatus, type FlowStage, type StageNode, membershipOf, nodeLocation, aggregateStatus, executionFinished, taskStatus, projectNodes, serializableWorkflow, newWorkflow, fromSnapshot, type TaskSummary, type WorkerSummary, type RunSnapshot, executionRun, inputsKey, mergeSnapshots, workflowRuns, variableRefs, substituteVariables, resolveVariables, applyDecision, canNest, loopBody, stageRound, loggedExecutions, neighbors, relationTo, tallyStatuses, summarizeExecution, type Execution } from './model.ts';
 
 const task = (status: string): TaskSummary => ({ id: 'task-a', title: 'A', spec: 'A', status, deps: [] });
 const worker = (liveness: string): WorkerSummary => ({ dispatchId: 'dispatch-a', taskId: 'task-a', liveness, stage: 'working', provider: 'claude', model: 'example-model', outcome: '' });
@@ -391,4 +391,23 @@ test('neighbors are one connection away in either direction, loops included', ()
   assert.equal(relationTo('c', 'b', near), 'both');
   assert.equal(relationTo('d', 'b', near), 'dim');
   assert.deepEqual(neighbors(edges, 'a'), { upstream: [], downstream: ['b'] });
+});
+
+test('요약 보기 tallies statuses in attention order and summarizes one execution', () => {
+  assert.deepEqual(tallyStatuses(['completed', 'running', 'completed', 'failed', 'unbound']),
+    [{ status: 'running', count: 1 }, { status: 'failed', count: 1 }, { status: 'completed', count: 2 }, { status: 'unbound', count: 1 }]);
+  assert.deepEqual(tallyStatuses([]), []);
+  const graph = newWorkflow();
+  const [first, second] = graph.nodes;
+  first.data.label = '분석';
+  second.data.label = '구현';
+  const live = { ...task('running'), id: 'task-b' };
+  const snapshot: RunSnapshot = { run: { id: 'run-a', objective: 'A', updatedAt: '' }, tasks: [task('completed'), live],
+    workers: [{ ...worker('live'), taskId: 'task-b' }], observedAt: '' };
+  const summary = summarizeExecution(graph.nodes, { id: 'exec-1', label: '#1', bindings: { [first.id]: 'task-a', [second.id]: 'task-b' } }, snapshot, false);
+  assert.equal(summary.total, graph.nodes.filter((node) => ['worker', 'gate', 'workflow', 'branch'].includes(node.data.kind)).length);
+  assert.equal(summary.done, 1);
+  assert.deepEqual(summary.running, ['구현']);
+  assert.deepEqual(summary.failed, []);
+  assert.deepEqual(summary.tally.slice(0, 1), [{ status: 'running', count: 1 }]);
 });

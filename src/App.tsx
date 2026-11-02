@@ -7,13 +7,13 @@ import {
 import {
   Activity, ArrowDownToLine, History, ArrowUpFromLine, Bot, Check, ChevronRight, Circle,
   CircleHelp, Clock3, ExternalLink, FileJson2, FolderGit2, GitBranch, Group, Hand, Layers3, LayoutDashboard, Link2,
-  Eye, LoaderCircle, LocateFixed, Lock, Menu, Move, PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen, MousePointer2, Network, Play, Plus, Save, Settings2, SkipForward, Sparkles, Split, SquareDashed, StickyNote,
+  Eye, Gauge, LoaderCircle, LocateFixed, Lock, Menu, Move, PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen, MousePointer2, Network, Play, Plus, Save, Settings2, SkipForward, Sparkles, Split, SquareDashed, StickyNote,
   Trash2, Unplug, Workflow as WorkflowIcon, X, XCircle, Zap,
 } from 'lucide-react';
 import {
   aggregateStatus, executionFinished, executionRun, executionStatuses as computeExecutionStatuses, mergeSnapshots, workflowRuns, openableStatuses, fromSnapshot, newWorkflow, projectNodes, serializableWorkflow, statusLabels,
   asksAtRun, defaultWorkerModel, effortLevels, frameContents, isFrame, launchesWorker, workerModels, type Effort, type Rect, joinNames, pendingDecisions, gateAskerNames, type GateAsker, linkModeNames, maxSpawnItems, type LinkMode, variableKeyPattern, variableRefs, maxVariables, maxVariableValue, type WorkflowVariable, loopBody, maxLoopRounds, type WorkflowEdge, type FlowStage, type PendingDecision, branchJudgeNames, branchModeNames, isBranch, maxBranchOutputs, type BranchJudge, type BranchMode, type BranchOutput, defaultCleanup, triggerNames, worktreeNamePattern, type AutomationConfig, type AutomationState, type Cleanup, canNest, maxGroupDepth, nameSourceNames, safeWorktreeName, type NameSource, createsWorktree, groupOf, membershipOf, orderNodes, worktreeRepo, isExecutable, isGroup, kindNames, normalizeNodes, scopeNames,
-  neighbors, relationTo, type Relation,
+  neighbors, relationTo, type Relation, tallyStatuses, summarizeExecution,
   type Workflow, type Execution, type StageNode, type StageKind, type NodeKind, type GroupScope, type StageStatus, type RunSummary, type RunSnapshot, type Locations,
 } from './model';
 import { RunLogDialog } from './RunLog';
@@ -29,8 +29,8 @@ async function api<T>(url: string, options?: RequestInit): Promise<T> {
 
 const statusIcons = { unbound: Unplug, pending: Clock3, running: LoaderCircle, completed: Check, failed: XCircle, blocked: CircleHelp, unknown: CircleHelp, skipped: SkipForward };
 // Lets node cards open a worker's terminal and name linked workflows without threading callbacks through node data.
-const CanvasContext = createContext<{ openTask: (taskId: string) => void; workflowName: (id?: string) => string | undefined; viewOnly: boolean }>({
-  openTask: () => {}, workflowName: () => undefined, viewOnly: false });
+const CanvasContext = createContext<{ openTask: (taskId: string) => void; workflowName: (id?: string) => string | undefined; viewOnly: boolean; summary: boolean }>({
+  openTask: () => {}, workflowName: () => undefined, viewOnly: false, summary: false });
 const kindIcons: Record<NodeKind, typeof Bot> = { worker: Bot, gate: Hand, branch: Split, note: StickyNote, workflow: WorkflowIcon, group: SquareDashed, frame: Group };
 /** Minimap marks a node by kind with the card's accent colour and icon; a corner dot carries run status. */
 const accentColors: Record<StageKind, string> = { worker: '#7fb0f5', gate: '#e3b45f', branch: '#e3b45f', workflow: '#62d0c0', note: '#b4b67e' };
@@ -56,17 +56,18 @@ function MiniMapNode({ id, x, y, width, height, borderRadius, selected, onClick 
 function StageCard({ data, selected }: NodeProps<StageNode>) {
   const status = data.status ?? 'unbound';
   const StatusIcon = statusIcons[status];
-  const { openTask, workflowName } = useContext(CanvasContext);
+  const { openTask, workflowName, summary } = useContext(CanvasContext);
   const openable = !!data.activeTaskId && openableStatuses.includes(status);
   const KindIcon = kindIcons[data.kind] ?? Bot;
   const relation = data.relation ? `rel-${data.relation}` : '';
-  if (data.kind === 'note') return <article className={`stage-card note ${relation} ${selected ? 'selected' : ''}`} aria-label={`메모, ${data.label}`}>
+  if (data.kind === 'note') return <article className={`stage-card note ${summary ? 'summary-note' : ''} ${relation} ${selected ? 'selected' : ''}`} aria-label={`메모, ${data.label}`}>
     <Handle type="target" position={Position.Left} />
     <div className="stage-kind"><KindIcon size={14} /><span>{kindNames.note}</span><RelationBadge relation={data.relation} /><span className="note-badge">실행 안 함</span></div>
     <h3>{data.label || '메모'}</h3>
     <p className="note-body">{data.description || '실행과 관계없는 설명을 적으세요.'}</p>
     <Handle type="source" position={Position.Right} />
   </article>;
+  if (summary) return <SummaryCard data={data} selected={selected} />;
   const linked = data.kind === 'workflow' ? workflowName(data.workflowId) : undefined;
   return <article className={`stage-card ${data.kind} ${status} ${data.live ? 'live' : ''} ${relation} ${selected ? 'selected' : ''}`}
     aria-label={`${data.label}, ${statusLabels[status]}${data.live && status !== 'running' ? `, ${data.live}개 실행 중` : ''}`}>
@@ -105,6 +106,42 @@ function StageCard({ data, selected }: NodeProps<StageNode>) {
     </div>}
     <div className="stage-footer"><span className={`stage-status ${status}`}><StatusIcon size={13} className={status === 'running' ? 'spin' : ''} />{statusLabels[status]}</span>
       <span className="agent-label">{openable ? '클릭해 실행 화면 열기' : data.agent || (data.activeTaskId ? data.activeTaskId.slice(0, 14) : data.runs ? '' : 'Task 연결 가능')}</span></div>
+    {data.kind !== 'branch' && <Handle type="source" position={Position.Right} />}
+  </article>;
+}
+/**
+ * 요약 보기 card: the title large enough to read zoomed out, the status as the card's colour and a big label, and how
+ * many shown executions sit in each status. Description, model, membership and link details are left to the normal view.
+ */
+function SummaryCard({ data, selected }: { data: StageNode['data']; selected: boolean }) {
+  const status = data.status ?? 'unbound';
+  const StatusIcon = statusIcons[status];
+  const KindIcon = kindIcons[data.kind] ?? Bot;
+  const { openTask } = useContext(CanvasContext);
+  const tally = data.runs?.length ? tallyStatuses(data.runs.map((run) => run.status)) : [];
+  const openable = !!data.activeTaskId && openableStatuses.includes(status);
+  const relation = data.relation ? `rel-${data.relation}` : '';
+  // A stage with nothing happening (and not running anywhere) steps back so active and settled ones stand out.
+  const quiet = !data.live && ['pending', 'unbound', 'skipped'].includes(status);
+  return <article className={`stage-card summary ${data.kind} ${status} ${data.live ? 'live' : ''} ${quiet ? 'quiet' : ''} ${relation} ${selected ? 'selected' : ''}`}
+    aria-label={`${data.label}, ${statusLabels[status]}${data.runs?.length ? `, 실행 ${data.runs.length}건` : ''}`}>
+    <Handle type="target" position={Position.Left} />
+    {data.live && <div className="live-badge" title="지금 이 단계를 실행하고 있습니다"><LoaderCircle size={11} className="spin" />실행 중{data.live > 1 ? ` ×${data.live}` : ''}</div>}
+    <div className="summary-head"><KindIcon size={14} className="summary-kind" /><RelationBadge relation={data.relation} />
+      {data.round && <span className="round-badge" title="되돌아가기로 다시 도는 회차">{data.round}회차</span>}
+      {openable ? <button className={`summary-status ${status} nodrag`} title="클릭해 실행 화면 열기" onClick={(event) => { event.stopPropagation(); openTask(data.activeTaskId!); }}>
+        <StatusIcon size={15} className={status === 'running' ? 'spin' : ''} />{statusLabels[status]}<ExternalLink size={11} /></button>
+        : <span className={`summary-status ${status}`}><StatusIcon size={15} className={status === 'running' ? 'spin' : ''} />{statusLabels[status]}</span>}</div>
+    <h3 className="summary-title" title={data.label}>{data.label || '이름 없는 단계'}</h3>
+    {tally.length > 0 && <div className="summary-tally" aria-label="실행별 상태 수">
+      <span className="summary-total">실행 {data.runs!.length}</span>
+      {tally.map((item) => <span key={item.status} className={`tally-pill ${item.status}`} title={`${statusLabels[item.status]} ${item.count}건`}>
+        <span className="status-dot" />{statusLabels[item.status]} {item.count}</span>)}</div>}
+    {data.spawned && <div className="summary-meta">항목 {data.spawned.length}건 요청{data.spawned.some((item) => item.error) ? ` · 실패 ${data.spawned.filter((item) => item.error).length}` : ''}</div>}
+    {data.kind === 'branch' && <ul className="branch-outputs summary-outputs" aria-label="분기 출력">
+      {(data.outputs ?? []).map((output) => <li key={output.id} className={`branch-output ${data.decision ? (data.decision.includes(output.id) ? 'taken' : 'untaken') : ''}`}>
+        <span className="branch-output-label">{output.label || output.id}</span>{data.decision?.includes(output.id) && <Check size={11} />}
+        <Handle type="source" position={Position.Right} id={output.id} className="branch-handle" /></li>)}</ul>}
     {data.kind !== 'branch' && <Handle type="source" position={Position.Right} />}
   </article>;
 }
@@ -160,11 +197,15 @@ function storedPanels(): Panels {
     : { left: typeof value?.left === 'boolean' ? value.left : fallback.left, right: typeof value?.right === 'boolean' ? value.right : fallback.right }; } catch { return fallback; }
 }
 const viewOnlyKey = 'workflow-canvas:view-only';
+/** 요약 보기: cards show only title, status and per-status execution counts, with an execution overview panel. Remembered per browser. */
+const summaryKey = 'workflow-canvas:summary';
+function storedSummary(): boolean { try { return localStorage.getItem(summaryKey) === '1'; } catch { return false; } }
 function storedViewOnly(): boolean { try { return localStorage.getItem(viewOnlyKey) === '1'; } catch { return false; } }
 function lastProject(): string | null { try { return localStorage.getItem(lastProjectKey); } catch { return null; } }
 /** The workflow's settings (like environment variables): asked in the run dialog, fixed per automation, used as {{key}}. */
 function VariablesEditor({ variables, nodes, onChange }: { variables: WorkflowVariable[]; nodes: StageNode[]; onChange: (variables: WorkflowVariable[]) => void }) {
-  const used = new Set(nodes.filter(isExecutable).flatMap((node) => variableRefs(node.data.description)));
+  const used = new Set([...nodes.filter(isExecutable).flatMap((node) => variableRefs(node.data.description)),
+    ...nodes.filter(isGroup).flatMap((node) => variableRefs(node.data.parentPath ?? ''))]);
   const update = (index: number, patch: Partial<WorkflowVariable>) => onChange(variables.map((item, at) => at === index ? { ...item, ...patch } : item));
   const nextKey = () => { let n = variables.length + 1; while (variables.some((item) => item.key === `value_${n}`)) n += 1; return `value_${n}`; };
   return <section className="variables-editor" aria-label="워크플로 설정값">
@@ -221,6 +262,8 @@ function Workspace() {
   useEffect(() => { try { localStorage.setItem(panelsKey, JSON.stringify(narrow(900) ? { ...JSON.parse(localStorage.getItem(panelsKey) ?? '{}'), right: panels.right } : panels)); } catch { /* per-browser convenience only */ } }, [panels]);
   // 보기 전용: 노드 이동·연결·삭제·추가와 속성 편집을 막고 화면 이동·선택·관찰만 허용한다.
   const [viewOnly, setViewOnly] = useState(storedViewOnly);
+  const [summary, setSummary] = useState(storedSummary);
+  useEffect(() => { try { localStorage.setItem(summaryKey, summary ? '1' : '0'); } catch { /* per-browser convenience only */ } }, [summary]);
   useEffect(() => { try { localStorage.setItem(viewOnlyKey, viewOnly ? '1' : '0'); } catch { /* per-browser convenience only */ } }, [viewOnly]);
   // Picking something from the sidebar closes it only where it covers the canvas as a drawer.
   const closeDrawer = useCallback(() => { if (narrow(900)) setPanels((value) => ({ ...value, left: false })); }, []);
@@ -233,6 +276,7 @@ function Workspace() {
       if (event.key === 'v' || event.key === 'V') setPointerMode('select');
       else if (event.key === 'h' || event.key === 'H') setPointerMode('pan');
       else if (event.key === 'l' || event.key === 'L') setViewOnly((value) => !value);
+      else if (event.key === 's' || event.key === 'S') setSummary((value) => !value);
       else if (event.key === '[') setPanels((value) => ({ ...value, left: !value.left }));
       else if (event.key === ']') setPanels((value) => ({ ...value, right: !value.right }));
     };
@@ -288,6 +332,9 @@ function Workspace() {
     return [...seen.values()];
   }, [visibleExecutions]);
   const finishedCount = executionStatuses.filter((execution) => execution.finished).length;
+  // 요약 보기 panel: each visible execution's progress and the stages running, waiting or failed in it.
+  const executionSummaries = useMemo(() => summary ? visibleExecutions.map((execution) => ({ execution, ...summarizeExecution(nodes, execution, observed, stale) })) : [],
+    [summary, visibleExecutions, nodes, observed, stale]);
   // User decisions (gates, user-judged branches) open now: answered here so the coordinator never has to stop and ask.
   const [flow, setFlow] = useState<FlowStage[]>([]);
   const isSaved = saved.some((item) => item.id === workflow.id);
@@ -931,7 +978,7 @@ function Workspace() {
     } catch (error) { setNotice((error as Error).message); }
   }
 
-  const canvasContext = useMemo(() => ({ openTask, workflowName, viewOnly }), [openTask, workflowName, viewOnly]);
+  const canvasContext = useMemo(() => ({ openTask, workflowName, viewOnly, summary }), [openTask, workflowName, viewOnly, summary]);
   /** 연결된 단계: the selected stage's direct predecessors and successors; clicking one moves to it. */
   function related() {
     if (!near || (!near.upstream.length && !near.downstream.length)) return null;
@@ -994,6 +1041,8 @@ function Workspace() {
                 <Icon size={17} /><span className="tool-tip" role="tooltip"><strong>{name}</strong>{tip}</span></button>)}
             <button className={`tool-button mode-button ${viewOnly ? 'active locked' : ''}`} aria-label="보기 전용 (L)" aria-pressed={viewOnly} onClick={() => setViewOnly((value) => !value)}>
               {viewOnly ? <Lock size={17} /> : <Eye size={17} />}<span className="tool-tip" role="tooltip"><strong>보기 전용 (L)</strong>{viewOnly ? '켜짐: 이동·연결·삭제·편집이 막혀 있습니다. 눌러서 편집으로 돌아가기' : '노드 이동·연결·삭제·추가와 속성 편집을 막고 보기만 합니다'}</span></button>
+            <button className={`tool-button mode-button ${summary ? 'active' : ''}`} aria-label="요약 보기 (S)" aria-pressed={summary} onClick={() => setSummary((value) => !value)}>
+              <Gauge size={17} /><span className="tool-tip" role="tooltip"><strong>요약 보기 (S)</strong>{summary ? '켜짐: 단계는 제목·상태·실행 수만 보입니다. 눌러서 자세히 보기로 돌아가기' : '단계 카드를 제목·상태·실행 수로 줄이고, 실행별 진행 현황을 함께 봅니다'}</span></button>
             {!viewOnly && <><span className="tool-divider" /><span className="tool-group-label">노드</span>
             {([['worker', Bot, '워커', '에이전트 하나가 지침을 수행'], ['gate', Hand, '사용자 개입 게이트', '사용자가 통과·거절을 결정'],
               ['branch', Split, '분기', '판정 결과에 따라 출력 하나(또는 여럿)로만 진행. 일반 연결은 모두 병렬'],
@@ -1040,6 +1089,21 @@ function Workspace() {
           </section>}
           <div className="canvas-mode"><span className={`status-dot ${workflow.runId && snapshot && !stale ? 'running' : ''}`} />{workflow.runId ? 'Orca 실시간 관찰' : '설계 모드'}
             {activeAutomations.length > 0 && <span className="automation-badge" title="이 자동화가 시작한 실행이 진행 중입니다"><Zap size={11} />자동화 {activeAutomations.map((item) => `「${item.name}」`).join(' ')} 진행 중</span>}</div>
+          {summary && executions.length > 0 && <section className="summary-panel" aria-label="실행 현황">
+            <header><Gauge size={13} />실행 현황 {visibleExecutions.length}{finishedCount > 0 && <small>끝난 실행 {finishedCount}개 숨김</small>}</header>
+            {!executionSummaries.length && <p className="summary-empty">진행 중인 실행이 없습니다</p>}
+            {executionSummaries.map(({ execution, total, done, tally, running, blocked, failed }) => <button key={execution.id}
+              className={`summary-row ${execution.status} ${execution.id === executionView ? 'active' : ''}`} title="클릭해 이 실행만 보기 (다시 누르면 모아 보기)"
+              onClick={() => setView(execution.id === executionView ? 'all' : execution.id)}>
+              <span className="summary-row-head"><span className={`task-state ${execution.status}`}><span className="status-dot" />{statusLabels[execution.status]}</span>
+                {execution.automation && <Zap size={10} />}<strong>{execution.label}</strong><span className="summary-count">{done}/{total}</span></span>
+              <span className="summary-bar" aria-hidden>{tally.map((item) => <i key={item.status} className={item.status} style={{ flexGrow: item.count }} />)}</span>
+              {(running.length > 0 || blocked.length > 0 || failed.length > 0) && <span className="summary-stages">
+                {running.length > 0 && <span className="running">▶ {running.join(', ')}</span>}
+                {blocked.length > 0 && <span className="blocked">? {blocked.join(', ')}</span>}
+                {failed.length > 0 && <span className="failed">✕ {failed.join(', ')}</span>}</span>}
+            </button>)}
+          </section>}
           {liveNodes.length > 0 && <nav className="live-bar" aria-label="실행 중인 단계">
             <button className="live-bar-title" title="실행 중인 단계로 차례로 이동" onClick={focusNextLive}><LocateFixed size={13} />실행 중 {liveCount}
               {liveNodes.length > liveCount && <span className="live-bar-blocked">· 확인 필요 {liveNodes.length - liveCount}</span>}</button>
@@ -1061,7 +1125,7 @@ function Workspace() {
           </ReactFlow>
           {nodes.length === 0 && !viewOnly && <div className="empty-canvas"><Network size={36} /><h2>첫 단계를 만들어 보세요</h2><p>워커를 추가하고, 프로젝트·워크트리 그룹으로 작업 위치를 묶을 수 있습니다.</p><div className="empty-actions"><button className="button primary" onClick={() => addNode('worker')}><Plus size={16} />워커 추가</button>
             <button className="button" onClick={() => { setGenerateForm((form) => ({ ...form, project: form.project || defaultProject() })); setGenerateDialog(true); }}><Sparkles size={16} />자연어로 만들기</button></div></div>}
-          <div className="canvas-hint">{viewOnly ? '보기 전용: 드래그·스크롤로 화면 이동, 클릭으로 선택만 됩니다 · L로 편집 모드 · [ / ]로 패널 접기' : pointerMode === 'select' ? '선택 모드: 빈 곳 드래그로 여러 개 선택 · 스크롤/가운데 버튼·Space+드래그로 화면 이동' : '이동 모드: 드래그로 화면 이동 · Shift+드래그로 여러 개 선택'} · V/H로 모드 전환 · 노드 드래그로 이동 · 단계를 그룹 안에 놓아 작업 위치 지정 · 포트를 연결해 흐름 만들기 · Delete로 삭제 · L 보기 전용 · [ / ]로 패널 접기</div>
+          <div className="canvas-hint">{viewOnly ? '보기 전용: 드래그·스크롤로 화면 이동, 클릭으로 선택만 됩니다 · L로 편집 모드 · [ / ]로 패널 접기' : pointerMode === 'select' ? '선택 모드: 빈 곳 드래그로 여러 개 선택 · 스크롤/가운데 버튼·Space+드래그로 화면 이동' : '이동 모드: 드래그로 화면 이동 · Shift+드래그로 여러 개 선택'} · V/H로 모드 전환 · 노드 드래그로 이동 · 단계를 그룹 안에 놓아 작업 위치 지정 · 포트를 연결해 흐름 만들기 · Delete로 삭제 · L 보기 전용 · S 요약 보기 · [ / ]로 패널 접기</div>
         </section>
         <aside className="sidebar floating-panel" hidden={!panels.left} aria-label="워크플로 목록">
           <div className="sidebar-head"><a className="brand" href="/" onClick={(event) => event.preventDefault()}><span className="brand-mark"><Network size={23} /></span><span>workflow<span className="brand-sub">canvas</span></span><span className="version">0.1</span></a><button className="icon-button panel-collapse" title="사이드바 접기 ([)" aria-label="사이드바 접기" onClick={() => setPanels((value) => ({ ...value, left: false }))}><PanelLeftClose size={16} /></button></div>
@@ -1149,6 +1213,17 @@ function Workspace() {
               onChange={(event) => updateNode({ baseBranch: event.target.value.replace(/[^A-Za-z0-9._/-]/g, '').replace(/^-+/, '').replace(/\.\.+/g, '.') || undefined })} />
             <label className="check-row"><input type="checkbox" checked={!!selectedGroup.data.perExecution} onChange={(event) => updateNode({ perExecution: event.target.checked || undefined })} />
               <span>실행마다 따로 만들기<small>이름 뒤에 -1, -2 …를 붙입니다. 끄면 병렬·반복 실행이 같은 워크트리를 재사용합니다.</small></span></label>
+            {(() => {
+              const outer = membershipOf({ nodes }, selectedGroup).worktrees;
+              if (outer.length) return <p className="field-help">워크트리 그룹 「{outer[outer.length - 1].data.label}」 안에 있어 그 워크트리의 하위로 만들어집니다.</p>;
+              const declared = new Set((workflow.variables ?? []).map((item) => item.key));
+              const unknown = variableRefs(selectedGroup.data.parentPath ?? '').filter((key) => !declared.has(key));
+              return <><label className="field-label" htmlFor="group-parent">부모 워크트리</label>
+                <input id="group-parent" value={selectedGroup.data.parentPath ?? ''} maxLength={1024} placeholder="비우면 부모 없음 · 절대 경로 또는 {{설정값}}"
+                  onChange={(event) => updateNode({ parentPath: event.target.value.replace(/[\u0000-\u001f]/g, '') || undefined })} />
+                {unknown.length ? <p className="field-help warning">{unknown.map((key) => `{{${key}}}`).join(', ')} 은(는) 워크플로 설정값에 없습니다 — 이대로면 실행 전에 거부됩니다.</p>
+                  : <p className="field-help">이 워크트리를 그 워크트리의 하위 워크트리로 만듭니다. 설정값으로 주면 실행·자동화마다 다르게 정할 수 있고, 값이 비면 부모 없이 만듭니다.</p>}</>;
+            })()}
             </> : <>
             <label className="field-label" htmlFor="group-target">{selectedGroup.data.scope === 'worktree' ? '워크트리' : '프로젝트'}</label>
             <select id="group-target" value={selectedGroup.data.path ?? ''} onChange={(event) => { const option = locationOptions.find((item) => item.path === event.target.value);
@@ -1318,7 +1393,13 @@ function Workspace() {
                 : <p className="field-help">일반 연결은 병렬입니다. 앞 단계가 끝나면 바로 이어지고, 한 단계에 여러 연결이 들어오면 건너뛰지 않은 앞 단계가 모두 끝날 때까지 기다립니다. 연결 설명은 참고용이며 진행 여부를 바꾸지 않습니다. 골라서 진행하려면 분기 노드를 쓰세요.</p>;
             })()}<button className="button danger" onClick={removeSelected}><Trash2 size={14} />연결 삭제</button></div>
             : <div className="inspector-content"><div className="inspector-empty compact"><Settings2 size={22} /><p>단계나 연결을 선택해 속성을 편집하세요.</p></div>
-              <VariablesEditor variables={workflow.variables ?? []} nodes={nodes} onChange={(variables) => setWorkflow((value) => ({ ...value, variables: variables.length ? variables : undefined }))} /></div>}
+              <VariablesEditor variables={workflow.variables ?? []} nodes={nodes} onChange={(variables) => setWorkflow((value) => ({ ...value, variables: variables.length ? variables : undefined }))} />
+              <label className="field-label" htmlFor="coordinator-group">코디네이터 위치</label>
+              <select id="coordinator-group" value={workflow.coordinatorGroup ?? ''} onChange={(event) => setWorkflow((value) => ({ ...value, coordinatorGroup: event.target.value || undefined }))}>
+                <option value="">실행 프로젝트</option>
+                {nodes.filter((node) => isGroup(node) && node.data.scope === 'worktree').map((node) => <option key={node.id} value={node.id}>워크트리 그룹 「{node.data.label}」</option>)}
+              </select>
+              <p className="field-help">워크트리 그룹을 고르면 캔버스 서버가 실행 전에 그 워크트리를 찾거나 만들고, 코디네이터를 그 안에서 띄웁니다. 이름은 직접 지정이나 실행 시 입력이어야 합니다. 자동화가 띄운 코디네이터는 실행 프로젝트에서 시작합니다.</p></div>}
           </fieldset>
         </aside>
       </div>

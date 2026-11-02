@@ -83,6 +83,11 @@ export type StageData = {
   inputPrompt?: string;
   /** 'create' only: one worktree per execution (name-#n) instead of one shared, reused worktree. */
   perExecution?: boolean;
+  /**
+   * 'create' only, for a group not nested in another worktree group: the worktree to create it under (an absolute path,
+   * or a setting such as `{{parent_worktree}}`). Empty, or a setting given no value: no parent.
+   */
+  parentPath?: string;
   /** Display only: the project a create-mode worktree group inherits from its project group. */
   inheritedRepo?: string;
   /** Display only: the selected node's project/worktree groups, shown on its card. */
@@ -173,6 +178,11 @@ export type Workflow = {
   automations?: AutomationConfig[];
   /** Settings the run dialog and automations ask for (an epic link, a sheet URL…); stage instructions use them as {{key}}. */
   variables?: WorkflowVariable[];
+  /**
+   * A worktree group the coordinator runs in. Unset: the coordinator starts in the run's project. Set: the server prepares
+   * that worktree (reuses or creates it) before starting the coordinator inside it.
+   */
+  coordinatorGroup?: string;
 };
 /**
  * A loop edge goes back from an output of an exclusive branch to a stage before it. Choosing that output runs the stages
@@ -398,6 +408,23 @@ export function executionStatuses(nodes: StageNode[], execution: Execution, snap
   return nodes.filter(isExecutable).map((node) => nodeExecutionStatus(node, execution, snapshot, stale));
 }
 
+/** 요약 보기 order: what needs eyes first (running, waiting on a person, failed), then what is settled. */
+export const tallyOrder: StageStatus[] = ['running', 'blocked', 'failed', 'unknown', 'pending', 'completed', 'skipped', 'unbound'];
+/** How many of the given statuses fall in each status, in `tallyOrder`, leaving out the empty ones. */
+export function tallyStatuses(statuses: StageStatus[]): { status: StageStatus; count: number }[] {
+  return tallyOrder.map((status) => ({ status, count: statuses.filter((item) => item === status).length })).filter((item) => item.count > 0);
+}
+export type ExecutionSummary = { total: number; done: number; tally: { status: StageStatus; count: number }[];
+  running: string[]; blocked: string[]; failed: string[] };
+/** One execution at a glance: settled stages (completed or skipped) of all, and which stages run, wait, or failed. */
+export function summarizeExecution(nodes: StageNode[], execution: Execution, snapshot: RunSnapshot | null, stale: boolean): ExecutionSummary {
+  const stages = nodes.filter(isExecutable);
+  const statuses = stages.map((node) => nodeExecutionStatus(node, execution, snapshot, stale));
+  const names = (status: StageStatus) => stages.filter((_, index) => statuses[index] === status).map((node) => node.data.label || '이름 없는 단계');
+  return { total: stages.length, done: statuses.filter((status) => status === 'completed' || status === 'skipped').length,
+    tally: tallyStatuses(statuses), running: names('running'), blocked: names('blocked'), failed: names('failed') };
+}
+
 /**
  * Projects observed state onto nodes.
  * - executionId omitted/null: node.data.taskId binding (single-execution documents).
@@ -457,9 +484,10 @@ export function serializableWorkflow(workflow: Workflow): Workflow {
       ...(execution.spawned && Object.keys(execution.spawned).some((nodeId) => nodeIds.has(nodeId))
         ? { spawned: Object.fromEntries(Object.entries(execution.spawned).filter(([nodeId]) => nodeIds.has(nodeId))) } : {}) };
   });
-  const { executions: _omit, workspace, cleanup, automations, variables, ...rest } = workflow;
+  const { executions: _omit, workspace, cleanup, automations, variables, coordinatorGroup, ...rest } = workflow;
   const ordered = orderNodes(workflow.nodes);
   return { ...rest, ...(workspace ? { workspace } : {}),
+    ...(coordinatorGroup && groupIds.has(coordinatorGroup) ? { coordinatorGroup } : {}),
     ...(variables?.length ? { variables: variables.map((item) => ({ key: item.key, label: item.label.trim() || item.key,
       ...(item.description ? { description: item.description } : {}), ...(item.default ? { default: item.default } : {}), ...(item.required ? { required: true } : {}) })) } : {}),
     ...(cleanup ? { cleanup: { coordinator: !!cleanup.coordinator, worktrees: !!cleanup.worktrees, sessions: !!cleanup.sessions } } : {}),
@@ -476,7 +504,7 @@ export function serializableWorkflow(workflow: Workflow): Workflow {
         ...(source === 'fixed' && node.data.worktreeName ? { worktreeName: node.data.worktreeName } : {}),
         ...(source === 'agent' && node.data.nameFrom ? { nameFrom: node.data.nameFrom } : {}),
         ...(source === 'input' && node.data.inputPrompt ? { inputPrompt: node.data.inputPrompt } : {}),
-        ...(node.data.perExecution ? { perExecution: true } : {}) });
+        ...(node.data.perExecution ? { perExecution: true } : {}), ...(node.data.parentPath?.trim() ? { parentPath: node.data.parentPath.trim() } : {}) });
     } else if (group && node.data.scope === 'worktree') Object.assign(data, { scope: 'worktree', path: node.data.path ?? '',
       ...(node.data.ref ? { ref: node.data.ref } : {}), ...(node.data.repoPath ? { repoPath: node.data.repoPath } : {}),
       ...(node.data.worktreeName ? { worktreeName: node.data.worktreeName } : {}), ...(node.data.branch ? { branch: node.data.branch } : {}) });
@@ -579,6 +607,11 @@ export function worktreeRepo(workflow: Pick<Workflow, 'nodes'>, group: StageNode
 export function parentWorktree(workflow: Pick<Workflow, 'nodes'>, group: StageNode): StageNode | undefined {
   const parent = groupOf(workflow, group);
   return parent?.data.scope === 'worktree' ? parent : undefined;
+}
+/** A create-mode group's own parent setting, with settings substituted; '' when unset or its setting has no value. */
+export function resolvedParentPath(group: Pick<StageNode, 'data'>, values: Record<string, string>): string {
+  const text = substituteVariables(group.data.parentPath ?? '', values).trim();
+  return text.startsWith('/') && !variableRefs(text).length ? text : '';
 }
 /**
  * Where a node runs: its group's path (or a new-worktree token for a create-mode group),

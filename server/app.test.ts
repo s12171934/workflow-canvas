@@ -242,7 +242,7 @@ test('automations: create in Orca with a brief-fetching prompt, fire, and remove
     const config = created.automations[0];
     assert.equal(config.orcaId, 'orca-auto-1');
     const create = calls.find((args) => args[1] === 'create')!;
-    assert.ok(create.includes('--repo') && create.includes('path:/example/repo') && create.includes('--time') && create.includes('02:00'));
+    assert.ok(create.includes('--workspace') && !create.includes('--repo') && create.includes('path:/example/repo') && create.includes('--time') && create.includes('02:00'));
     assert.match(create[create.indexOf('--prompt') + 1], new RegExp(`/api/workflows/${graph.id}/automations/${config.id}/brief`));
     const listing = await (await fetch(`${base}/api/workflows/${graph.id}/automations`)).json();
     assert.equal(listing.automations[0].state.enabled, true);
@@ -413,6 +413,9 @@ test('branches: brief carries order and judges, bad branches are refused, decisi
     assert.equal(decided.status, 200);
     assert.deepEqual(await decided.json(), { decisions: { check: ['pass'] }, skipped: ['fix'], skippedTasks: ['task-fix'] });
     assert.equal((await decide({ node: 'check', outputs: ['pass'] })).status, 200);
+    // A choice made elsewhere (the QA dashboard) names where; a repeat of the same choice is accepted, another one refused.
+    assert.equal((await decide({ node: 'check', outputs: ['pass'], by: 'user', via: '\n' })).status, 400);
+    assert.equal((await decide({ node: 'check', outputs: ['pass'], by: 'user', via: '대시보드' })).status, 200);
     assert.equal((await decide({ node: 'check', outputs: ['fail'] })).status, 409);
     // Re-registering the same Run keeps what was decided.
     await fetch(`${base}/api/workflows/wf-branch/executions`, { method: 'PUT', headers: json,
@@ -814,4 +817,92 @@ test('loops: a branch output goes back with a limit; the decision API starts a n
     await new Promise<void>((resolve, reject) => { server.close((error) => error ? reject(error) : resolve()); server.closeAllConnections(); });
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test('a coordinator worktree group: the server reuses or creates it (under the parent setting) and starts the coordinator inside it', async () => {
+  await mkdir('.local', { recursive: true });
+  const directory = await mkdtemp(join(resolve('.local'), 'api-coordinator-test-'));
+  const calls: string[][] = [];
+  const existing = [{ path: '/example/worktrees/ABC-2', displayName: 'ABC-2', branch: 'refs/heads/ABC-2' }];
+  const bridge = createOrcaBridge(async (args) => {
+    calls.push(args);
+    if (args[0] === 'repo') return places(args)!;
+    if (args[0] === 'worktree' && args[1] === 'list') return { worktrees: args.includes('--repo') ? existing : [] };
+    if (args[0] === 'worktree' && args[1] === 'create') return { worktree: { path: `/example/worktrees/${args[args.indexOf('--name') + 1]}` } };
+    if (args[0] === 'agent') return { terminal: { handle: `term_${calls.length}` } };
+    return {};
+  });
+  const json = { 'Content-Type': 'application/json' };
+  const ticket = { version: 1 as const, id: 'ticket', name: '티켓 해결', description: '', runId: '', edges: [], coordinatorGroup: 'wt',
+    variables: [{ key: 'parent_worktree', label: '에픽 워크트리' }], nodes: [
+      { id: 'wt', type: 'group' as const, position: { x: 0, y: 0 }, width: 400, height: 300,
+        data: { label: '티켓', description: '', kind: 'group' as const, scope: 'worktree' as const, path: '', worktreeMode: 'create' as const, nameSource: 'input' as const, parentPath: '{{parent_worktree}}' } },
+      { id: 'fix', type: 'stage' as const, parentId: 'wt', position: { x: 20, y: 40 }, data: { label: '수정', description: '고친다', kind: 'worker' as const } },
+    ] };
+  const server = createApp(directory, bridge).listen(0, '127.0.0.1');
+  await new Promise<void>((resolve) => server.once('listening', resolve));
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const put = (graph: unknown) => fetch(`${base}/api/workflows/${(graph as { id: string }).id}`, { method: 'PUT', headers: json, body: JSON.stringify(graph) });
+  const execute = (id: string, inputs: Record<string, string>, values: Record<string, string> = {}) =>
+    fetch(`${base}/api/workflows/${id}/execute`, { method: 'POST', headers: json, body: JSON.stringify({ count: 1, project: '/example/repo', inputs, values }) });
+  const settled = async (agents: number) => { for (let i = 0; i < 100 && calls.filter((args) => args[0] === 'agent').length < agents; i += 1) await new Promise((resolve) => setTimeout(resolve, 20)); };
+  const latestBrief = async (id: string) => {
+    const [log] = await (await fetch(`${base}/api/workflows/${id}/logs`)).json();
+    return { log, brief: (await (await fetch(`${base}/api/workflows/${id}/logs/${log.id}/files/brief.md`)).json()).text as string };
+  };
+  try {
+    // Stored and refused as documents: a relative parent, a coordinator group that is not a worktree group.
+    assert.equal((await put({ ...ticket, id: 'bad-parent', nodes: [{ ...ticket.nodes[0], data: { ...ticket.nodes[0].data, parentPath: 'relative/path' } }, ticket.nodes[1]] })).status, 400);
+    assert.equal((await put({ ...ticket, id: 'bad-group', coordinatorGroup: 'fix' })).status, 400);
+    // Refused before anything is created: an agent-named group cannot hold the coordinator; nor a run without its name.
+    assert.equal((await put({ ...ticket, id: 'agent-named', nodes: [{ ...ticket.nodes[0], data: { ...ticket.nodes[0].data, nameSource: 'agent', nameFrom: 'pick' } }, ticket.nodes[1],
+      { id: 'pick', type: 'stage' as const, position: { x: 0, y: 400 }, data: { label: '고르기', description: '고른다', kind: 'worker' as const } }] })).status, 200);
+    assert.match((await (await execute('agent-named', {})).json()).error, /코디네이터를 띄우기 전에/);
+    assert.equal((await put(ticket)).status, 200);
+    assert.match((await (await execute('ticket', { wt: '' })).json()).error, /워크트리 이름/);
+    assert.equal(calls.filter((args) => args[0] === 'worktree' && args[1] === 'create').length + calls.filter((args) => args[0] === 'agent').length, 0);
+
+    // New ticket: created under the parent setting, coordinator started inside it, brief marks it prepared.
+    assert.equal((await execute('ticket', { wt: 'ABC-1' }, { parent_worktree: '/example/worktrees/epic' })).status, 200);
+    await settled(1);
+    const create = calls.find((args) => args[0] === 'worktree' && args[1] === 'create')!;
+    assert.deepEqual(create.slice(create.indexOf('--parent-worktree'), create.indexOf('--parent-worktree') + 2), ['--parent-worktree', 'path:/example/worktrees/epic']);
+    assert.ok(!create.includes('--no-parent'));
+    const launch = calls.filter((args) => args[0] === 'agent')[0];
+    assert.equal(launch[launch.indexOf('--worktree') + 1], 'path:/example/worktrees/ABC-1');
+    let { log, brief } = await latestBrief('ticket');
+    assert.match(brief, /"prepared": true/);
+    assert.match(brief, /"parentPath": "\/example\/worktrees\/epic"/);
+    const events = (await (await fetch(`${base}/api/workflows/ticket/logs/${log.id}`)).json()).events.map((event: { message: string }) => event.message).join('\n');
+    assert.match(events, /새로 생성 \(부모 \/example\/worktrees\/epic\): \/example\/worktrees\/ABC-1/);
+
+    // Reopened ticket: its worktree is reused as it is; nothing created.
+    assert.equal((await execute('ticket', { wt: 'ABC-2' }, { parent_worktree: '/example/worktrees/epic' })).status, 200);
+    await settled(2);
+    assert.equal(calls.filter((args) => args[0] === 'worktree' && args[1] === 'create').length, 1);
+    assert.equal(calls.filter((args) => args[0] === 'agent')[1][calls.filter((args) => args[0] === 'agent')[1].indexOf('--worktree') + 1], 'path:/example/worktrees/ABC-2');
+    ({ log } = await latestBrief('ticket'));
+    const reused = (await (await fetch(`${base}/api/workflows/ticket/logs/${log.id}`)).json()).events.map((event: { message: string }) => event.message).join('\n');
+    assert.match(reused, /재사용: \/example\/worktrees\/ABC-2/);
+
+    // No parent value: created with no parent.
+    assert.equal((await execute('ticket', { wt: 'ABC-3' })).status, 200);
+    await settled(3);
+    assert.ok(calls.filter((args) => args[0] === 'worktree' && args[1] === 'create')[1].includes('--no-parent'));
+  } finally {
+    await new Promise<void>((resolve, reject) => { server.close((error) => error ? reject(error) : resolve()); server.closeAllConnections(); });
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('the brief marks the coordinator worktree prepared only when the server started the coordinator there', async () => {
+  const { buildBrief } = await import('./execute.ts');
+  const graph = { version: 1 as const, id: 'wf', name: 'wf', description: '', runId: '', edges: [], coordinatorGroup: 'wt', nodes: [
+    { id: 'wt', type: 'group' as const, position: { x: 0, y: 0 }, data: { label: '티켓', description: '', kind: 'group' as const, scope: 'worktree' as const, path: '', worktreeMode: 'create' as const, nameSource: 'fixed' as const, worktreeName: 'T-1', parentPath: '/epic' } },
+    { id: 'a', type: 'stage' as const, parentId: 'wt', position: { x: 0, y: 0 }, data: { label: 'a', description: 'a', kind: 'worker' as const } },
+  ] };
+  const common = { graph, count: 1, apiBase: 'http://127.0.0.1:1', workspace: '/run/project', artifactDir: '/tmp/x' };
+  assert.doesNotMatch(buildBrief(common), /"prepared"/); // an automation's own agent coordinates from the project
+  assert.match(buildBrief(common), /"parentPath": "\/epic"/);
+  assert.match(buildBrief({ ...common, preparedGroup: 'wt' }), /"prepared": true/);
 });

@@ -1,10 +1,12 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { worktreeNamePattern } from '../src/model.ts';
 import type { AutomationState, Locations, RunSnapshot, RunSummary, TaskSummary, WorkerSummary } from '../src/model.ts';
 
 const exec = promisify(execFile);
 type Row = Record<string, any>;
-export type Command = (args: string[]) => Promise<Row>;
+/** `timeoutMs`: for slow commands (creating a worktree runs its setup); the default suits queries. */
+export type Command = (args: string[], options?: { timeoutMs?: number }) => Promise<Row>;
 
 export function commandForEnvironment(env: NodeJS.ProcessEnv = process.env): string {
   if (env.ORCA_CLI_COMMAND) return env.ORCA_CLI_COMMAND;
@@ -32,16 +34,18 @@ const limited = createLimiter(maxConcurrentCalls);
 /** Slow calls are logged (command words and timings only, never arguments that could carry paths or task text). */
 const slowCallMs = 3000;
 let queued = 0;
-export const orcaCommand: Command = (args) => {
+export const orcaCommand: Command = (args, options) => {
   const asked = Date.now();
+  const timeoutMs = options?.timeoutMs ?? callTimeoutMs;
   queued++;
-  return limited(async () => {
+  // A long call (creating a worktree runs its setup for minutes) would hold a slot meant for quick reads: it skips the line.
+  const run = async () => {
   const started = Date.now();
   const waiting = --queued;
   let outcome = 'ok';
   try {
     const { stdout } = await exec(commandForEnvironment(), [...args, '--json'], {
-      timeout: callTimeoutMs, maxBuffer: 8 * 1024 * 1024, windowsHide: true,
+      timeout: timeoutMs, maxBuffer: 8 * 1024 * 1024, windowsHide: true,
     });
     const response = JSON.parse(stdout);
     if (response.ok !== true || !response.result) throw new Error(response.error?.message ?? 'Orca 응답을 확인할 수 없습니다.');
@@ -51,13 +55,14 @@ export const orcaCommand: Command = (args) => {
     const failure = error as NodeJS.ErrnoException & { killed?: boolean; signal?: string };
     if (failure.code === 'ENOENT') throw new Error('Orca CLI를 찾지 못했습니다. ORCA_CLI_COMMAND를 실행 파일 경로로 설정하세요.');
     outcome = failure.killed || failure.signal === 'SIGTERM' ? 'timeout' : 'fail';
-    if (failure.killed || failure.signal === 'SIGTERM') throw new Error(`Orca CLI가 ${callTimeoutMs / 1000}초 안에 응답하지 않았습니다. 시스템 부하나 동시에 돌고 있는 에이전트 수를 확인하세요.`);
+    if (failure.killed || failure.signal === 'SIGTERM') throw new Error(`Orca CLI가 ${timeoutMs / 1000}초 안에 응답하지 않았습니다. 시스템 부하나 동시에 돌고 있는 에이전트 수를 확인하세요.`);
     throw new Error('Orca CLI 조회에 실패했습니다. Orca 앱 실행 상태와 CLI 버전을 확인하세요.');
   } finally {
     const done = Date.now();
     if (done - asked >= slowCallMs) console.log(`[orca] ${new Date(done).toISOString()} ${args.slice(0, 2).join(' ')} wait=${((started - asked) / 1000).toFixed(1)}s run=${((done - started) / 1000).toFixed(1)}s queue=${waiting} ${outcome}`);
   }
-  });
+  };
+  return options?.timeoutMs ? run() : limited(run);
 };
 
 /** How long a read is reused (`fresh`) and how long the last good value stands in for a failed read (`stale`). */
@@ -145,7 +150,7 @@ export function createOrcaBridge(command: Command = orcaCommand, cacheTimes: Cac
     async createAutomation(input: { name: string; trigger: string; time?: string; day?: number; project: string; prompt: string }): Promise<string> {
       const result = await command(['automations', 'create', '--name', input.name, '--trigger', input.trigger,
         ...(input.time ? ['--time', input.time] : []), ...(input.day !== undefined ? ['--day', String(input.day)] : []),
-        '--prompt', input.prompt, '--provider', 'claude', '--repo', `path:${input.project}`, '--workspace-mode', 'existing', '--fresh-session', '--enabled']);
+        '--prompt', input.prompt, '--provider', 'claude', '--workspace', `path:${input.project}`, '--workspace-mode', 'existing', '--fresh-session', '--enabled']);
       const id = result.automation?.id ?? result.id;
       cache.forget('automations');
       if (typeof id !== 'string' || !/^[a-zA-Z0-9-]{1,128}$/.test(id)) throw new Error('Orca가 만든 자동화의 ID를 확인할 수 없습니다.');
@@ -202,6 +207,25 @@ export function createOrcaBridge(command: Command = orcaCommand, cacheTimes: Cac
      * The handle is resolved server-side from the Run snapshot; clients never pass a handle.
      * This is a view action only: it does not send input or change any lifecycle state.
      */
+    /**
+     * The worktree a coordinator starts in: one of the repo's worktrees whose display name or branch is `name`, else a new one
+     * (under `parent` when given, else with no parent). Reused worktrees are left as they are.
+     */
+    async prepareWorktree(input: { repo: string; name: string; parent?: string; baseBranch?: string }): Promise<{ path: string; created: boolean }> {
+      if (!worktreeNamePattern.test(input.name)) throw new Error('올바르지 않은 워크트리 이름입니다.');
+      const absolute = (value: unknown): value is string => typeof value === 'string' && value.startsWith('/') && !/[\u0000-\u001f]/.test(value);
+      if (!absolute(input.repo) || (input.parent !== undefined && !absolute(input.parent))) throw new Error('워크트리 경로가 올바르지 않습니다.');
+      const listed = await command(['worktree', 'list', '--repo', `path:${input.repo}`, '--limit', '500']);
+      const found = (listed.worktrees ?? []).find((row: Row) => absolute(row.path) && !row.isArchived && !row.isBare
+        && (row.displayName === input.name || (typeof row.branch === 'string' && row.branch.replace(/^refs\/heads\//, '') === input.name)));
+      if (found) return { path: found.path, created: false };
+      const result = await command(['worktree', 'create', '--repo', `path:${input.repo}`, '--name', input.name,
+        ...(input.baseBranch ? ['--base-branch', input.baseBranch] : []),
+        ...(input.parent ? ['--parent-worktree', `path:${input.parent}`] : ['--no-parent']), '--setup', 'inherit'], { timeoutMs: 600_000 });
+      const path = result.worktree?.path ?? result.path;
+      if (!absolute(path)) throw new Error('Orca가 만든 워크트리의 경로를 확인할 수 없습니다.');
+      return { path, created: true };
+    },
     /** Starts the coordinator agent in a terminal (orchestration needs a terminal-bound coordinator). */
     async launchCoordinator(workspaceRoot: string, prompt: string): Promise<{ terminal?: string }> {
       const result = await command(['agent', 'launch', '--agent', 'claude', '--model', 'claude-opus-5-5',
