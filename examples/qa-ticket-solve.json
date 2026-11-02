@@ -326,7 +326,7 @@
       "parentId": "wt",
       "data": {
         "label": "검토 완료 보고",
-        "description": "공통 — 먼저 같은 산출물 폴더의 준비 산출물 `<실행 번호>-prepare.txt` 를 읽어 parent·key·round·reopen·state_dir(아래 STATE)·record_file·설정 값을 확인한다. 상태 디렉터리 규칙은 `~/.claude/skills/qa-ticket-driver/exports/state-contract.md` 가, 단계별 세부 절차는 `~/.claude/skills/qa-ticket-driver/references/brief-coordinator.md` 가 정본이다(@@KEY@@ 등 자리는 준비 산출물 값, @@STATE_DIR@@ 은 STATE, @@RECORD_DIR@@ 은 record_file 의 폴더). 다른 티켓의 신호·기록은 건드리지 않는다. 임시 파일은 STATE/scratch/<KEY>/ 에 둔다.\n\n검토·실측 결과를 모아 STATE/ready/<KEY>.md 를 brief-coordinator.md 4단계 5 의 형식으로 쓴다(저장소별 브랜치·PR 타깃·커밋, 다시 돌린 검증과 red 확인, 화면 실측 결과 또는 해당 없음의 이유, 기록, 남은 확인 — 실측 워커의 「남은 것」 포함). 사용자에게 보여 줄 5줄 요약(원인 / 수정 / 검증 / 화면 실측 / 남은 확인)을 만든다.",
+        "description": "공통 — 먼저 같은 산출물 폴더의 준비 산출물 `<실행 번호>-prepare.txt` 를 읽어 parent·key·round·reopen·state_dir(아래 STATE)·record_file·설정 값을 확인한다. 상태 디렉터리 규칙은 `~/.claude/skills/qa-ticket-driver/exports/state-contract.md` 가, 단계별 세부 절차는 `~/.claude/skills/qa-ticket-driver/references/brief-coordinator.md` 가 정본이다(@@KEY@@ 등 자리는 준비 산출물 값, @@STATE_DIR@@ 은 STATE, @@RECORD_DIR@@ 은 record_file 의 폴더). 다른 티켓의 신호·기록은 건드리지 않는다. 임시 파일은 STATE/scratch/<KEY>/ 에 둔다.\n\n검토·실측 결과를 모아 STATE/ready/<KEY>.md 를 brief-coordinator.md 4단계 5 의 형식으로 쓴다(저장소별 브랜치·PR 타깃·커밋, 다시 돌린 검증과 red 확인, 화면 실측 결과 또는 해당 없음의 이유, 기록, 남은 확인 — 실측 워커의 「남은 것」 포함). 사용자에게 보여 줄 5줄 요약(원인 / 수정 / 검증 / 화면 실측 / 남은 확인)을 만든다.\n\n이 단계는 사용자에게 묻지 않는다 — brief-coordinator.md 4단계 6(요약 보고·반출 승인 대기)은 하지 않는다. 5줄 요약은 worker_done 에 담고, 승인을 묻거나(AskUserQuestion 등 질문 도구 포함) 답을 기다리지 말고 곧바로 worker_done 한다. 반출 승인은 다음 단계인 「반출 승인」 게이트가 캔버스 카드·QA 대시보드로 받는다.",
         "kind": "worker",
         "effort": "low",
         "join": "any"
