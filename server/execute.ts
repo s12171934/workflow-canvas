@@ -384,6 +384,7 @@ ${worktreeSection}
    - title·display-name: "<단계 이름> #<n>"
    - deps: 같은 실행 안의 선행 단계 Task
    - spec: 아래 "워커 spec 규칙"을 따른다.
+   - spec 본문은 Write 도구로 파일에 먼저 쓰고 Task 하나마다 \`--spec "$(cat <파일>)"\` 로 넘긴다. 여러 Task 를 한 Bash 에 묶거나, 따옴표 없는 heredoc(\`<<EOF\`)·겹친 \`$( )\` 를 쓰지 않는다 — Claude Code 는 구문을 파싱하지 못한 Bash 를 bypass 모드에서도 권한 요청으로 멈추고, 답이 없으면 약 2분 뒤 자동 차단한다.
 3. Task 를 모두 만들면 **워커를 띄우기 전에** 캔버스에 실행 목록을 등록한다(한 번만):
    \`\`\`sh
    curl -s -X PUT -H 'Content-Type: application/json' ${apiBase}/api/workflows/${graph.id}/executions \\
