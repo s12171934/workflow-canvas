@@ -1,5 +1,5 @@
 import express from 'express';
-import type { ErrorRequestHandler } from 'express';
+import type { ErrorRequestHandler, Request } from 'express';
 import { createOrcaBridge } from './orca.ts';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -15,6 +15,20 @@ import { defaultCleanup, type AutomationConfig, type AutomationState, type Clean
 const launchCooldownMs = 60_000;
 /** How long a coordinator may stay open after its run ended without a closing report before the server closes it. */
 const coordinatorGraceMs = 10 * 60_000;
+
+/**
+ * Hosts the API answers: the loopback, and this Mac's tailnet name when tailscale serve relays to the canvas
+ * (`tailscale serve --bg --https=4318 http://127.0.0.1:4318`; the server itself still listens on 127.0.0.1 only).
+ * A *.ts.net name resolves to tailnet addresses, never to the loopback, so it does not reopen DNS rebinding.
+ */
+export function allowedHost(host: string) {
+  return /^(127\.0\.0\.1|localhost)(:\d+)?$/.test(host) || /^[a-z0-9-]+\.[a-z0-9-]+\.ts\.net(:\d+)?$/i.test(host);
+}
+
+/** The address coordinators and workers on this Mac call back, whichever host the request came through. */
+function localBase(req: Request) {
+  return `http://127.0.0.1:${req.socket.localPort}`;
+}
 
 export function createApp(directory: string, bridge = createOrcaBridge(), options: { root?: string; watchMs?: number } = {}) {
   void options; // root is no longer used: every run names its project.
@@ -51,9 +65,9 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
   app.use('/api', (req, res, next) => {
     res.setHeader('Cache-Control', 'no-store');
     const host = req.get('host') ?? '';
-    if (!/^(127\.0\.0\.1|localhost)(:\d+)?$/.test(host)) { res.status(403).json({ error: '로컬 요청만 허용합니다.' }); return; }
+    if (!allowedHost(host)) { res.status(403).json({ error: '로컬 요청만 허용합니다.' }); return; }
     const origin = req.get('origin');
-    if ((origin && origin !== `http://${host}`) || req.get('sec-fetch-site') === 'cross-site') {
+    if ((origin && origin !== `http://${host}` && origin !== `https://${host}`) || req.get('sec-fetch-site') === 'cross-site') {
       res.status(403).json({ error: '같은 출처의 요청만 허용합니다.' }); return;
     }
     next();
@@ -383,7 +397,7 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
     if (!validId(id)) { res.status(400).json({ error: '올바르지 않은 워크플로 ID입니다.' }); return; }
     const graph = await storage.load(id);
     try {
-      await startRun(id, graph, await settingsFor(graph, req.body ?? {}), `http://${req.get('host')}`);
+      await startRun(id, graph, await settingsFor(graph, req.body ?? {}), localBase(req));
       res.json({ launched: true });
     } catch (error) { if (!sendRunError(res, error)) throw error; }
   });
@@ -418,7 +432,7 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
       if (requested.has(item)) { results.push({ item, at, workflowId: target.id, status: 'already' }); continue; }
       try {
         const settings = await settingsFor(target, { count: 1, project, inputs: { [inputGroups[0].id]: item }, cleanup: target.cleanup ?? defaultCleanup, values: passed });
-        const launch = await startRun(target.id, target, { ...settings, origin }, `http://${req.get('host')}`);
+        const launch = await startRun(target.id, target, { ...settings, origin }, localBase(req));
         results.push({ item, at, workflowId: target.id, launch, status: 'requested' });
       } catch (error) {
         results.push({ item, at, workflowId: target.id, error: (error as Error).message.slice(0, 500), status: 'failed' });
@@ -459,7 +473,7 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
       // Validate the whole document with the new entry before anything is created in Orca.
       try { validateWorkflow({ ...graph, automations: [...(graph.automations ?? []), config] }); }
       catch (error) { throw new RunError(400, (error as Error).message); }
-      const apiBase = `http://${req.get('host')}`;
+      const apiBase = localBase(req);
       const prompt = `workflow-canvas 자동화 「${name}」 실행이다. 자동화를 설정하거나 조회하지 말고, 다음 명령으로 이번 실행의 브리프를 받아라: `
         + `curl -s -X POST ${apiBase}/api/workflows/${id}/automations/${config.id}/brief `
         + `응답 JSON 의 briefPath 파일을 읽고 그 지시대로 코디네이터로서 끝까지 수행하라. 응답에 error 가 있으면 그 내용을 이 터미널에 보고하고 종료하라.`;
@@ -494,7 +508,7 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
     if (!config) { res.status(404).json({ error: '이 워크플로에 등록된 자동화가 아닙니다.' }); return; }
     try {
       const settings = await settingsFor(graph, { count: config.count, project: config.project, inputs: config.inputs ?? {}, cleanup: config.cleanup, values: config.values ?? {} });
-      const { briefPath, logId } = await prepareRun(graph.id, graph, { ...settings, automation: { id: config.id, name: config.name } }, `http://${req.get('host')}`);
+      const { briefPath, logId } = await prepareRun(graph.id, graph, { ...settings, automation: { id: config.id, name: config.name } }, localBase(req));
       await runlog.append(logId, { type: 'coordinator', message: '자동화 에이전트가 브리프를 받아 코디네이터로 시작' }).catch(() => {});
       res.json({ briefPath });
     } catch (error) { if (!sendRunError(res, error)) throw error; }
@@ -573,7 +587,7 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
     const id = randomUUID();
     const dir = join(directory, '.generations', id);
     await mkdir(dir, { recursive: true, mode: 0o700 });
-    const apiBase = `http://${req.get('host')}`;
+    const apiBase = localBase(req);
     const resultUrl = `${apiBase}/api/generations/${id}`;
     const resultFile = join(dir, 'result.json');
     const promptPath = join(dir, 'prompt.md');
