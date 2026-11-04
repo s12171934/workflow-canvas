@@ -64,6 +64,7 @@ npm run build
 ```
 
 - 기본 주소 — `http://127.0.0.1:4318`. Orca 프로젝트의 브라우저 탭에서 연다.
+- tailnet — 서버는 127.0.0.1 에만 묶이고, 다른 기기에서는 `tailscale serve --bg --https=4318 http://127.0.0.1:4318` 의 https 주소로 연다. API 는 루프백과 `*.ts.net` 호스트만 받고, 코디네이터·워커에게 주는 콜백 주소는 요청이 어디로 왔든 `http://127.0.0.1:<포트>` 다. 에이전트 대시보드의 「워크플로 캔버스」 탭이 이 주소를 메트릭 서버에서 받아 iframe 으로 띄운다.
 - 개발 — `npm run dev`로 같은 주소에서 개발 서버를 실행한다.
 - 포트 변경 — `./bin/workflow-canvas --port 4320`.
 - CLI 선택 — `ORCA_CLI_COMMAND` 우선, 개발 환경은 `orca-dev`, Linux 외부 터미널은 `orca-ide`, 그 외는 `orca`.

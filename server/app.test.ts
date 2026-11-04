@@ -31,6 +31,12 @@ test('local API saves graphs, rejects cross-origin requests, and exposes no work
       }).on('error', reject);
     });
     assert.equal(foreignHostStatus, 403);
+    const tailnetStatus = await new Promise<number | undefined>((resolve, reject) => {
+      get(`${base}/api/runs`, { headers: { Host: 'mac.tail1234.ts.net:4318', Origin: 'https://mac.tail1234.ts.net:4318' } }, (response) => {
+        response.resume(); resolve(response.statusCode);
+      }).on('error', reject);
+    });
+    assert.equal(tailnetStatus, 200);
     const graph = newWorkflow();
     const saved = await fetch(`${base}/api/workflows/${graph.id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(graph) });
     assert.equal(saved.status, 200);
