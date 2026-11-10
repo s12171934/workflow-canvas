@@ -202,6 +202,49 @@ test('check reports every 실행 check without starting a coordinator, plus warn
   }
 });
 
+test('brief names each execution by the request name: Task titles, tabs and the registered label', async () => {
+  const { buildBrief } = await import('./execute.ts');
+  const graph = { ...newWorkflow(), id: 'wf-name', nodes: [{ id: 'impl', type: 'stage' as const, position: { x: 0, y: 0 }, data: { label: '구현', description: '', kind: 'worker' as const } }], edges: [] };
+  const base = { graph, apiBase: 'http://127.0.0.1:1', workspace: '/w', artifactDir: '/tmp/x' };
+  const once = buildBrief({ ...base, count: 1, title: '체크박스 1차' });
+  assert.match(once, /1 → `체크박스 1차`/);
+  assert.match(once, /"label":"체크박스 1차"/);
+  assert.match(once, /title·display-name: "<단계 이름> · <실행 라벨>"/);
+  assert.doesNotMatch(once, /#<n>/);
+  const many = buildBrief({ ...base, count: 3, title: 'PROJ-12' });
+  assert.match(many, /1 → `PROJ-12 #1`, 2 → `PROJ-12 #2`, 3 → `PROJ-12 #3`/);
+  // Unnamed (older callers): the plain numbers stay.
+  assert.match(buildBrief({ ...base, count: 2 }), /1 → `#1`, 2 → `#2`/);
+});
+
+test('brief fans a worker out per model: run setting wins, Codex for GPT models, child Tasks per model', async () => {
+  const { buildBrief, composeBrief } = await import('./execute.ts');
+  const graph = { ...newWorkflow(), id: 'wf-fan', variables: [{ key: 'reviewer_models', label: '리뷰어 모델' }],
+    nodes: [{ id: 'review', type: 'stage' as const, position: { x: 0, y: 0 }, data: { label: '리뷰 라운드', description: '<리뷰어> 로 리뷰한다', kind: 'worker' as const,
+      effort: 'high' as const, fanout: { models: ['claude-opus-5-5'], variable: 'reviewer_models' } } },
+    { id: 'judge', type: 'stage' as const, position: { x: 300, y: 0 }, data: { label: '판정', description: '', kind: 'worker' as const, workerModel: 'gpt-5-codex' } }],
+    edges: [{ id: 'e', source: 'review', target: 'judge' }] };
+  const base = { graph, count: 1, apiBase: 'http://127.0.0.1:1', workspace: '/w', artifactDir: '/tmp/x' };
+  const stages = (brief: string) => JSON.parse(brief.match(/```json\n(\[[\s\S]*?\])\n```/)![1]) as { nodeId: string; model?: string; agent?: string; fanout?: unknown }[];
+  // No setting given: the node's own list.
+  let listed = stages(buildBrief(base));
+  assert.deepEqual(listed[0].fanout, [{ name: 'claude-opus-5-5', model: 'claude-opus-5-5', agent: 'claude' }]);
+  assert.equal(listed[0].model, undefined);
+  assert.deepEqual([listed[1].model, listed[1].agent], ['gpt-5-codex', 'codex']);
+  // The run setting replaces it; the same model twice gets a numbered name.
+  listed = stages(buildBrief({ ...base, values: { reviewer_models: 'claude-opus-5-5, gpt-5-codex claude-opus-5-5' } }));
+  assert.deepEqual(listed[0].fanout, [{ name: 'claude-opus-5-5', model: 'claude-opus-5-5', agent: 'claude' },
+    { name: 'gpt-5-codex', model: 'gpt-5-codex', agent: 'codex' }, { name: 'claude-opus-5-5-2', model: 'claude-opus-5-5', agent: 'claude' }]);
+  const brief = buildBrief(base);
+  assert.match(brief, /모델별 병렬 워커\(`fanout` 이 있는 단계\)/);
+  assert.match(brief, /--parent <단계 Task>/);
+  assert.match(brief, /--agent <그 단계의 agent>/);
+  // An empty list with no setting value cannot start.
+  const empty = { ...graph, nodes: graph.nodes.map((node) => node.id === 'review' ? { ...node, data: { ...node.data, fanout: { models: [], variable: 'reviewer_models' } } } : node) };
+  assert.throws(() => composeBrief({ ...base, graph: empty }), /모델이 없습니다/);
+  assert.throws(() => composeBrief({ ...base, values: { reviewer_models: '-x' } }), /올바르지 않습니다/);
+});
+
 test('brief asks for one new worktree per execution, including inside links', async () => {
   const { buildBrief, checkGroups } = await import('./execute.ts');
   const child = { ...newWorkflow(), id: 'wf-child', name: '하위', nodes: [
@@ -357,6 +400,50 @@ test('execution log records the launch, registration, observed Task changes and 
     await rm(directory, { recursive: true, force: true });
   }
 });
+test('open user decisions across workflows: listed for the dashboard, gone once picked there', async () => {
+  await mkdir('.local', { recursive: true });
+  const directory = await mkdtemp(join(resolve('.local'), 'api-decisions-test-'));
+  let work = 'running';
+  const bridge = createOrcaBridge(async (args) => {
+    const place = places(args); if (place) return place;
+    if (args[1] === 'run-show') return { run: { id: 'run-g', objective: 'A' } };
+    if (args[1] === 'task-list') return { tasks: [{ id: 'task-w', display_name: '구현 #1', status: work, deps: [] }, { id: 'task-g', display_name: '검토 #1', status: 'ready', deps: ['task-w'] }] };
+    if (args[1] === 'worker-list') return { workers: [], page: { hasMore: false } };
+    return {};
+  });
+  const graph = { ...newWorkflow(), id: 'wf-gate', name: '게이트', runId: 'run-g',
+    nodes: [{ id: 'work', type: 'stage' as const, position: { x: 0, y: 0 }, data: { label: '구현', description: '', kind: 'worker' as const } },
+      { id: 'gate', type: 'stage' as const, position: { x: 300, y: 0 }, data: { label: '검토', description: '머지할까요?', kind: 'gate' as const } }],
+    edges: [{ id: 'e', source: 'work', target: 'gate' }],
+    executions: [{ id: 'exec-1', label: '#1', bindings: { work: 'task-w', gate: 'task-g' } }] };
+  // An adopted launch from an hour ago owns the Run, so the workflow counts as having an open Run.
+  const legacy = launchDirName(new Date(Date.now() - 60 * 60 * 1000), graph.id);
+  await mkdir(join(directory, '.executions', legacy), { recursive: true });
+  await writeFile(join(directory, '.executions', legacy, 'report.md'), '# 보고');
+  const server = createApp(directory, bridge, { watchMs: 20 }).listen(0, '127.0.0.1');
+  await new Promise<void>((resolve) => server.once('listening', resolve));
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const json = { 'Content-Type': 'application/json' };
+  try {
+    await fetch(`${base}/api/workflows/${graph.id}`, { method: 'PUT', headers: json, body: JSON.stringify(graph) });
+    await fetch(`${base}/api/workflows/${graph.id}/logs`);
+    const open = async () => (await (await fetch(`${base}/api/decisions`)).json()).decisions;
+    // The worker before the gate still runs: nothing to decide yet.
+    assert.deepEqual(await open(), []);
+    work = 'completed';
+    await new Promise((resolve) => setTimeout(resolve, 2100)); // past the snapshot cache
+    const [card] = await open();
+    assert.deepEqual({ ...card }, { executionId: 'exec-1', executionLabel: '#1', node: 'gate', label: '검토', question: '머지할까요?', mode: 'exclusive',
+      outputs: [{ id: 'approve', label: '통과' }, { id: 'reject', label: '거절' }], taskId: 'task-g', workflowId: 'wf-gate', workflowName: '게이트', runId: 'run-g' });
+    const picked = await fetch(`${base}/api/workflows/wf-gate/executions/exec-1/decisions`, { method: 'POST', headers: json,
+      body: JSON.stringify({ node: 'gate', outputs: ['approve'], by: 'user', via: '대시보드' }) });
+    assert.equal(picked.status, 200);
+    assert.deepEqual(await open(), []);
+  } finally {
+    await new Promise<void>((resolve, reject) => { server.close((error) => error ? reject(error) : resolve()); server.closeAllConnections(); });
+    await rm(directory, { recursive: true, force: true });
+  }
+});
 test('execution log keeps finished executions: results, completion events, legacy adoption and background watch', async () => {
   await mkdir('.local', { recursive: true });
   const directory = await mkdtemp(join(resolve('.local'), 'api-log-done-test-'));
@@ -389,6 +476,9 @@ test('execution log keeps finished executions: results, completion events, legac
     let detail = await (await fetch(`${base}/api/workflows/${graph.id}/logs/${legacy}`)).json();
     assert.deepEqual(detail.results.map((item: { label: string; status: string; finished: boolean }) => [item.label, item.status, item.finished]), [['#1', 'running', false]]);
     assert.equal(detail.outcome, 'running');
+    // The sidebar marks the workflow as running even when it is not the one open on the canvas.
+    let listed = (await (await fetch(`${base}/api/workflows`)).json()).find((item: { id: string }) => item.id === graph.id);
+    assert.deepEqual(listed.live, { running: 1, blocked: 0 });
     // The Task completes while no canvas polls: the background watcher logs it; the untaken branch was skipped.
     status = 'completed';
     for (let i = 0; i < 50 && detail.outcome !== 'completed'; i++) {
@@ -396,6 +486,8 @@ test('execution log keeps finished executions: results, completion events, legac
       detail = (await (await fetch(`${base}/api/workflows/${graph.id}/logs`)).json())[0];
     }
     assert.equal(detail.outcome, 'completed');
+    listed = (await (await fetch(`${base}/api/workflows`)).json()).find((item: { id: string }) => item.id === graph.id);
+    assert.equal(listed.live, undefined);
     detail = await (await fetch(`${base}/api/workflows/${graph.id}/logs/${legacy}`)).json();
     assert.deepEqual(detail.results[0].stages.map((stage: { title: string; status: string }) => [stage.title, stage.status]), [['구현 #1', 'completed'], ['검토 #1', 'skipped']]);
     assert.equal(detail.results[0].stages[1].skipped, true);
@@ -471,7 +563,7 @@ test('branches: brief carries order and judges, bad branches are refused, decisi
     assert.deepEqual(saved.executions[0].decisions, { check: ['pass'] });
     // The coordinator polls what was decided; the canvas reads the expanded graph to offer user decisions.
     assert.deepEqual(await (await fetch(`${base}/api/workflows/wf-branch/executions/exec-1/decisions`)).json(),
-      { decisions: { check: ['pass'] }, skipped: ['fix'], skippedTasks: ['task-fix'] });
+      { decisions: { check: ['pass'] }, skipped: ['fix'], skippedTasks: ['task-fix'], userDecisions: [], userSection: '' });
     const flow = await (await fetch(`${base}/api/workflows/wf-branch/flow`)).json();
     assert.deepEqual(flow.find((item: { id: string }) => item.id === 'check').outputLabels, { pass: '통과', fail: '실패' });
   } finally {
@@ -500,7 +592,7 @@ test('brief gives each launching stage its model (default when unset) and effort
   assert.deepEqual(stages.map((item) => [item.nodeId, item.model, item.effort]), [
     ['plain', 'claude-opus-5-5', undefined], ['tuned', 'claude-sonnet-5-5', 'xhigh'], ['ask', undefined, undefined], ['judge', 'claude-opus-5-5', 'low']]);
   assert.match(brief, /--model <그 단계의 model> \[--effort <그 단계의 effort>\]/);
-  assert.match(brief, /`location`·`model`·`effort` 가 모두 직전 단계와 같으면/);
+  assert.match(brief, /`location`·`agent`·`model`·`effort` 가 모두 직전 단계와 같으면/);
 });
 test('worker specs point at instruction files; waits are long by default and the brief says how to resume after compaction', async () => {
   const { composeBrief } = await import('./execute.ts');
@@ -689,12 +781,15 @@ test('one workflow runs side by side for different run-time inputs; the same inp
     assert.equal((await start(base, 'ABC-1')).status, 409); // same ticket within the cooldown
     assert.equal((await start(base, 'ABC-2')).status, 200); // another ticket starts its own coordinator
     assert.equal(calls.filter((args) => args[0] === 'agent').length, 2);
-    const logs = await (await fetch(`${base}/api/workflows/per-ticket/logs`)).json() as { id: string; inputs?: Record<string, string> }[];
+    const logs = await (await fetch(`${base}/api/workflows/per-ticket/logs`)).json() as { id: string; title?: string; inputs?: Record<string, string> }[];
     const first = logs.find((entry) => entry.inputs?.wt === 'ABC-1')!;
     const second = logs.find((entry) => entry.inputs?.wt === 'ABC-2')!;
     const brief = (await (await fetch(`${base}/api/workflows/per-ticket/logs/${first.id}/files/brief.md`)).json()).text as string;
     assert.match(brief, new RegExp(`"launch":"${first.id}"`));
     assert.match(brief, /"id":"<run_id>-1"/);
+    // The ticket key names the request: Tasks and the registered label go by it, not by `#1`.
+    assert.match(brief, /"label":"ABC-1"/);
+    assert.equal(first.title, 'ABC-1');
 
     // The older request registers after the newer one started: it still lands on its own launch, not the newest.
     assert.equal((await register(base, { runId: 'run-a', launch: first.id, executions: [{ id: 'run-a-1', label: '#1', bindings: { fix: 'task-run-a' } }] })).status, 200);
@@ -702,7 +797,7 @@ test('one workflow runs side by side for different run-time inputs; the same inp
     const stored = await (await fetch(`${base}/api/workflows/per-ticket`)).json();
     assert.equal(stored.runId, 'run-b');
     assert.deepEqual(stored.executions.map((item: { id: string; label: string; runId: string; inputs: Record<string, string> }) => [item.id, item.label, item.runId, item.inputs.wt]),
-      [['run-a-1', 'ABC-1 #1', 'run-a', 'ABC-1'], ['run-b-1', 'ABC-2 #1', 'run-b', 'ABC-2']]);
+      [['run-a-1', 'ABC-1', 'run-a', 'ABC-1'], ['run-b-1', 'ABC-2', 'run-b', 'ABC-2']]);
     assert.equal((await (await fetch(`${base}/api/workflows/per-ticket/logs/${first.id}`)).json()).meta.runId, 'run-a');
     assert.equal((await (await fetch(`${base}/api/workflows/per-ticket/logs/${second.id}`)).json()).meta.runId, 'run-b');
     // An execution id another Run already uses is refused with a hint; re-registering a Run replaces only its own.
@@ -789,7 +884,7 @@ test('a spawn link starts one separate execution of its target per reported item
     const launches = await (await fetch(`${base}/api/workflows/per-ticket/logs`)).json() as { inputs?: Record<string, string>; last?: { message: string } }[];
     assert.deepEqual(launches.map((item) => item.inputs?.wt).sort(), ['ABC-1', 'ABC-2']);
     const requested = (await (await fetch(`${base}/api/workflows/per-ticket/logs/${(launches[0] as unknown as { id: string }).id}`)).json()).events[0].message as string;
-    assert.match(requested, /「선별」 #1 의 fan/);
+    assert.match(requested, /「선별」 \d\d-\d\d \d\d:\d\d 의 fan/); // unnamed request: named by its start time
     const stored = (await (await fetch(`${base}/api/workflows/picker`)).json()).executions[0];
     assert.deepEqual(stored.spawned.fan.map((item: { item: string; error?: string }) => [item.item, !!item.error]), [['ABC-1', false], ['ABC-2', false], ['ABC-3', true]]);
   } finally {
@@ -916,7 +1011,7 @@ test('loops: a branch output goes back with a limit; the decision API starts a n
     assert.equal((await fetch(`${base}/api/workflows/looping/executions`, { method: 'PUT', headers: json, body: JSON.stringify({ runId: 'run-l', launch: log.id,
       executions: [{ id: 'run-l-1', label: '#1', bindings: { impl: 't1', review: 't2', result: 't3', done: 't4', blocked: 't5' } }] }) })).status, 200);
     const first = await (await decide(['fix'])).json();
-    assert.deepEqual(first.loop, { edge: 'back', to: 'impl', restart: ['impl', 'review', 'result'], pass: 2, max: 2, remaining: 1 });
+    assert.deepEqual(first.loop, { edge: 'back', to: 'impl', restart: ['impl', 'review', 'result'], pass: 2, rounds: { impl: 2, review: 2, result: 2 }, max: 2, remaining: 1 });
     assert.deepEqual(first.skippedTasks, []);
     assert.equal((await (await decide(['fix'])).json()).loop.pass, 2); // a retried request does not go round again
     const patch = (bindings: unknown) => fetch(`${base}/api/workflows/looping/executions/run-l-1/bindings`, { method: 'PATCH', headers: json, body: JSON.stringify({ bindings }) });
@@ -1192,7 +1287,8 @@ test('a sub-coordinator spawn link prepares each item without launching an agent
       body: JSON.stringify({ runId: 'run-c', launch: first.results[1].launch, executions: [{ id: 'run-c-1', label: '#1', bindings: { fix: 'tc1' } }] }) });
     const graph = await (await fetch(`${base}/api/workflows/picker`)).json();
     graph.executions[0].spawned = { fan: [graph.executions[0].spawned.fan[0]] }; // forget ABC-2 so it is asked again
-    assert.equal((await put(graph)).status, 200);
+    // A graph PUT keeps the stored executions (runtime records), so the test edits the stored file itself.
+    await writeFile(join(directory, 'picker.json'), JSON.stringify(graph, null, 2));
     await new Promise((resolve) => setTimeout(resolve, 0));
     const busy = await (await spawn(['ABC-2'])).json();
     assert.equal(busy.results[0].status, 'failed');

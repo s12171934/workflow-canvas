@@ -12,10 +12,13 @@ import {
 } from 'lucide-react';
 import {
   aggregateStatus, executionFinished, executionRun, executionStatuses as computeExecutionStatuses, mergeSnapshots, workflowRuns, openableStatuses, fromSnapshot, newWorkflow, projectNodes, serializableWorkflow, statusLabels,
-  asksAtRun, scriptParseNames, maxScriptTimeout, type ScriptParse, defaultWorkerModel, effortLevels, frameContents, isFrame, launchesWorker, workerModels, type Effort, type Rect, joinNames, pendingDecisions, gateAskerNames, type GateAsker, linkModeNames, maxSpawnItems, type LinkMode, spawnAsNames, type SpawnAs, variableKeyPattern, variableRefs, maxVariables, maxVariableValue, type WorkflowVariable, loopBody, maxLoopRounds, type WorkflowEdge, type FlowStage, type PendingDecision, branchJudgeNames, branchModeNames, isBranch, maxBranchOutputs, type BranchJudge, type BranchMode, type BranchOutput, defaultCleanup, triggerNames, worktreeNamePattern, type AutomationConfig, type AutomationState, type Cleanup, canNest, maxGroupDepth, nameSourceNames, safeWorktreeName, type NameSource, createsWorktree, groupOf, membershipOf, orderNodes, worktreeRepo, isExecutable, isGroup, kindNames, normalizeNodes, scopeNames, cleanTag, groupByTag, maxTags, maxTagLength,
+  asksAtRun, scriptParseNames, maxScriptTimeout, type ScriptParse, defaultWorkerModel, effortLevels, frameContents, isFrame, launchesWorker, workerModels, fansOut, parseModelList, agentOf, type Effort, type Rect, joinNames, pendingDecisions, gateAskerNames, type GateAsker, linkModeNames, maxSpawnItems, type LinkMode, spawnAsNames, type SpawnAs, variableKeyPattern, variableRefs, maxVariables, maxVariableValue, type WorkflowVariable, loopBody, maxLoopRounds, type WorkflowEdge, type FlowStage, type PendingDecision, branchJudgeNames, branchModeNames, isBranch, maxBranchOutputs, type BranchJudge, type BranchMode, type BranchOutput, defaultCleanup, triggerNames, worktreeNamePattern, type AutomationConfig, type AutomationState, type Cleanup, canNest, maxGroupDepth, nameSourceNames, safeWorktreeName, type NameSource, createsWorktree, groupOf, membershipOf, orderNodes, worktreeRepo, isExecutable, isGroup, kindNames, normalizeNodes, scopeNames, cleanTag, groupByTag, maxTags, maxTagLength,
   neighbors, relationTo, type Relation, tallyStatuses, summarizeExecution,
   type Workflow, type Execution, type StageNode, type StageKind, type NodeKind, type GroupScope, type StageStatus, type RunSummary, type RunSnapshot, type Locations,
+  type WorkflowLive,
+  maxRunTitle,
 } from './model';
+import { AgentIcon } from './brandIcons';
 import { InstructionDialog, InstructionPreview } from './InstructionEditor';
 
 function descriptionLabel(kind: NodeKind): string {
@@ -94,8 +97,14 @@ function StageCard({ data, selected, width }: NodeProps<StageNode>) {
       {data.round && <span className="round-badge" title="되돌아가기로 다시 도는 회차">{data.round}회차</span>}
       <span className={`status-dot ${status}`} /></div>
     <h3>{data.label || '이름 없는 단계'}</h3>
-    {launchesWorker({ data }) && (data.workerModel || data.effort) && <div className="launch-chip" title="이 단계 워커의 모델·추론 수준(effort)">
-      <Bot size={11} />{(data.workerModel || defaultWorkerModel).replace(/^claude-/, '')}{data.effort ? ` · ${data.effort}` : ''}</div>}
+    {fansOut({ data }) ? <div className="fanout-chips" aria-label="모델별 병렬 워커" title="모델마다 워커 하나씩 동시에 띄웁니다">
+      {data.fanout!.models.map((model, index) => <span key={index} className={`launch-chip ${agentOf(model)}`}><AgentIcon agent={agentOf(model)} />{model.replace(/^claude-/, '')}</span>)}
+      {data.fanout!.variable && <span className="launch-chip setting" title="실행 때 이 설정값이 주어지면 그 목록으로 바뀝니다">{`{{${data.fanout!.variable}}}`}</span>}
+      <span className="fanout-count">{data.fanout!.models.length ? `×${data.fanout!.models.length}` : '×N'}</span>
+      {data.effort && <span className={`launch-chip effort ${data.effort}`} title="추론 수준(effort)">{data.effort}</span>}</div>
+    : launchesWorker({ data }) && (data.workerModel || data.effort) && <div className="fanout-chips" title="이 단계 워커의 모델·추론 수준(effort)">
+      <span className={`launch-chip ${agentOf(data.workerModel || defaultWorkerModel)}`}><AgentIcon agent={agentOf(data.workerModel || defaultWorkerModel)} />{(data.workerModel || defaultWorkerModel).replace(/^claude-/, '')}</span>
+      {data.effort && <span className={`launch-chip effort ${data.effort}`}>{data.effort}</span>}</div>}
     {data.membership && <div className="membership-chips" aria-label="소속">
       {data.membership.project && <span className="member-chip project"><FolderGit2 size={11} />{data.membership.project}</span>}
       {data.membership.worktrees.map((name, index) => <span key={index} className="member-link">
@@ -236,7 +245,8 @@ function storedPanels(): Panels {
 const viewOnlyKey = 'workflow-canvas:view-only';
 /** 요약 보기: cards show only title, status and per-status execution counts, with an execution overview panel. Remembered per browser. */
 const summaryKey = 'workflow-canvas:summary';
-type SavedItem = { id: string; name: string; tags?: string[] };
+/** A saved workflow in the sidebar; `live` is what its open Runs are doing (from the server's background watch). */
+type SavedItem = { id: string; name: string; tags?: string[]; live?: WorkflowLive };
 const collapsedTagsKey = 'workflow-canvas:collapsed-tags';
 function storedCollapsedTags(): string[] { try { const value = JSON.parse(localStorage.getItem(collapsedTagsKey) ?? '[]'); return Array.isArray(value) ? value.filter((item) => typeof item === 'string') : []; } catch { return []; } }
 function storedSummary(): boolean { try { return localStorage.getItem(summaryKey) === '1'; } catch { return false; } }
@@ -291,7 +301,7 @@ function VariablesEditor({ variables, nodes, onChange }: { variables: WorkflowVa
     <button className="button small" disabled={variables.length >= maxVariables} onClick={() => onChange([...variables, { key: nextKey(), label: '' }])}><Plus size={13} />설정값 추가</button>
   </section>;
 }
-type RunForm = { mode: 'now' | 'schedule'; project: string; count: number; inputs: Record<string, string>; cleanup: Cleanup; values: Record<string, string>;
+type RunForm = { mode: 'now' | 'schedule'; project: string; title: string; count: number; inputs: Record<string, string>; cleanup: Cleanup; values: Record<string, string>;
   name: string; trigger: string; cron: string; time: string; day: number };
 /** "매일 09:00", "매주 월 09:00", or the cron text. */
 function scheduleText(config: Pick<AutomationConfig, 'trigger' | 'time' | 'day'>) {
@@ -392,7 +402,7 @@ function Workspace() {
   const [runDialog, setRunDialog] = useState(false);
   const [logOpen, setLogOpen] = useState(false);
   const [instructionNodeId, setInstructionNodeId] = useState<string | null>(null);
-  const [runForm, setRunForm] = useState<RunForm>({ mode: 'now', project: '', count: 1, inputs: {}, cleanup: defaultCleanup, values: {},
+  const [runForm, setRunForm] = useState<RunForm>({ mode: 'now', project: '', title: '', count: 1, inputs: {}, cleanup: defaultCleanup, values: {},
     name: '', trigger: 'daily', cron: '0 9 * * 1-5', time: '09:00', day: 1 });
   const [watchUntil, setWatchUntil] = useState(0);
   const importRef = useRef<HTMLInputElement>(null);
@@ -816,8 +826,11 @@ function Workspace() {
   async function save(doc: Workflow = current): Promise<boolean> {
     setBusy(true);
     try {
-      await api(`/api/workflows/${doc.id}`, { method: 'PUT', body: JSON.stringify(doc) });
-      setSavedFingerprint(JSON.stringify(doc));
+      // The server keeps its own runtime fields (executions, automations): take them from the reply, not from this screen.
+      const stored = await api<Workflow>(`/api/workflows/${doc.id}`, { method: 'PUT', body: JSON.stringify(doc) });
+      const runtime = { runId: stored.runId, executions: stored.executions, automations: stored.automations };
+      setWorkflow((value) => value.id === doc.id ? { ...value, ...runtime } : value);
+      setSavedFingerprint(JSON.stringify(serializableWorkflow({ ...doc, ...runtime })));
       rememberWorkflow(doc.id);
       setSaved(await api('/api/workflows'));
       setNotice('워크플로를 로컬에 저장했습니다.');
@@ -957,7 +970,7 @@ function Workspace() {
     if (missingLinkTarget()) return;
     const remembered = lastProject();
     const preferred = [workflow.workspace, remembered].find((path) => path && locations.projects.some((item) => item.path === path)) ?? '';
-    setRunForm((form) => ({ ...form, project: preferred, cleanup: workflow.cleanup ?? defaultCleanup,
+    setRunForm((form) => ({ ...form, project: preferred, title: '', cleanup: workflow.cleanup ?? defaultCleanup,
       inputs: Object.fromEntries(nodes.filter(asksAtRun).map((node) => [node.id, form.inputs[node.id] ?? ''])),
       values: Object.fromEntries((workflow.variables ?? []).map((item) => [item.key, form.values[item.key] ?? ''])),
       name: form.name || '정기 실행' }));
@@ -979,7 +992,7 @@ function Workspace() {
     setBusy(true);
     try {
       if (form.mode === 'now') {
-        await api(`/api/workflows/${doc.id}/execute`, { method: 'POST', body: JSON.stringify({ count: form.count, project: form.project, inputs, values, cleanup: form.cleanup }) });
+        await api(`/api/workflows/${doc.id}/execute`, { method: 'POST', body: JSON.stringify({ count: form.count, project: form.project, ...(form.title.trim() ? { title: form.title.trim() } : {}), inputs, values, cleanup: form.cleanup }) });
         setWatchUntil(Date.now() + 5 * 60_000);
         setNotice(`코디네이터를 띄웠습니다. ${form.count}회 실행이 등록되면 그래프에 표시됩니다.`);
       } else {
@@ -1094,9 +1107,10 @@ function Workspace() {
   }
   function changeRun(runId: string) {
     if (runId === workflow.runId) return;
-    if ((nodes.some((node) => node.data.taskId) || executions.length) && !window.confirm('Run을 바꾸면 기존 Task 연결이 해제됩니다. 계속할까요?')) return;
+    if (nodes.some((node) => node.data.taskId) && !window.confirm('Run을 바꾸면 노드의 Task 연결이 해제됩니다. 등록된 실행 기록은 각자의 Run 에 남습니다. 계속할까요?')) return;
     setSnapshot(null);
-    setWorkflow((value) => ({ ...value, runId, executions: undefined }));
+    // Executions are runtime records the server keeps on save: each stays on the Run it was registered with.
+    setWorkflow((value) => ({ ...value, runId, executions: value.executions?.map((item) => item.runId || !value.runId ? item : { ...item, runId: value.runId }) }));
     setNodes((items) => items.map((node) => ({ ...node, data: { ...node.data, taskId: undefined } })));
   }
   function importRun() {
@@ -1280,9 +1294,15 @@ function Workspace() {
           {(() => {
             const activeRow = (key: string) => <button key={key} className="sidebar-item active" onClick={closeDrawer}><GitBranch size={17} /><span title={workflow.name}>{workflow.name}</span>
               {liveCount > 0 ? <span className="sidebar-live" title={`단계 ${liveCount}개 실행 중`}><LoaderCircle size={11} className="spin" />{liveCount}</span> : <span className="tiny-dot" />}</button>;
-            const row = (item: SavedItem, key: string) => item.id === workflow.id ? activeRow(key) : <div className="sidebar-row" key={key}><button className="sidebar-item" onClick={() => void load(item.id)}><FileJson2 size={16} /><span title={item.name}>{item.name}</span></button>
+            const row = (item: SavedItem, key: string) => item.id === workflow.id ? activeRow(key) : <div className="sidebar-row" key={key}><button className="sidebar-item" onClick={() => void load(item.id)}><FileJson2 size={16} /><span title={item.name}>{item.name}</span>{liveBadge(item.live)}</button>
               <button className="icon-button row-delete lock-hide" title="워크플로 삭제" aria-label={`${item.name} 삭제`} onClick={() => void removeWorkflow(item.id, item.name)}><Trash2 size={14} /></button></div>;
             const grouped = sidebarSections.some((section) => section.tag);
+            // Workflows not on screen: the server's background watch says whether their Runs are running or waiting on a person.
+            function liveBadge(live?: WorkflowLive) {
+              if (live?.running) return <span className="sidebar-live" title={`단계 ${live.running}개 실행 중${live.blocked ? ` · ${live.blocked}개 확인 필요` : ''}`}><LoaderCircle size={11} className="spin" />{live.running}</span>;
+              if (live?.blocked) return <span className="sidebar-live blocked" title={`단계 ${live.blocked}개 확인 필요`}><CircleHelp size={11} />{live.blocked}</span>;
+              return null;
+            }
             return <>{!isSaved && activeRow('unsaved')}
               {sidebarSections.map((section) => {
                 if (!grouped) return section.items.map((item) => row(item, item.id));
@@ -1292,7 +1312,7 @@ function Workspace() {
                   <button className={`tag-section-head${hasActive ? ' current' : ''}`} aria-expanded={!collapsed}
                     onClick={() => setCollapsedTags((list) => collapsed ? list.filter((item) => item !== section.tag) : [...list, section.tag])}>
                     {collapsed ? <ChevronRight size={13} /> : <ChevronDown size={13} />}{section.tag ? <Tag size={12} /> : null}
-                    <span>{section.tag || '태그 없음'}</span><small>{section.items.length}</small></button>
+                    <span>{section.tag || '태그 없음'}</span>{collapsed && section.items.some((item) => item.id === workflow.id ? liveCount > 0 : item.live?.running) && <i className="status-dot running live-pulse" title="실행 중인 워크플로가 있습니다" />}<small>{section.items.length}</small></button>
                   {!collapsed && <div className="tag-section-body">{section.items.map((item) => row(item, `${section.tag}:${item.id}`))}</div>}</div>;
               })}</>;
           })()}
@@ -1532,11 +1552,29 @@ function Workspace() {
                     onClick={async () => { if (await startGeneration('brief', briefForm.prompt, briefForm.project, selected)) setBriefForm(null); }}><Sparkles size={13} />생성</button></div></div>;
             })()}
             {launchesWorker(selected) && <>
+              {selected.data.kind === 'worker' && <label className="check-row"><input type="checkbox" checked={fansOut(selected)}
+                onChange={(event) => updateNode(event.target.checked
+                  ? { fanout: { models: [selected.data.workerModel || defaultWorkerModel] }, workerModel: undefined }
+                  : { fanout: undefined, workerModel: selected.data.fanout?.models[0] && selected.data.fanout.models[0] !== defaultWorkerModel ? selected.data.fanout.models[0] : undefined })} />
+                모델별 병렬 워커 (모델마다 1명)</label>}
+              {fansOut(selected) ? <>
+                <label className="field-label" htmlFor="stage-fanout-models">모델 목록</label>
+                <input id="stage-fanout-models" key={`${selected.id}:${selected.data.fanout!.models.join(',')}`} defaultValue={selected.data.fanout!.models.join(', ')}
+                  placeholder={`예: ${defaultWorkerModel}, gpt-5-codex`} list="stage-model-options"
+                  onBlur={(event) => updateNode({ fanout: { ...selected.data.fanout!, models: parseModelList(event.target.value) } })} />
+                <datalist id="stage-model-options">{models.map((model) => <option key={model} value={model} />)}</datalist>
+                <label className="field-label" htmlFor="stage-fanout-variable">실행 때 바꿀 설정값</label>
+                <select id="stage-fanout-variable" value={selected.data.fanout!.variable ?? ''}
+                  onChange={(event) => updateNode({ fanout: { models: selected.data.fanout!.models, ...(event.target.value ? { variable: event.target.value } : {}) } })}>
+                  <option value="">없음 (위 목록 고정)</option>
+                  {(workflow.variables ?? []).map((item) => <option key={item.key} value={item.key}>{item.label} ({item.key})</option>)}</select>
+                <p className="field-help">쉼표로 나눈 모델마다 워커 하나가 같은 지침을 동시에, 서로 독립적으로 수행합니다(개수 제한 없음). GPT·Codex 모델은 Codex, 나머지는 Claude Code 로 띄웁니다. 같은 모델을 두 번 적으면 두 번째는 「모델-2」 입니다. 설정값을 고르면 실행 때 그 값(쉼표 목록)이 주어진 경우 이 목록 대신 씁니다.</p>
+              </> : <>
               <label className="field-label" htmlFor="stage-model">모델</label>
               <select id="stage-model" value={selected.data.workerModel ?? ''} onChange={(event) => updateNode({ workerModel: event.target.value || undefined })}>
                 <option value="">기본값 ({defaultWorkerModel})</option>
                 {selected.data.workerModel && !models.includes(selected.data.workerModel) && <option value={selected.data.workerModel}>{selected.data.workerModel}</option>}
-                {models.map((model) => <option key={model} value={model}>{model}</option>)}</select>
+                {models.map((model) => <option key={model} value={model}>{model}</option>)}</select></>}
               <label className="field-label" htmlFor="stage-effort">추론 수준 (effort)</label>
               <select id="stage-effort" value={selected.data.effort ?? ''} onChange={(event) => updateNode({ effort: (event.target.value || undefined) as Effort | undefined })}>
                 <option value="">기본값 (모델 기본)</option>
@@ -1619,6 +1657,10 @@ function Workspace() {
           {locations.projects.map((item) => <option key={item.id} value={item.path}>{item.name} · {shortPath(item.path)}</option>)}
         </select>
         <p className="field-help">그룹 밖 단계는 이 프로젝트에서 작업하고, 프로젝트를 정하지 않은 새 워크트리도 여기서 만듭니다. 코디네이터도 여기서 시작합니다.</p>
+        {runForm.mode === 'now' && <><label className="field-label" htmlFor="run-title-input">실행 이름</label>
+          <input id="run-title-input" value={runForm.title} maxLength={maxRunTitle} placeholder="예: 체크박스 1차 · 비우면 입력값이나 시작 시각"
+            onChange={(event) => setRunForm((form) => ({ ...form, title: event.target.value.replace(/["`'\\\r\n]/g, '') }))} />
+          <p className="field-help">Orca Task·터미널 탭·캔버스 실행 칩에 「단계 이름 · 실행 이름」으로 붙어 다른 실행과 구분됩니다. 병렬 실행 횟수가 2 이상이면 뒤에 #1, #2 가 붙습니다.</p></>}
         <label className="field-label" htmlFor="run-count">병렬 실행 횟수</label>
         <input id="run-count" type="number" min={1} max={20} value={runForm.count} onChange={(event) => setRunForm((form) => ({ ...form, count: Math.min(20, Math.max(1, Math.round(Number(event.target.value) || 1))) }))} />
         {Object.keys(runForm.inputs).length > 0 && <fieldset className="modal-section"><legend>실행 시 입력 · 워크트리 이름</legend>

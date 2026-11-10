@@ -1,6 +1,7 @@
 import { effortLevels, forwardEdges, isExecutable, topologicalOrder, waves, workerModels, defaultWorkerModel, kindNames,
   type StageNode, type Workflow } from '../src/model.ts';
 import { autoLayout } from '../src/layout.ts';
+import { runtimeContractMarkdown } from './contract.ts';
 
 // Natural-language generation runs in Orca: the canvas server writes a prompt file, Orca launches a Claude agent in the
 // chosen project, and the agent sends its result back through the canvas API. The server validates every result; the
@@ -20,6 +21,12 @@ export const generationTimeoutMs = 30 * 60_000;
 export const maxPromptLength = 10_000;
 
 const stageKinds = ['worker', 'gate', 'branch', 'workflow', 'note'] as const;
+/** The runtime contract section both prompts carry (server/contract.ts, same text as README). */
+const contractSection = () => `## 런타임 계약
+지침은 아래 런타임 동작을 전제로 쓴다. 지침 안에서 이 동작을 다르게 가정하거나 다시 정의하지 않는다.
+
+${runtimeContractMarkdown()}
+`;
 const resultFormat = (url: string, file: string) => `결과는 JSON 파일(\`${file}\`)로 쓰고 아래처럼 보낸다:
 
 \`\`\`sh
@@ -53,6 +60,7 @@ ${input.request}
 - 프로젝트·워크트리 그룹은 만들지 않는다(사용자가 캔버스에서 묶는다). 위치(position)도 쓰지 않는다(캔버스가 배치한다).
 - 단계는 요청을 이루는 데 필요한 만큼만. 한 워커가 할 수 있는 일을 쪼개지 않는다.
 
+${contractSection()}
 ## 저장된 워크플로 (링크 대상)
 ${input.saved.length ? input.saved.map((item) => `- \`${item.id}\` ${item.name}`).join('\n') : '- (없음)'}
 
@@ -104,6 +112,7 @@ ${order.map((id) => line(byId.get(id)!)).join('\n') || '- (없음)'}
 - 바로 앞 단계: ${before.map((item) => item.data.label).join(', ') || '없음'}
 - 바로 뒤 단계: ${after.map((item) => item.data.label).join(', ') || '없음'}
 
+${contractSection()}
 ## 결과 형식
 \`\`\`json
 { "description": "<지침, 20000자 이하>", "label": "<선택: 더 나은 단계 이름, 500자 이하>" }

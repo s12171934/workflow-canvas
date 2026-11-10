@@ -349,7 +349,7 @@ test('a loop edge runs its body again: archived passes, cleared decisions, the e
     { source: 'result', target: 'impl', loop: { max: 2, exit: 'stop' } }], { source: 'result', target: 'impl' }).sort(), ['impl', 'result', 'review']);
   let execution: Execution = { id: 'e', label: '#1', bindings: { impl: 't1', review: 't2', result: 't3', done: 't4', blocked: 't5' } };
   const first = applyDecision(flow, execution, 'result', ['fix']);
-  assert.deepEqual(first.loop, { edge: 'back', to: 'impl', restart: ['impl', 'review', 'result'], pass: 2, max: 2, remaining: 1 });
+  assert.deepEqual(first.loop, { edge: 'back', to: 'impl', restart: ['impl', 'review', 'result'], pass: 2, rounds: { impl: 2, review: 2, result: 2 }, max: 2, remaining: 1 });
   assert.deepEqual(first.execution.bindings, { done: 't4', blocked: 't5' });
   assert.deepEqual(first.execution.decisions, {});
   assert.deepEqual(first.execution.skipped, []); // nothing after the branch is skipped while it runs again
@@ -472,4 +472,30 @@ test('a resized memo saves its size; other stages and untouched memos save none'
   assert.deepEqual([byId.get('memo')!.width, byId.get('memo')!.height], [420, 260]);
   assert.equal(byId.get('plain')!.width, undefined);
   assert.equal(byId.get('w')!.width, undefined);
+});
+test('(c) loop rounds count per stage across every loop; the limit stays per loop edge', () => {
+  // Two loops return to the same stage (impl-ticket: next-round and finish-result both go back to status).
+  const flow: FlowStage[] = [
+    { id: 'status', after: [] }, { id: 'work', after: [{ id: 'status' }] },
+    { id: 'round', after: [{ id: 'work' }], branch: { mode: 'exclusive', outputs: ['again', 'finish'] },
+      loops: [{ edge: 'next-round', output: 'again', to: 'status', max: 5, exit: 'finish', body: ['status', 'work', 'round'] }] },
+    { id: 'finish', after: [{ id: 'round', output: 'finish' }] },
+    { id: 'result', after: [{ id: 'finish' }], branch: { mode: 'exclusive', outputs: ['retry', 'done'] },
+      loops: [{ edge: 'finish-result', output: 'retry', to: 'status', max: 1, exit: 'done', body: ['status', 'work', 'round', 'finish', 'result'] }] },
+  ];
+  let execution: Execution = { id: 'e', label: '#1', bindings: { status: 't1', work: 't2', round: 't3', finish: 't4', result: 't5' } };
+  const first = applyDecision(flow, execution, 'round', ['again']);
+  assert.equal(first.loop?.pass, 2);
+  assert.deepEqual(first.loop?.rounds, { status: 2, work: 2, round: 2 });
+  execution = { ...first.execution, bindings: { ...first.execution.bindings, status: 't6', work: 't7', round: 't8' } };
+  execution = applyDecision(flow, execution, 'round', ['finish']).execution;
+  // The other loop now goes back to the same stage: its third run, not a second "r2" that would overwrite the first.
+  const second = applyDecision(flow, execution, 'result', ['retry']);
+  assert.equal(second.loop?.pass, 3);
+  assert.deepEqual(second.loop?.rounds, { status: 3, work: 3, round: 3, finish: 2, result: 2 });
+  // Each loop keeps its own limit: finish-result used its only round, next-round has 4 left.
+  assert.equal(second.loop?.remaining, 0);
+  assert.deepEqual(second.execution.loops, { 'next-round': 1, 'finish-result': 1 });
+  // A retried request reports the same rounds.
+  assert.deepEqual(applyDecision(flow, second.execution, 'result', ['retry']).loop?.rounds, second.loop?.rounds);
 });

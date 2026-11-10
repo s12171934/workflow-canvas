@@ -2,7 +2,7 @@ import { mkdir, readFile, readdir, rename, stat, writeFile, unlink, utimes } fro
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { Workflow } from '../src/model.ts';
-import { spawnsRuns, effortLevels, maxScriptTimeout, scriptParses, forwardEdges, loopBody, maxLoopRounds, linkModes, spawnAsModes, maxBranchOutputs, maxSpawnItems, maxVariables, validVariableValue, variableKeyPattern, maxGroupDepth, workerModelPattern, serializableWorkflow, topologicalOrder, validTrigger, worktreeNamePattern, validTags, maxTags, maxTagLength } from '../src/model.ts';
+import { spawnsRuns, effortLevels, maxScriptTimeout, scriptParses, forwardEdges, loopBody, maxLoopRounds, linkModes, spawnAsModes, maxBranchOutputs, maxSpawnItems, maxVariables, validVariableValue, variableKeyPattern, maxGroupDepth, workerModelPattern, isBranch, serializableWorkflow, topologicalOrder, validTrigger, worktreeNamePattern, validTags, maxTags, maxTagLength } from '../src/model.ts';
 
 export function validId(id: string): boolean { return /^[a-zA-Z0-9_-]{1,128}$/.test(id); }
 
@@ -187,6 +187,24 @@ export function validateWorkflow(value: unknown): Workflow {
     }
   }
   const declared = new Set((graph.variables ?? []).map((item) => item.key));
+  // A fanout worker runs one worker per model: a list of model ids, or a declared setting that gives one, or both.
+  // It reports no single decision or item list, so a branch or gate it would judge and a spawn link it would feed are refused.
+  for (const node of graph.nodes) {
+    const fanout = node.data.fanout;
+    if (fanout === undefined) continue;
+    const where = `'${node.data.label || node.id}' 의 모델별 병렬 워커`;
+    if (node.data.kind !== 'worker' || !fanout || typeof fanout !== 'object' || !Array.isArray(fanout.models)
+      || fanout.models.some((model) => typeof model !== 'string' || !workerModelPattern.test(model))
+      || (fanout.variable !== undefined && (typeof fanout.variable !== 'string' || !declared.has(fanout.variable)))) {
+      throw new Error(`${where}는 워커 노드에만 두고, 모델 id 목록과 선언된 설정값 키로 적으세요.`);
+    }
+    if (!fanout.models.length && !fanout.variable) throw new Error(`${where}에는 모델이 1개 이상 있거나 모델 목록 설정값이 연결돼야 합니다.`);
+    if (node.data.workerModel !== undefined) throw new Error(`${where}에는 단일 모델(workerModel)을 함께 둘 수 없습니다.`);
+    const next = graph.edges.filter((edge) => edge.source === node.id && !edge.loop).map((edge) => byId.get(edge.target)!);
+    const judged = next.find((target) => (isBranch(target) && (target.data.judge ?? 'previous') === 'previous')
+      || (target.data.kind === 'gate' && target.data.asker === 'previous') || spawnsRuns(target));
+    if (judged) throw new Error(`${where}는 판정·항목을 하나로 보고하지 않으므로 '${judged.data.label || judged.id}' 의 판정 주체나 항목 보고 단계가 될 수 없습니다.`);
+  }
   if (graph.automations !== undefined) {
     const automationIds = new Set<string>();
     if (!Array.isArray(graph.automations) || graph.automations.length > 20 || graph.automations.some((item) => !item || !validId(item.id)

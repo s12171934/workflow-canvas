@@ -71,6 +71,30 @@ export type Effort = typeof effortLevels[number];
 export const workerModelPattern = /^[A-Za-z0-9][A-Za-z0-9._:\[\]-]{0,99}$/;
 /** Nodes for which the coordinator starts a worker: workers, and branches judged by a worker of their own. */
 export const launchesWorker = (node: Pick<StageNode, 'data'>) => node.data.kind === 'worker' || (node.data.kind === 'branch' && node.data.judge === 'worker');
+/**
+ * A worker node that fans out: one worker per model, all at once on the same instructions (a review round by N reviewers).
+ * `models` is the list kept on the canvas; `variable` names a run setting whose comma-separated value, when given, replaces it.
+ */
+export type ModelFanout = { models: string[]; variable?: string };
+export const fansOut = (node: Pick<StageNode, 'data'>) => node.data.kind === 'worker' && !!node.data.fanout;
+/** The Orca agent (`worker-start --agent`) that runs a model: GPT·Codex models run in Codex, the rest in Claude Code. */
+export function agentOf(model: string): 'claude' | 'codex' { return /^(gpt|codex|o\d)/i.test(model) ? 'codex' : 'claude'; }
+/** Models in a setting value: separated by commas or whitespace, empty entries dropped. */
+export const parseModelList = (value: string) => value.split(/[\s,]+/).map((item) => item.trim()).filter(Boolean);
+/** The models a fanout stage runs with these setting values: the setting's list when it is given, else the node's own list. */
+export function fanoutModels(fanout: ModelFanout, values: Record<string, string> = {}): string[] {
+  const fromSetting = fanout.variable ? parseModelList(values[fanout.variable] ?? '') : [];
+  return fromSetting.length ? fromSetting : fanout.models;
+}
+/** One worker per listed model, named after it; the same model listed again becomes `<model>-2`, `<model>-3`, … */
+export function fanoutWorkers(models: string[]): { name: string; model: string; agent: 'claude' | 'codex' }[] {
+  const seen = new Map<string, number>();
+  return models.map((model) => {
+    const count = (seen.get(model) ?? 0) + 1;
+    seen.set(model, count);
+    return { name: count === 1 ? model : `${model}-${count}`, model, agent: agentOf(model) };
+  });
+}
 export type WorktreeMode = 'existing' | 'create';
 export type NameSource = 'fixed' | 'agent' | 'input';
 export const nameSourceNames: Record<NameSource, string> = { fixed: '직접 지정', agent: '이전 단계 에이전트가 정함', input: '실행 시 입력' };
@@ -157,6 +181,8 @@ export type StageData = {
   /** Launching nodes (see `launchesWorker`): the worker's model and reasoning effort; unset uses the defaults. */
   workerModel?: string;
   effort?: Effort;
+  /** kind 'worker': run one worker per model in parallel instead of one worker (see `ModelFanout`); `workerModel` is then unset. */
+  fanout?: ModelFanout;
   /** kind 'script': the command (a shell script, {{settings}} allowed), how its output is read, and how it runs. */
   command?: string;
   parse?: ScriptParse;
@@ -577,7 +603,8 @@ export function serializableWorkflow(workflow: Workflow): Workflow {
         ...(node.data.detach ? { detach: true } : {}), ...(node.data.timeoutSec ? { timeoutSec: node.data.timeoutSec } : {}),
         ...(node.data.taskId ? { taskId: node.data.taskId } : {}) });
     } else if (node.data.taskId) data.taskId = node.data.taskId;
-    if (launchesWorker(node)) Object.assign(data, { ...(node.data.workerModel ? { workerModel: node.data.workerModel } : {}), ...(node.data.effort ? { effort: node.data.effort } : {}) });
+    if (launchesWorker(node)) Object.assign(data, { ...(node.data.workerModel && !fansOut(node) ? { workerModel: node.data.workerModel } : {}), ...(node.data.effort ? { effort: node.data.effort } : {}),
+      ...(fansOut(node) ? { fanout: { models: [...node.data.fanout!.models], ...(node.data.fanout!.variable ? { variable: node.data.fanout!.variable } : {}) } } : {}) });
     if (!group && isExecutable(node) && node.data.join === 'any') data.join = 'any';
     if (node.data.kind === 'gate' && (node.data.asker === 'previous' || node.data.asker === 'auto')) data.asker = node.data.asker;
     const width = node.width ?? node.measured?.width;
@@ -707,7 +734,7 @@ export function normalizeNodes(nodes: StageNode[]): StageNode[] {
 /** One line of a launch's events.jsonl. */
 export type RunEvent = {
   at: string;
-  /** requested · brief · coordinator · coordinator-failed · registered · task · note */
+  /** requested · brief · coordinator · coordinator-failed · coordinator-lost · registered · task · note */
   type: string;
   message: string;
   taskId?: string;
@@ -715,11 +742,19 @@ export type RunEvent = {
   from?: StageStatus;
 };
 /** meta.json of a launch directory (`.executions/<stamp>-<workflow id>/`). */
+/** Longest run name (실행 이름) the run dialog accepts. */
+export const maxRunTitle = 60;
+/** Label of execution `n` of a request named `title`: the name alone when the request runs once, else `<name> #<n>`. */
+export const executionLabel = (title: string, n: number, count: number) => count > 1 ? `${title} #${n}` : title;
+/** A workflow's open Runs at a glance (sidebar): Tasks running and Tasks waiting on a person. */
+export type WorkflowLive = { running: number; blocked: number };
 export type RunLogMeta = {
   workflowId: string;
   workflowName: string;
   startedAt: string;
   count?: number;
+  /** The name this request's executions go by (Task titles, tabs, canvas chips): typed in the run dialog, else derived. */
+  title?: string;
   project?: string;
   automation?: { id: string; name: string };
   /** Run-time worktree names this request was started with (group id → name). */
@@ -731,7 +766,10 @@ export type RunLogMeta = {
   executions?: LoggedExecution[];
   /** The Run was attached after the fact (a launch from before execution logs existed); events are observation times, not real times. */
   adopted?: boolean;
-  /** Terminal of the coordinator the server started for this launch (absent: an automation's own agent). */
+  /**
+   * Terminal of this launch's coordinator: the one the server started, or the one the coordinator named when it registered
+   * its executions (a sub-coordinator, an automation's agent). Its disappearance before the run finished makes it `stalled`.
+   */
   coordinatorTerminal?: string;
   /** 완료 시 정리 asked the coordinator to close itself: the server closes it when it is still open after the run ends. */
   closeCoordinator?: boolean;
@@ -747,7 +785,8 @@ export type ExecutionResult = { id: string; label: string; status: StageStatus; 
   /** `skipped`: a branch the finished execution never took (its Task stayed ready). */
   stages: { taskId: string; title: string; status: StageStatus; skipped?: boolean }[] };
 /** Overall state of one 실행 request, for the log list. */
-export type RunLogOutcome = 'pending' | 'running' | 'completed' | 'failed' | 'blocked' | 'unknown';
+/** `stalled`: the coordinator's terminal is gone from Orca and the run never finished — ended, but not a success (like `failed`). */
+export type RunLogOutcome = 'pending' | 'running' | 'completed' | 'failed' | 'blocked' | 'unknown' | 'stalled';
 export type RunLogSummary = RunLogMeta & { id: string; events: number; last?: RunEvent; files: string[]; outcome: RunLogOutcome };
 export type RunLogDetail = { id: string; meta: RunLogMeta; events: RunEvent[]; files: string[]; outcome: RunLogOutcome;
   /** Live per-execution results from Orca; null when the Run is unknown or could not be read. */
@@ -758,7 +797,7 @@ export type RunLogFile = { name: string; size: number; truncated: boolean; text:
 export const coordinatorEventTypes = ['note', 'gate', 'worker', 'error', 'report'] as const;
 export const runEventNames: Record<string, string> = {
   execution: '실행 결과', finished: '전체 종료', adopted: 'Run 연결',
-  requested: '실행 요청', brief: '브리프', coordinator: '코디네이터', 'coordinator-failed': '기동 실패', 'coordinator-closed': '코디네이터 종료', registered: '실행 등록',
+  requested: '실행 요청', brief: '브리프', coordinator: '코디네이터', 'coordinator-failed': '기동 실패', 'coordinator-closed': '코디네이터 종료', 'coordinator-lost': '코디네이터 사라짐', registered: '실행 등록',
   task: 'Task', note: '메모', gate: '게이트', worker: '워커 보고', error: '오류', report: '마무리 보고',
 };
 /** Results of each logged execution in a Run snapshot. A Task missing from the snapshot counts as unknown. */
@@ -812,8 +851,12 @@ export type FlowStage = { id: string; after: { id: string; output?: string }[]; 
 export type FlowLoop = { edge: string; output: string; to: string; max: number; exit: string; body: string[] };
 /** What one decision did: the execution afterwards, and whether it looped back or ran out of rounds. */
 export type DecisionEffect = { execution: Execution;
-  /** Went back: stages to run again from `to` (new Tasks needed); the body now runs its pass number `pass`. */
-  loop?: { edge: string; to: string; restart: string[]; pass: number; max: number; remaining: number };
+  /**
+   * Went back: stages to run again from `to` (new Tasks needed). `rounds` is each restarted stage's round in this execution,
+   * counted per stage across every loop (2 = its second run): the `<k>` of its `-r<k>` artifacts and Task titles. `pass` is
+   * the round of `to`. `max`·`remaining` count this loop edge only (the limit stays per loop).
+   */
+  loop?: { edge: string; to: string; restart: string[]; pass: number; rounds: Record<string, number>; max: number; remaining: number };
   /** The loop output was chosen with no rounds left: `output` (the loop's exit) was recorded instead. */
   exhausted?: { output: string; max: number };
   /** Nothing changed: this decision was already recorded (a retried request). */
@@ -830,7 +873,7 @@ export function applyDecision(flow: FlowStage[], execution: Execution, node: str
   if (loop && last?.edge === loop.edge && !execution.bindings[node] && !execution.decisions?.[node]
     && JSON.stringify(last.decisions?.[node]) === JSON.stringify(outputs)) {
     const count = execution.loops?.[loop.edge] ?? 0;
-    return { execution, loop: { edge: loop.edge, to: loop.to, restart: last.nodes, pass: count + 1, max: loop.max, remaining: loop.max - count }, repeated: true };
+    return { execution, loop: { edge: loop.edge, to: loop.to, restart: last.nodes, ...roundsOf(execution, last.nodes, loop.to), max: loop.max, remaining: loop.max - count }, repeated: true };
   }
   const decide = (chosen: string[]) => {
     const decisions = { ...execution.decisions, [node]: chosen };
@@ -858,7 +901,12 @@ export function applyDecision(flow: FlowStage[], execution: Execution, node: str
   const { spawned: _spawned, ...rest } = execution;
   const next: Execution = { ...rest, ...(Object.keys(spawnedKept).length ? { spawned: spawnedKept } : {}), bindings: part(execution.bindings, false), decisions, skipped: skippedStages(flow, decisions),
     loops: { ...execution.loops, [loop.edge]: count + 1 }, history: [...(execution.history ?? []), pass] };
-  return { execution: next, loop: { edge: loop.edge, to: loop.to, restart, pass: count + 2, max: loop.max, remaining: loop.max - count - 1 } };
+  return { execution: next, loop: { edge: loop.edge, to: loop.to, restart, ...roundsOf(next, restart, loop.to), max: loop.max, remaining: loop.max - count - 1 } };
+}
+/** Rounds the restarted stages run now: per stage, across every loop of the execution (see `stageRound`). */
+function roundsOf(execution: Execution, restart: string[], to: string) {
+  const rounds = Object.fromEntries(restart.map((id) => [id, stageRound(execution, id)]));
+  return { pass: rounds[to] ?? stageRound(execution, to), rounds };
 }
 /** A gate is a user decision with two outputs; every edge leaving it is the 'approve' output. */
 export const gateOutputs: BranchOutput[] = [{ id: 'approve', label: '통과' }, { id: 'reject', label: '거절' }];
@@ -953,4 +1001,23 @@ export function decisionError(flow: FlowStage[], decisions: Record<string, strin
   const previous = decisions[node];
   if (previous && (previous.length !== outputs.length || previous.some((output) => !outputs.includes(output)))) return `이 분기는 이미 ${previous.join(', ')} 로 결정되었습니다.`;
   return undefined;
+}
+
+/** Heading of the section a worker spec gets with the user-judged branch decisions taken before it (runtime contract (a)). */
+export const userDecisionsHeading = '## 앞 사용자 분기 판정';
+/**
+ * User-judged branch decisions (judge `user`, gates excluded) taken so far in an execution: the current ones, else the latest
+ * of an earlier loop pass, in flow order.
+ */
+export function userDecisions(flow: FlowStage[], execution: Pick<Execution, 'decisions' | 'history'>): { node: string; label: string; outputs: string[] }[] {
+  const latest = new Map<string, string[]>();
+  for (const pass of execution.history ?? []) for (const [node, outputs] of Object.entries(pass.decisions ?? {})) latest.set(node, outputs);
+  for (const [node, outputs] of Object.entries(execution.decisions ?? {})) latest.set(node, outputs);
+  return flow.filter((stage) => stage.branch && stage.judge === 'user' && !stage.veto && latest.has(stage.id))
+    .map((stage) => ({ node: stage.id, label: stage.label ?? stage.id, outputs: latest.get(stage.id)! }));
+}
+/** The `## 앞 사용자 분기 판정` section for a worker spec; empty when no user-judged branch was decided. */
+export function userDecisionsSection(decisions: { node: string; label: string; outputs: string[] }[]): string {
+  if (!decisions.length) return '';
+  return `${userDecisionsHeading}\n${decisions.map((item) => `- ${item.node} (${item.label}): ${item.outputs.join(', ')}`).join('\n')}\n`;
 }

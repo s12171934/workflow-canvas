@@ -1,0 +1,37 @@
+import { maxLoopRounds, userDecisionsHeading } from '../src/model.ts';
+
+/**
+ * The runtime contract a graph is written against: what the canvas and its coordinator do with a graph that the graph's
+ * own text cannot see. One source for every place a graph author (a person, the generation agent, a method document)
+ * reads it — the generation prompts embed it, README carries the same text between its runtime-contract markers
+ * (a test keeps them equal). Change the runtime and this list together.
+ */
+export const runtimeContract: readonly { key: string; title: string; text: string }[] = [
+  { key: 'empty-setting', title: '빈 설정값',
+    text: '선언했지만 실행 때 비운 설정값은 지침의 `{{키}}` 자리에 빈 문자열로 들어간다. 「`{{키}}` 가 중괄호 그대로면」으로 판별하지 말고 「값이 비어 있으면」으로 쓴다.' },
+  { key: 'setting-reach', title: '설정값이 닿는 곳',
+    text: '설정값은 단계 지침·스크립트 명령·부모 워크트리 경로에 `{{키}}` 로 쓴 곳에만 들어간다. 선언만 하고 어느 지침에도 쓰지 않으면 워커는 그 값을 모른다. 분기 출력 이름·게이트 질문에는 치환하지 않는다.' },
+  { key: 'decision', title: '판정',
+    text: '분기·게이트 판정은 워커의 worker_done **첫 줄** `decision: <출력 id>[,<출력 id>...]` 만 인정한다. 없거나 출력 목록에 없는 값이면 코디네이터는 추측하지 않고 사용자 결정(캔버스 결정 카드)으로 넘긴다. 같은 분기는 한 번만 판정한다(재실행해 고르지 않는다).' },
+  { key: 'loop-exhausted', title: '반복 소진',
+    text: `되돌아가기 연결은 연결마다 최대 반복(1~${maxLoopRounds})을 센다. 다 쓴 뒤 그 출력을 고르면 판정이 연결의 「반복을 다 쓰면」(exit) 출력으로 바뀌어 기록되고 워커에게는 따로 알리지 않는다 — exit 출력 뒤 단계는 반복 소진으로 온 경우도 처리해야 한다.` },
+  { key: 'rounds', title: '회차 번호',
+    text: '되돌아가기로 다시 도는 단계의 산출물은 `<n>-<노드 id>-r<k>.txt` 이고, k 는 그 단계가 이 실행에서 몇 번째로 도는지다(단계 기준 누적, 2부터. 같은 단계로 가는 루프가 여럿이어도 합쳐 센다. 1회차는 `-r` 없이 `<n>-<노드 id>.txt`). 그래서 그 단계의 앞 회차는 언제나 `-r<k-1>` 이다. 「가장 최근 회차」는 이름 사전순이 아니라 k 를 숫자로 비교한 최댓값(또는 `ls -t` 맨 위)으로 고르고, glob 에는 노드 id 를 정확히 적어 `-children`·`-result` 같은 다른 파일이 섞이지 않게 한다. 최대 반복은 회차와 따로 연결마다 센다.' },
+  { key: 'stalled', title: '죽은 하위 실행',
+    text: '실행 로그 outcome(`GET /api/workflows/<id>/logs`)은 pending·running·blocked·completed·failed·unknown·stalled 다. `stalled` 는 코디네이터 터미널이 Orca 에서 사라졌는데 `finished` 이벤트가 없는 실행이다(Orca 가 응답하지 않을 때는 stalled 로 보지 않는다). 하위 실행을 기다리는 그래프는 `stalled` 를 `failed` 와 같이 「끝났지만 성공 아님」으로 다루고 더 기다리지 않는다.' },
+  { key: 'user-decisions', title: '사용자 분기 판정 전달',
+    text: `코디네이터는 워커 spec 마다, 이 실행에서 그 워커보다 앞서 내려진 사용자(judge \`user\`) 분기 판정을 \`${userDecisionsHeading}\` 절로 전한다. 절의 줄은 \`- <분기 노드 id> (<라벨>): <출력 id>\` 이다. Task 는 판정 전에 만들어지므로 spec 의 이 절은 코디네이터가 워커를 띄우기 직전에 쓰는 \`<n>-<노드 id>-user-decisions.md\` 를 가리킨다. 판정이 없으면 그 파일이 없다(그래프에 사용자 판정 분기가 없으면 절도 없다). 게이트(통과·거절)는 들어가지 않는다.` },
+  { key: 'fanout-failed', title: '모델별 병렬 워커 전원 실패',
+    text: 'fanout 단계의 모델 워커가 모두 실패해도 단계와 실행을 실패로 끝내지 않는다. 코디네이터는 결과 줄 `모델별 <완료 k>/<전체 m> · 실패 <name>(<사유>), ... · 산출물 <경로, ...>` 을 단계 Task 결과와 단계 산출물 `<n>-<노드 id>.txt`(2회차 이상 `-r<k>.txt`)에 남기고 다음 단계로 진행한다. 뒤 단계가 결과 줄로 전원 실패(`모델별 0/<m>`)를 판단한다.' },
+  { key: 'coordinator-cleanup', title: '코디네이터 정리',
+    text: '단계 워커가 worker_done 에 `코디네이터 정리 필요: <터미널 핸들>[, <터미널 핸들> ...]` 한 줄을 적으면, 코디네이터가 그 단계가 끝난 직후(다음 단계를 띄우기 전에) 그 터미널을 닫는다. 코디네이터 자신과 이 Run 에서 아직 일하는 워커의 터미널은 닫지 않는다.' },
+  { key: 'location-terminals', title: 'location 안 터미널 닫기 금지',
+    text: '워커는 자기 location 워크트리를 지우거나 그 안의 터미널을 닫지 않는다(자기 터미널이 함께 닫혀 worker_done 을 보낼 수 없다). 그런 정리가 필요하면 위 「코디네이터 정리」 줄로 보고한다.' },
+  { key: 'document-put', title: '문서 저장',
+    text: '`PUT /api/workflows/:id` 는 런타임 쓰기와 같은 직렬 큐에 들어가고, 본문의 `executions`·`automations` 는 무시하고 서버의 현재 값을 보존한다. `GET` 응답의 `ETag`(문서 버전)를 `If-Match` 로 보내면 그 사이 문서가 바뀌었을 때 409 와 현재 `version` 을 돌려준다.' },
+];
+
+/** The contract as a Markdown list: the generation prompts and README's runtime-contract section. */
+export function runtimeContractMarkdown(): string {
+  return runtimeContract.map((item) => `- **${item.title}** — ${item.text}`).join('\n');
+}
