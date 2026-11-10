@@ -235,3 +235,51 @@ test('(a) the decisions API gives the user-judged branch decisions and the spec 
     [{ node: 'b', label: 'B', outputs: ['x'] }]);
   assert.deepEqual(userDecisions(flow, { decisions: { b: ['y'] }, history: [{ edge: 'e', pass: 1, nodes: ['b'], bindings: {}, decisions: { b: ['x'] } }] })[0].outputs, ['y']);
 });
+
+test('runtime contract: one list for the generation prompts and README; README loop limit matches the code', async () => {
+  const { runtimeContract, runtimeContractMarkdown } = await import('./contract.ts');
+  const { workflowPrompt, briefPrompt } = await import('./generate.ts');
+  const { maxLoopRounds } = await import('../src/model.ts');
+  const { readFile } = await import('node:fs/promises');
+  // Every rule the task names is in the list.
+  assert.deepEqual(runtimeContract.map((item) => item.key), ['empty-setting', 'setting-reach', 'decision', 'loop-exhausted', 'rounds', 'stalled',
+    'user-decisions', 'fanout-failed', 'coordinator-cleanup', 'location-terminals', 'document-put']);
+  const list = runtimeContractMarkdown();
+  assert.match(list, /빈 문자열/);
+  assert.match(list, /worker_done \*\*첫 줄\*\* `decision:/);
+  assert.match(list, /## 앞 사용자 분기 판정/);
+  assert.match(list, new RegExp(`1~${maxLoopRounds}`));
+  // README carries the same text between its markers.
+  const readme = await readFile(new URL('../README.md', import.meta.url), 'utf8');
+  const section = readme.match(/<!-- runtime-contract:start -->\n([\s\S]*?)\n<!-- runtime-contract:end -->/);
+  assert.ok(section, 'README 에 런타임 계약 절이 있어야 한다');
+  assert.equal(section[1], list, 'README 의 런타임 계약 절을 server/contract.ts 와 맞추세요');
+  assert.match(readme, new RegExp(`최대 반복 횟수\\(1~${maxLoopRounds}\\)`));
+  assert.doesNotMatch(readme, /1~10\)/);
+  // Both generation prompts embed it.
+  const workflow = workflowPrompt({ request: 'r', resultUrl: 'http://x', resultFile: '/tmp/r.json', saved: [] });
+  assert.ok(workflow.includes(`## 런타임 계약`) && workflow.includes(list));
+  const graph = { ...newWorkflow(), id: 'g' };
+  const brief = briefPrompt({ request: 'r', resultUrl: 'http://x', resultFile: '/tmp/r.json', graph, nodeId: graph.nodes.find((node) => node.data.kind === 'worker')!.id });
+  assert.ok(brief.includes(list));
+});
+
+test('check warns about settings no instruction uses, 「중괄호 그대로」, and picking the latest round by name', async () => {
+  const { preflight } = await import('./execute.ts');
+  const stage = (id: string, description: string, extra: Record<string, unknown> = {}) => ({ id, type: 'stage' as const, position: { x: 0, y: 0 },
+    data: { label: id, description, kind: 'worker' as const, ...extra } });
+  const graph = { ...newWorkflow(), id: 'warned', variables: [{ key: 'top_name', label: '상위 이름' }, { key: 'unused', label: '안 씀' }, { key: 'models', label: '모델' }],
+    nodes: [
+      stage('status', '`{{top_name}}` 이 중괄호 그대로면 단독 실행이다.'),
+      stage('prepare', '산출물 `1-review-r*.txt` 중 가장 최근 회차를 읽는다.'),
+      stage('fixed', '`1-review-r<k>.txt` 중 k 를 숫자로 비교해 가장 최근 회차를 읽는다.'),
+      stage('review', '<리뷰어> 로 리뷰한다', { fanout: { models: [], variable: 'models' } }),
+    ], edges: [{ id: 'a', source: 'status', target: 'prepare' }, { id: 'b', source: 'prepare', target: 'fixed' }, { id: 'c', source: 'fixed', target: 'review' }] } as Workflow;
+  const report = await preflight(graph, async () => { throw new Error('no links'); });
+  const has = (text: string) => report.warnings.some((item) => item.includes(text));
+  assert.ok(has("'안 씀'(unused)"), report.warnings.join('\n'));
+  assert.ok(!has('(top_name)') && !has('(models)'), 'used in an instruction or as the fanout setting');
+  assert.ok(has("'status' 지침이 「중괄호 그대로」"));
+  assert.ok(has("'prepare' 지침이 「가장 최근 회차」"));
+  assert.ok(!has("'fixed' 지침이 「가장 최근 회차」"));
+});

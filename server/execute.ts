@@ -241,6 +241,21 @@ export async function preflight(graph: Workflow, load: (id: string) => Promise<W
         }
       }
     }
+    // Runtime contract (server/contract.ts): settings reach only where `{{key}}` is written; an empty one becomes ''.
+    const used = new Set(workflow.nodes.flatMap((node) => [
+      ...variableRefs(`${node.data.description}\n${node.data.command ?? ''}\n${node.data.parentPath ?? ''}`),
+      ...(node.data.fanout?.variable ? [node.data.fanout.variable] : [])]));
+    for (const item of workflow.variables ?? []) {
+      if (!used.has(item.key)) warnings.push(`${where}설정값 '${item.label}'(${item.key}) 이(가) 어느 지침·명령에도 \`{{${item.key}}}\` 로 쓰이지 않아 워커에게 닿지 않습니다.`);
+    }
+    for (const node of workflow.nodes.filter((item) => item.data.description)) {
+      const text = node.data.description;
+      const name = `${where}'${node.data.label || node.id}'`;
+      if (/중괄호\s*그대로/.test(text)) warnings.push(`${name} 지침이 「중괄호 그대로」로 빈 설정값을 판별합니다. 빈 설정값은 빈 문자열이 되므로 「값이 비어 있으면」으로 쓰세요.`);
+      if ((/-r\*/.test(text) || /가장\s*최근\s*회차/.test(text)) && !/숫자|ls -t/.test(text)) {
+        warnings.push(`${name} 지침이 「가장 최근 회차」를 이름(\`-r*\`)으로 고르는 것 같습니다. 이름 사전순이면 -r10 이 -r2 앞에 옵니다 — -r<k> 의 k 를 숫자로 비교해 고르세요.`);
+      }
+    }
     if (stages.length > 1) {
       for (const stage of stages) {
         if (!workflow.edges.some((edge) => edge.source === stage.id || edge.target === stage.id)) warnings.push(`${where}'${stage.data.label || '단계'}' 이(가) 어느 단계와도 연결되지 않아 실행 시작과 함께 따로 돕니다.`);
