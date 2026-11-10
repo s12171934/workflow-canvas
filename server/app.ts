@@ -99,6 +99,8 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
     };
     const timer = setInterval(() => { void reap(); }, options.reapMs ?? Math.max(options.watchMs, 30_000));
     timer.unref?.();
+    // Lets a caller (tests) stop the watch before removing the directory it writes to.
+    app.locals.stopWatch = () => clearInterval(timer);
   }
   app.disable('x-powered-by');
   app.use('/api', (req, res, next) => {

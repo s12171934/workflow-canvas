@@ -126,7 +126,8 @@ test('(b) the server marks a launch stalled only when Orca says the coordinator 
     }
     return places(args) ?? { terminal: { handle: 'term_coord' } };
   });
-  const server = createApp(directory, bridge, { watchMs: 60_000, reapMs: 40 }).listen(0, '127.0.0.1');
+  const app = createApp(directory, bridge, { watchMs: 60_000, reapMs: 40 });
+  const server = app.listen(0, '127.0.0.1');
   await new Promise<void>((done) => server.once('listening', done));
   const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
   const wait = (ms: number) => new Promise((done) => setTimeout(done, ms));
@@ -147,8 +148,10 @@ test('(b) the server marks a launch stalled only when Orca says the coordinator 
     const detail = await (await fetch(`${url}/api/workflows/dying/logs/${events.id}`)).json() as { events: { type: string }[] };
     assert.equal(detail.events.filter((event) => event.type === 'coordinator-lost').length, 1);
   } finally {
+    (app.locals.stopWatch as (() => void) | undefined)?.();
     await new Promise<void>((done, fail) => { server.close((error) => error ? fail(error) : done()); server.closeAllConnections(); });
-    await rm(directory, { recursive: true, force: true });
+    // A reap already in flight may still append once; retry the removal instead of racing it.
+    await rm(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   }
 });
 
