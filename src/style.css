@@ -85,6 +85,8 @@ select { text-overflow:ellipsis; }
 .panel-toggle.right { right:var(--gap); }
 .selection-dot { width:6px; height:6px; border-radius:50%; background:var(--mint); }
 .view-only-badge { display:inline-flex; align-items:center; gap:3px; margin-right:8px; padding:2px 6px; border-radius:4px; background:#e3b45f1c; color:#e3b45f; font-size:9px; }
+/* 고정 보기 전용(?readonly): 바꾸는 버튼은 아예 숨긴다 */
+.locked-view .lock-hide, .locked-view .inspector .button.danger { display:none !important; }
 .inspector-fields { border:0; margin:0; padding:0; min-width:0; }
 .tool-button.locked { color:#e3b45f!important; background:#e3b45f1c!important; }
 .react-flow { background:transparent!important; }
