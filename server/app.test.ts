@@ -5,6 +5,7 @@ import { join, resolve } from 'node:path';
 import type { AddressInfo } from 'node:net';
 import { get } from 'node:http';
 import { createApp } from './app.ts';
+import { createModelCatalog, latestPerFamily } from './models.ts';
 import { createOrcaBridge } from './orca.ts';
 import { launchDirName } from './runlog.ts';
 import { newWorkflow } from '../src/model.ts';
@@ -164,6 +165,43 @@ test('execute refuses a workflow link that is unset, missing, or cyclic', async 
     await rm(directory, { recursive: true, force: true });
   }
 });
+test('check reports every 실행 check without starting a coordinator, plus warnings', async () => {
+  await mkdir('.local', { recursive: true });
+  const directory = await mkdtemp(join(resolve('.local'), 'api-check-test-'));
+  const calls: string[][] = [];
+  const bridge = createOrcaBridge(async (args) => { calls.push(args); return places(args) ?? { terminal: { handle: 'term_coord' } }; });
+  const server = createApp(directory, bridge, { root: '/example/canvas' }).listen(0, '127.0.0.1');
+  await new Promise<void>((resolve) => server.once('listening', resolve));
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const json = { 'Content-Type': 'application/json' };
+  const put = (graph: unknown) => fetch(`${base}/api/workflows/${(graph as { id: string }).id}`, { method: 'PUT', headers: json, body: JSON.stringify(graph) });
+  const check = async (id: string) => (await fetch(`${base}/api/workflows/${id}/check`)).json();
+  const stage = (id: string, data: Record<string, unknown>) => ({ id, type: 'stage', position: { x: 0, y: 0 }, data: { label: id, description: '', ...data } });
+  try {
+    await put({ ...newWorkflow(), id: 'wf-good', nodes: [stage('a', { kind: 'worker' })], edges: [] });
+    const good = await check('wf-good');
+    assert.equal(good.ok, true);
+    assert.deepEqual(good.warnings, []);
+    await put({ ...newWorkflow(), id: 'wf-bad', nodes: [
+      stage('a', { kind: 'worker', description: '{{missing}} 를 쓴다' }),
+      stage('b', { kind: 'branch', judge: 'previous', mode: 'exclusive', outputs: [{ id: 'x', label: '엑스' }, { id: 'y', label: '와이' }] }),
+      stage('c', { kind: 'worker' }), stage('lonely', { kind: 'worker' }), stage('link', { kind: 'workflow', workflowId: 'nowhere' }),
+    ], edges: [{ id: 'a-b', source: 'a', target: 'b' }, { id: 'b-c', source: 'b', target: 'c', sourceHandle: 'x' }, { id: 'c-link', source: 'c', target: 'link' }] });
+    const bad = await check('wf-bad');
+    assert.equal(bad.ok, false);
+    const failed = Object.fromEntries(bad.checks.filter((item: { ok: boolean }) => !item.ok).map((item: { name: string; message: string }) => [item.name, item.message]));
+    assert.match(failed.links, /찾지 못했습니다/);
+    assert.match(failed.variables, /missing/);
+    assert.equal(bad.checks.find((item: { name: string }) => item.name === 'branches').ok, true);
+    assert.ok(bad.warnings.some((item: string) => item.includes('(y)')));
+    assert.ok(bad.warnings.some((item: string) => item.includes("'lonely'")));
+    assert.equal(calls.filter((args) => args[0] === 'agent').length, 0);
+  } finally {
+    await new Promise<void>((resolve, reject) => { server.close((error) => error ? reject(error) : resolve()); server.closeAllConnections(); });
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test('brief asks for one new worktree per execution, including inside links', async () => {
   const { buildBrief, checkGroups } = await import('./execute.ts');
   const child = { ...newWorkflow(), id: 'wf-child', name: '하위', nodes: [
@@ -441,6 +479,14 @@ test('branches: brief carries order and judges, bad branches are refused, decisi
     await rm(directory, { recursive: true, force: true });
   }
 });
+test('brief turns a declared setting left empty into an empty string, never a raw {{key}}', async () => {
+  const { buildBrief } = await import('./execute.ts');
+  const graph = { ...newWorkflow(), id: 'wf-empty', variables: [{ key: 'focus', label: '볼 점' }, { key: 'target', label: '대상', required: true }],
+    nodes: [{ id: 'a', type: 'stage' as const, position: { x: 0, y: 0 }, data: { label: 'a', description: '대상 {{target}} · 볼 점[{{focus}}]', kind: 'worker' } }], edges: [] } as never;
+  const brief = buildBrief({ graph, count: 1, apiBase: 'http://127.0.0.1:1', workspace: '/example/repo', artifactDir: '/tmp/x', values: { target: 'wf-x' } });
+  const [stage] = JSON.parse(brief.match(/```json\n(\[[\s\S]*?\])\n```/)![1]) as { instructions: string }[];
+  assert.equal(stage.instructions, '대상 wf-x · 볼 점[]');
+});
 test('brief gives each launching stage its model (default when unset) and effort; memo groups never become stages', async () => {
   const { buildBrief } = await import('./execute.ts');
   const stage = (id: string, kind = 'worker', extra = {}) => ({ id, type: 'stage' as const, position: { x: 0, y: 0 }, data: { label: id, description: id, kind, ...extra } });
@@ -475,6 +521,39 @@ test('a gate can be asked in the terminal of the one worker before it', async ()
   const coordinator = { ...twoInFront, nodes: twoInFront.nodes.map((node) => node.id === 'review' ? stage('review', 'gate') : node) } as never as typeof graph;
   checkBranches([coordinator]);
 });
+test('a script driver runs without an agent and can feed a spawn link and decide the branch after it', async () => {
+  const { buildBrief, checkBranches, checkScripts, checkSpawns, flowOf } = await import('./execute.ts');
+  const stage = (id: string, kind = 'worker', extra = {}) => ({ id, type: 'stage' as const, position: { x: 0, y: 0 }, data: { label: id, description: `${id} 지침`, kind, ...extra } });
+  const edge = (source: string, target: string, sourceHandle?: string) => ({ id: `${source}-${target}`, source, target, ...(sourceHandle ? { sourceHandle } : {}) });
+  const target = { ...newWorkflow(), id: 'wf-target', name: '티켓 하나', nodes: [{ id: 'g', type: 'group' as const, position: { x: 0, y: 0 },
+    data: { label: 'wt', description: '', kind: 'group', scope: 'worktree', worktreeMode: 'create', nameSource: 'input', path: '', repoPath: '' } }], edges: [] } as never as Parameters<typeof buildBrief>[0]['graph'];
+  const graph = { ...newWorkflow(), id: 'wf-script', variables: [{ key: 'project', label: '프로젝트' }],
+    nodes: [stage('select', 'script', { command: 'cbd {{project}} select --json', parse: 'jsonl' }), stage('each', 'workflow', { workflowId: 'wf-target', linkMode: 'spawn' }),
+      stage('drive', 'script', { command: 'cbd x schedule --once', detach: true }),
+      stage('pick', 'script', { command: 'echo', parse: 'jsonl' }), stage('which', 'branch', { judge: 'previous', mode: 'exclusive', outputs: [{ id: 'a', label: 'A' }, { id: 'b', label: 'B' }] }),
+      stage('afterA'), stage('afterB')],
+    edges: [edge('select', 'each'), edge('pick', 'which'), edge('which', 'afterA', 'a'), edge('which', 'afterB', 'b')] } as never as typeof target;
+  const linked = new Map([['wf-target', target]]);
+  checkSpawns([graph], linked);
+  checkBranches([graph]);
+  checkScripts([graph]);
+  const brief = buildBrief({ graph, linked, count: 1, apiBase: 'http://127.0.0.1:1', workspace: '/example/repo', artifactDir: '/tmp/x', values: { project: 'prd60' } });
+  const stages = JSON.parse(brief.match(/```json\n(\[[\s\S]*?\])\n```/)![1]) as { nodeId: string; script?: { command: string; parse: string; detach: boolean; timeoutSec: number }; reportsItems?: string[]; decides?: unknown[]; model?: string }[];
+  const byId = Object.fromEntries(stages.map((item) => [item.nodeId, item]));
+  assert.deepEqual(byId.select.script, { command: 'cbd prd60 select --json', parse: 'jsonl', detach: false, timeoutSec: 600 }); // settings substituted
+  assert.deepEqual(byId.select.reportsItems, ['each']);
+  assert.equal(byId.select.model, undefined); // no worker is launched for a script
+  assert.deepEqual(byId.drive.script, { command: 'cbd x schedule --once', parse: 'none', detach: true, timeoutSec: 86400 });
+  assert.equal((byId.pick.decides as { nodeId: string }[])[0].nodeId, 'which');
+  assert.match(brief, /스크립트 단계\(kind `script`\)/);
+  assert.match(brief, /"selected": false/);
+  assert.ok(flowOf(graph, linked).some((item) => item.id === 'select'));
+  // Without output parsing a script reports nothing: it cannot feed a spawn link or judge a branch.
+  const silent = { ...graph, nodes: graph.nodes.map((node) => ['select', 'pick'].includes(node.id) ? { ...node, data: { ...node.data, parse: undefined } } : node) } as never as typeof graph;
+  assert.throws(() => checkSpawns([silent], linked), /출력을 읽는 스크립트 드라이버/);
+  assert.throws(() => checkBranches([silent]), /JSON 줄로 판정/);
+  assert.throws(() => checkScripts([{ ...graph, nodes: [stage('empty', 'script', { command: ' ' })] } as never as typeof graph]), /명령을 적으세요/);
+});
 test('a link that only starts lets what follows it go on without waiting for its sub-graph', async () => {
   const { flowOf, buildBrief } = await import('./execute.ts');
   const stage = (id: string, kind = 'worker', extra = {}) => ({ id, type: 'stage' as const, position: { x: 0, y: 0 }, data: { label: id, description: id, kind, ...extra } });
@@ -494,9 +573,11 @@ test('natural-language generation: Orca launches an agent, its results are valid
   const directory = await mkdtemp(join(resolve('.local'), 'api-generate-test-'));
   const calls: string[][] = [];
   const bridge = createOrcaBridge(async (args) => { calls.push(args); return places(args) ?? { terminal: { handle: 'term_gen' } }; });
-  const server = createApp(directory, bridge).listen(0, '127.0.0.1');
+  const models = createModelCatalog(async () => ['claude-opus-9', 'claude-fable-9']);
+  const server = createApp(directory, bridge, { models }).listen(0, '127.0.0.1');
   await new Promise<void>((resolve) => server.once('listening', resolve));
   const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  assert.deepEqual(await (await fetch(`${base}/api/models`)).json(), { models: ['claude-opus-9', 'claude-fable-9'], source: 'api' });
   const json = { 'Content-Type': 'application/json' };
   const post = (body: unknown) => fetch(`${base}/api/generations`, { method: 'POST', headers: json, body: JSON.stringify(body) });
   const put = (id: string, body: unknown) => fetch(`${base}/api/generations/${id}`, { method: 'PUT', headers: json, body: JSON.stringify(body) });
@@ -510,6 +591,7 @@ test('natural-language generation: Orca launches an agent, its results are valid
     assert.deepEqual(launch.slice(0, 8), ['agent', 'launch', '--agent', 'claude', '--model', 'claude-opus-5-5', '--worktree', 'path:/example/repo']);
     const prompt = await readFile(launch[9].split(' ')[0], 'utf8');
     assert.match(prompt, /설계 후 구현, 검토/);
+    assert.match(prompt, /`workerModel`\(claude-opus-9, claude-fable-9;/, 'the prompt offers the fetched models');
     assert.match(prompt, new RegExp(`/api/generations/${started.id}`));
 
     // A cycle is refused with a reason the agent can act on; a valid graph is laid out, saved and reported.
@@ -528,7 +610,7 @@ test('natural-language generation: Orca launches an agent, its results are valid
     assert.equal(done.status, 'done');
     const saved = await (await fetch(`${base}/api/workflows/${done.workflowId}`)).json();
     assert.equal(saved.name, '기능 개발');
-    assert.deepEqual(saved.nodes.map((node: { id: string; position: { x: number } }) => [node.id, node.position.x]), [['design', 0], ['impl', 320], ['review', 640]]);
+    assert.deepEqual(saved.nodes.map((node: { id: string; position: { x: number } }) => [node.id, node.position.x]), [['design', 0], ['impl', 324], ['review', 648]]);
     assert.deepEqual([saved.nodes[0].data.effort, saved.nodes[1].data.workerModel, saved.nodes[2].data.asker], ['high', 'claude-sonnet-5-5', 'previous']);
 
     // Instructions for one stage, with the canvas's current graph as context; the agent may also give up with a reason.
@@ -788,6 +870,11 @@ test('loops: a branch output goes back with a limit; the decision API starts a n
     assert.match(await errorOf({ ...graph, edges: [...edges, { ...back, sourceHandle: 'pass' }] }), /다른 연결을 둘 수 없습니다/);
     assert.match(await errorOf({ ...graph, edges: [...edges, { ...back, target: 'done', sourceHandle: 'fix' }] }), /앞에 있는/);
     assert.match(await errorOf({ ...graph, nodes: graph.nodes.map((node) => node.id === 'result' ? { ...result, data: { ...result.data, mode: 'inclusive' } } : node) }), /하나만/);
+    // Inside the body a link may only spawn separate executions (each pass asks again); one that expands here is refused.
+    const linked = (extra: object) => graph.nodes.map((node) => node.id === 'review' ? stage('review', { kind: 'workflow', workflowId: 'other', ...extra }) : node);
+    assert.match(await errorOf({ ...graph, nodes: linked({}) }), /따로 실행」 링크만/);
+    const spawning = await put({ ...graph, id: 'looping-spawn', nodes: linked({ linkMode: 'spawn' }) });
+    assert.equal(spawning.status, 200, await spawning.text());
     assert.equal((await put(graph)).status, 200);
     const saved = await (await fetch(`${base}/api/workflows/looping`)).json();
     assert.deepEqual(saved.edges.find((edge: { id: string }) => edge.id === 'back').loop, { max: 2, exit: 'stop' });
@@ -967,4 +1054,162 @@ test('a coordinator still open after its run ended is due for closing: a minute 
     await runlog.append(id, { at: at(70_000), type: 'coordinator-closed', message: '닫음' });
     assert.deepEqual(await runlog.coordinatorsToClose(t0 + 3600_000, 600_000), []);
   } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('model catalog: newest model per family from the Models API, built-in list when it fails', async () => {
+  assert.deepEqual(latestPerFamily([
+    { id: 'claude-fable-5-2', created_at: '2026-11-09T18:30:00Z' }, { id: 'claude-haiku-5-5', created_at: '2026-10-07T00:00:00Z' },
+    { id: 'claude-opus-5-5', created_at: '2026-09-21T00:00:00Z' }, { id: 'claude-fable-5-1', created_at: '2026-08-28T00:00:00Z' },
+    { id: 'claude-opus-4-8', created_at: '2026-05-28T00:00:00Z' }, { id: 'claude-sonnet-4-5-20250929', created_at: '2025-09-29T00:00:00Z' },
+    { id: 'claude-sonnet-5-5', created_at: '2026-09-28T00:00:00Z' }, { id: 'other-model', created_at: '2027-01-01T00:00:00Z' },
+  ]), ['claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5', 'claude-fable-5-2']);
+  let calls = 0;
+  const cached = createModelCatalog(async () => { calls += 1; return ['claude-opus-9']; });
+  await cached.list(); await cached.list();
+  assert.equal(calls, 1, 'fetched once and cached');
+  const failing = await createModelCatalog(async () => { throw new Error('offline'); }).list();
+  assert.equal(failing.source, 'fallback');
+  assert.ok(failing.models.length > 0);
+  assert.equal(failing.error, 'offline');
+});
+
+test('a sub-coordinator spawn link prepares each item without launching an agent; its coordinator starts them as workers', async () => {
+  await mkdir('.local', { recursive: true });
+  const directory = await mkdtemp(join(resolve('.local'), 'api-subcoord-test-'));
+  const calls: string[][] = [];
+  const existing = [{ path: '/example/worktrees/ABC-1', displayName: 'ABC-1', branch: 'refs/heads/ABC-1' }];
+  const bridge = createOrcaBridge(async (args) => {
+    calls.push(args);
+    if (args[0] === 'repo') return places(args)!;
+    if (args[0] === 'worktree' && args[1] === 'list') return { worktrees: args.includes('--repo') ? existing : [] };
+    if (args[0] === 'worktree' && args[1] === 'create') return { worktree: { path: `/example/worktrees/${args[args.indexOf('--name') + 1]}` } };
+    if (args[0] === 'agent') return { terminal: { handle: `term_${calls.length}` } };
+    return {};
+  });
+  const json = { 'Content-Type': 'application/json' };
+  const target = { version: 1 as const, id: 'per-ticket', name: '구현 ② 티켓·워크트리', description: '', runId: '', edges: [], cleanup: { coordinator: true, worktrees: false, sessions: true }, nodes: [
+    { id: 'wt', type: 'group' as const, position: { x: 0, y: 0 }, width: 400, height: 300,
+      data: { label: '티켓', description: '', kind: 'group' as const, scope: 'worktree' as const, path: '', worktreeMode: 'create' as const, nameSource: 'input' as const } },
+    { id: 'fix', type: 'stage' as const, parentId: 'wt', position: { x: 20, y: 40 }, data: { label: '수정', description: '고친다', kind: 'worker' as const } },
+  ] };
+  const stage = (id: string, kind: 'worker' | 'workflow' | 'branch', extra = {}) => ({ id, type: 'stage' as const, position: { x: 0, y: 0 }, data: { label: id, description: id, kind, ...extra } });
+  const judge = stage('judge', 'branch', { mode: 'exclusive', judge: 'previous', outputs: [{ id: 'go', label: '착수' }, { id: 'wait', label: '기다림' }] });
+  const picker = { version: 1 as const, id: 'picker', name: '선별', description: '', runId: '',
+    nodes: [stage('status', 'worker'), judge, stage('pick', 'worker'), stage('fan', 'workflow', { workflowId: 'per-ticket', linkMode: 'spawn', spawnAs: 'subcoordinator', join: 'any' }), stage('after', 'worker')],
+    edges: [{ id: 'e0', source: 'status', target: 'judge' }, { id: 'e1', source: 'judge', sourceHandle: 'go', target: 'pick' }, { id: 'e2', source: 'pick', target: 'fan' },
+      { id: 'e3', source: 'judge', sourceHandle: 'wait', target: 'fan' }, { id: 'e4', source: 'fan', target: 'after' }] };
+  const server = createApp(directory, bridge).listen(0, '127.0.0.1');
+  await new Promise<void>((resolve) => server.once('listening', resolve));
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const put = (graph: unknown) => fetch(`${base}/api/workflows/${(graph as { id: string }).id}`, { method: 'PUT', headers: json, body: JSON.stringify(graph) });
+  const execute = (id: string) => fetch(`${base}/api/workflows/${id}/execute`, { method: 'POST', headers: json, body: JSON.stringify({ count: 1, project: '/example/repo' }) });
+  const spawn = (items: string[]) => fetch(`${base}/api/workflows/picker/executions/run-p-1/spawn`, { method: 'POST', headers: json, body: JSON.stringify({ node: 'fan', project: '/example/repo', items }) });
+  const agents = () => calls.filter((args) => args[0] === 'agent').length;
+  try {
+    assert.equal((await put(target)).status, 200);
+    // A branch output may lead to the link (no items), but then what comes in must be allowed to arrive alone.
+    assert.equal((await put({ ...picker, id: 'all-join', nodes: picker.nodes.map((node) => node.id === 'fan' ? { ...node, data: { ...node.data, join: undefined } } : node) })).status, 200);
+    assert.match((await (await execute('all-join')).json()).error, /하나라도 오면 진행/);
+    assert.equal((await put({ ...picker, id: 'two-workers', edges: [...picker.edges, { id: 'e5', source: 'status', target: 'fan' }] })).status, 200);
+    assert.match((await (await execute('two-workers')).json()).error, /워커 하나만/);
+    assert.equal((await put(picker)).status, 200);
+    assert.equal(((await (await fetch(`${base}/api/workflows/picker`)).json()).nodes as { id: string; data: { spawnAs?: string } }[]).find((node) => node.id === 'fan')!.data.spawnAs, 'subcoordinator');
+    assert.equal((await execute('picker')).status, 200);
+    assert.equal(agents(), 1);
+    const [log] = await (await fetch(`${base}/api/workflows/picker/logs`)).json();
+    const brief = (await (await fetch(`${base}/api/workflows/picker/logs/${log.id}/files/brief.md`)).json()).text as string;
+    // The parent brief: child Tasks under the link, sub-coordinators as workers, and the link closes once any one of them is done.
+    assert.match(brief, /"as": "subcoordinator"/);
+    assert.match(brief, /하위 코디네이터로 띄우기/);
+    assert.match(brief, /task-create --run <run_id> --parent <링크 Task>/);
+    assert.match(brief, /worker-start --run <run_id> --task <자식 Task> --worktree path:<worktree> --agent claude --model claude-opus-5-5/);
+    assert.match(brief, /orca terminal rename/);
+    assert.match(brief, /하나라도 끝나면/);
+    assert.match(brief, /분기 출력으로 왔으면\(빈 항목\) 요청을 보내지 않는다/);
+    assert.match(brief, /worker-release/);
+    assert.doesNotMatch(brief, /## 하위 코디네이터로 기동됨/);
+
+    assert.equal((await fetch(`${base}/api/workflows/picker/executions`, { method: 'PUT', headers: json,
+      body: JSON.stringify({ runId: 'run-p', launch: log.id, executions: [{ id: 'run-p-1', label: '#1', bindings: { status: 'tp0', judge: 'tpj', pick: 'tp1', fan: 'tp2', after: 'tp3' } }] }) })).status, 200);
+    const first = await (await spawn(['ABC-1', 'ABC-2'])).json();
+    assert.deepEqual(first.results.map((item: { item: string; status: string }) => [item.item, item.status]), [['ABC-1', 'prepared'], ['ABC-2', 'prepared']]);
+    // No agent launched; the existing worktree is reused and a missing one created, both returned as absolute paths.
+    assert.equal(agents(), 1);
+    assert.deepEqual(first.results.map((item: { worktree: string }) => item.worktree), ['/example/worktrees/ABC-1', '/example/worktrees/ABC-2']);
+    assert.equal(calls.filter((args) => args[0] === 'worktree' && args[1] === 'create').length, 1);
+    for (const result of first.results) assert.match(result.brief, /^\/.*\/brief\.md$/);
+    // Requested again while still open: the same item is reported as already started, nothing new.
+    const again = await (await spawn(['ABC-1'])).json();
+    assert.equal(again.results[0].status, 'already');
+    assert.equal(agents(), 1);
+
+    // The child run: parent recorded, never closed by the server, and its brief carries the sub-coordinator section.
+    const child = await (await fetch(`${base}/api/workflows/per-ticket/logs/${first.results[0].launch}`)).json();
+    assert.deepEqual(child.meta.parent, { workflowId: 'picker', executionId: 'run-p-1', node: 'fan', launch: log.id });
+    assert.equal(child.meta.closeCoordinator, undefined);
+    assert.match(child.events.map((event: { message: string }) => event.message).join('\n'), /하위 코디네이터로 준비/);
+    const childBrief = (await (await fetch(`${base}/api/workflows/per-ticket/logs/${first.results[0].launch}/files/brief.md`)).json()).text as string;
+    assert.match(childBrief, /## 하위 코디네이터로 기동됨/);
+    assert.match(childBrief, /--run <run_id>/);
+    assert.match(childBrief, /check --wait --run <run_id> --timeout-ms 30000/);
+    assert.match(childBrief, /턴을 끝내서 기다리지 않는다/);
+    assert.match(childBrief, /worker_done/);
+    assert.match(childBrief, /run-use/);
+    assert.match(childBrief, /"prepared": true/);
+    assert.match(childBrief, /코디네이터: \*\*남겨 둔다/);
+    // The parent coordinator now closes itself (the server's reaper leaves it alone).
+    assert.equal((await (await fetch(`${base}/api/workflows/picker/logs/${log.id}`)).json()).meta.subcoordinators, true);
+
+    // The same input already prepared for a run that is still open is refused per item.
+    await fetch(`${base}/api/workflows/per-ticket/executions`, { method: 'PUT', headers: json,
+      body: JSON.stringify({ runId: 'run-c', launch: first.results[1].launch, executions: [{ id: 'run-c-1', label: '#1', bindings: { fix: 'tc1' } }] }) });
+    const graph = await (await fetch(`${base}/api/workflows/picker`)).json();
+    graph.executions[0].spawned = { fan: [graph.executions[0].spawned.fan[0]] }; // forget ABC-2 so it is asked again
+    assert.equal((await put(graph)).status, 200);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const busy = await (await spawn(['ABC-2'])).json();
+    assert.equal(busy.results[0].status, 'failed');
+    assert.match(busy.results[0].error, /진행 중인 실행|같은 입력/);
+    const stored = (await (await fetch(`${base}/api/workflows/picker`)).json()).executions[0];
+    assert.equal(stored.spawned.fan[0].worktree, '/example/worktrees/ABC-1');
+  } finally {
+    await new Promise<void>((resolve, reject) => { server.close((error) => error ? reject(error) : resolve()); server.closeAllConnections(); });
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+
+test('a project group can hold the coordinator: it starts in the group path whatever project the run names', async () => {
+  await mkdir('.local', { recursive: true });
+  const directory = await mkdtemp(join(resolve('.local'), 'api-project-coord-test-'));
+  const calls: string[][] = [];
+  const bridge = createOrcaBridge(async (args) => {
+    calls.push(args);
+    const place = places(args); if (place) return place;
+    if (args[0] === 'agent') return { terminal: { handle: 'term_p' } };
+    return {};
+  });
+  const json = { 'Content-Type': 'application/json' };
+  const graph = { version: 1 as const, id: 'super', name: '슈퍼', description: '', runId: '', edges: [], coordinatorGroup: 'proj', workspace: '/example/super', nodes: [
+    { id: 'proj', type: 'group' as const, position: { x: 0, y: 0 }, width: 400, height: 300, data: { label: '슈퍼프로젝트', description: '', kind: 'group' as const, scope: 'project' as const, path: '/example/super' } },
+    { id: 'a', type: 'stage' as const, parentId: 'proj', position: { x: 20, y: 40 }, data: { label: 'a', description: 'a', kind: 'worker' as const } },
+  ] };
+  const server = createApp(directory, bridge).listen(0, '127.0.0.1');
+  await new Promise<void>((resolve) => server.once('listening', resolve));
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  try {
+    assert.equal((await fetch(`${base}/api/workflows/super`, { method: 'PUT', headers: json, body: JSON.stringify(graph) })).status, 200);
+    assert.equal((await fetch(`${base}/api/workflows/super`, { method: 'PUT', headers: json, body: JSON.stringify({ ...graph, nodes: [{ ...graph.nodes[0], data: { ...graph.nodes[0].data, path: '' } }, graph.nodes[1]] }) })).status, 200);
+    assert.match((await (await fetch(`${base}/api/workflows/super/execute`, { method: 'POST', headers: json, body: JSON.stringify({ count: 1, project: '/example/repo' }) })).json()).error, /대상을 고르세요/);
+    assert.equal((await fetch(`${base}/api/workflows/super`, { method: 'PUT', headers: json, body: JSON.stringify(graph) })).status, 200);
+    assert.equal((await fetch(`${base}/api/workflows/super/execute`, { method: 'POST', headers: json, body: JSON.stringify({ count: 1, project: '/example/repo' }) })).status, 200);
+    const launch = calls.find((args) => args[0] === 'agent')!;
+    assert.equal(launch[launch.indexOf('--worktree') + 1], 'path:/example/super');
+    const [log] = await (await fetch(`${base}/api/workflows/super/logs`)).json();
+    const brief = (await (await fetch(`${base}/api/workflows/super/logs/${log.id}/files/brief.md`)).json()).text as string;
+    assert.match(brief, /"location": "\/example\/super"/);
+  } finally {
+    await new Promise<void>((resolve, reject) => { server.close((error) => error ? reject(error) : resolve()); server.closeAllConnections(); });
+    await rm(directory, { recursive: true, force: true });
+  }
 });

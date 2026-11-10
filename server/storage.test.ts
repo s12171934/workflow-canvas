@@ -59,7 +59,19 @@ test('migrates v1 task nodes and validates group nodes and parents', () => {
   assert.throws(() => validateWorkflow({ ...graph, nodes: [{ ...graph.nodes[0], parentId: 'nowhere' }], edges: [] }));
   // A worktree group inside a worktree group is a child worktree.
   assert.doesNotThrow(() => validateWorkflow({ ...graph, nodes: [group, { ...group, id: 'grp2', parentId: 'grp' }], edges: [] }));
-  assert.throws(() => validateWorkflow({ ...graph, nodes: [{ ...graph.nodes[0], data: { ...graph.nodes[0].data, kind: 'script' } }], edges: [] }));
+  assert.throws(() => validateWorkflow({ ...graph, nodes: [{ ...graph.nodes[0], data: { ...graph.nodes[0].data, kind: 'robot' } }], edges: [] }));
+});
+test('validates script driver nodes and keeps their fields only on scripts', () => {
+  const graph = newWorkflow();
+  const script = (extra: Record<string, unknown>) => ({ ...graph, nodes: [{ ...graph.nodes[0], data: { ...graph.nodes[0].data, kind: 'script', ...extra } }], edges: [] }) as never as typeof graph;
+  const ok = validateWorkflow(script({ command: 'cbd prd select --json', parse: 'jsonl', detach: true, timeoutSec: 3600 }));
+  assert.deepEqual([ok.nodes[0].data.command, ok.nodes[0].data.parse, ok.nodes[0].data.detach, ok.nodes[0].data.timeoutSec], ['cbd prd select --json', 'jsonl', true, 3600]);
+  assert.equal(validateWorkflow(script({ command: 'x', parse: 'regex', itemPattern: '^기동 예정: (\\S+)' })).nodes[0].data.itemPattern, '^기동 예정: (\\S+)');
+  assert.throws(() => validateWorkflow(script({ command: 'x', parse: 'yaml' })), /스크립트 드라이버/);
+  assert.throws(() => validateWorkflow(script({ command: 'x', parse: 'regex', itemPattern: '(' })), /스크립트 드라이버/);
+  assert.throws(() => validateWorkflow(script({ command: 'x', itemPattern: 'a' })), /스크립트 드라이버/); // a pattern without regex parsing
+  assert.throws(() => validateWorkflow(script({ command: 'x', timeoutSec: 0 })), /스크립트 드라이버/);
+  assert.throws(() => validateWorkflow({ ...graph, nodes: [{ ...graph.nodes[0], data: { ...graph.nodes[0].data, command: 'x' } }], edges: [] }), /스크립트 드라이버/);
 });
 test('validates execution links for workflow-link nodes', () => {
   const graph = newWorkflow();
@@ -136,6 +148,24 @@ test('only workflow links take a link mode, and only a known one', () => {
   assert.throws(() => validateWorkflow({ ...graph, nodes: [{ ...graph.nodes[0], data: { ...graph.nodes[0].data, linkMode: 'later' as never } }] }));
   assert.throws(() => validateWorkflow({ ...graph, nodes: [{ ...graph.nodes[0], data: { ...graph.nodes[0].data, kind: 'worker' as const } }] }));
 });
+test('spawn links take a supervision mode: kept only as subcoordinator on a spawn link, and only a known one', () => {
+  const link = (data: Record<string, unknown>) => ({ ...newWorkflow(), nodes: [{ id: 'link', type: 'stage' as const, position: { x: 0, y: 0 }, data: { label: 'link', description: '', kind: 'workflow' as const, ...data } }], edges: [] });
+  assert.equal(validateWorkflow(link({ linkMode: 'spawn', spawnAs: 'subcoordinator' })).nodes[0].data.spawnAs, 'subcoordinator');
+  // The default and a non-spawn link store nothing.
+  assert.equal(validateWorkflow(link({ linkMode: 'spawn', spawnAs: 'coordinator' })).nodes[0].data.spawnAs, undefined);
+  assert.equal(validateWorkflow(link({ linkMode: 'wait', spawnAs: 'subcoordinator' })).nodes[0].data.spawnAs, undefined);
+  assert.throws(() => validateWorkflow(link({ linkMode: 'spawn', spawnAs: 'boss' })));
+  const worker = { ...newWorkflow(), nodes: [{ id: 'w', type: 'stage' as const, position: { x: 0, y: 0 }, data: { label: 'w', description: '', kind: 'worker' as const, spawnAs: 'subcoordinator' as const } }], edges: [] };
+  assert.throws(() => validateWorkflow(worker));
+  // Spawn results may carry the prepared brief and worktree, as absolute paths.
+  const graph = link({ linkMode: 'spawn', spawnAs: 'subcoordinator' });
+  const execution = (result: Record<string, unknown>) => ({ ...graph, executions: [{ id: 'run-1', label: '#1', bindings: { link: 't1' },
+    spawned: { link: [{ item: 'ABC-1', at: '2026-11-10T00:00:00.000Z', workflowId: 'target', launch: 'x-target', ...result }] } }] });
+  assert.equal(validateWorkflow(execution({ brief: '/tmp/x/brief.md', worktree: '/wt/ABC-1' })).executions![0].spawned!.link[0].worktree, '/wt/ABC-1');
+  assert.throws(() => validateWorkflow(execution({ brief: 'relative/brief.md' })));
+  assert.throws(() => validateWorkflow(execution({ worktree: '/wt/\u0000' })));
+});
+
 test('memo groups go in any group, but nothing goes in a memo group', () => {
   const graph = newWorkflow();
   const project = { id: 'p', type: 'group', position: { x: 0, y: 0 }, width: 800, height: 600, data: { label: 'P', description: '', kind: 'group', scope: 'project', path: '' } };
@@ -151,12 +181,24 @@ test('seeds bundled examples once, never over or after the user\'s own copy', as
   try {
     const storage = createStorage(directory);
     const examples = resolve('examples');
-    const ids = ['qa-ticket-select', 'qa-ticket-solve'];
+    const ids = ['impl-checkbox', 'impl-project', 'impl-ticket', 'qa-ticket-select', 'qa-ticket-solve', 'workflow-verify'];
     assert.deepEqual(await storage.seed(examples), ids);
     for (const id of ids) assert.equal((await storage.load(id)).runId, '');
     await storage.remove(ids[0]);
     assert.deepEqual(await storage.seed(examples), []);
     await assert.rejects(storage.load(ids[0]));
     assert.deepEqual(await storage.seed(join(directory, 'missing')), []);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+test('stores tags and lists them for the sidebar groups', async () => {
+  await mkdir('.local', { recursive: true });
+  const directory = await mkdtemp(join(resolve('.local'), 'storage-test-'));
+  try {
+    const graph = newWorkflow();
+    assert.throws(() => validateWorkflow({ ...graph, tags: ['QA', 'QA'] }));
+    assert.throws(() => validateWorkflow({ ...graph, tags: [' QA'] }));
+    const storage = createStorage(directory);
+    await storage.save({ ...graph, tags: ['QA', '티켓'] });
+    assert.deepEqual(await storage.list(), [{ id: graph.id, name: graph.name, tags: ['QA', '티켓'] }]);
   } finally { await rm(directory, { recursive: true, force: true }); }
 });

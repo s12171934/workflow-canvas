@@ -22,6 +22,8 @@ test('snapshot uses only explicit read commands and follows worker pages', async
   assert.equal(snapshot.workers.length, 2);
   assert.ok(calls.every((args) => ['run-show', 'task-list', 'worker-list'].includes(args[1])));
   assert.ok(calls.every((args) => args.includes('run-a')));
+  // Orca's concise view drops run, projection and page; these reads need the full record.
+  assert.ok(calls.every((args) => args.includes('--full')));
   await assert.rejects(bridge.snapshot('--other-flag;rm'), /Run ID/);
   assert.equal(calls.length, 4);
 });

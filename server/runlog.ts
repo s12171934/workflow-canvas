@@ -222,7 +222,8 @@ export function createRunLog(root: string) {
       for (const id of await launches()) {
         if (!recent(id)) continue;
         const meta = await readMeta(id);
-        if (!meta?.closeCoordinator || !meta.coordinatorTerminal) continue;
+        // A coordinator with sub-coordinators among its workers closes itself once they settle: closing it would strand their worker_done.
+        if (!meta?.closeCoordinator || !meta.coordinatorTerminal || meta.subcoordinators) continue;
         const events = await readEvents(id);
         const finished = lastOf(events, 'finished');
         if (finished < 0 || lastOf(events, 'coordinator-closed') >= 0 || lastOf(events, 'task') > finished) continue;
@@ -237,6 +238,11 @@ export function createRunLog(root: string) {
       await index();
       const id = runId ? runLaunch.get(runId) : undefined;
       return id ? readMeta(id) : undefined;
+    },
+    /** Id of the launch that owns a Run, if any. */
+    async launchOfRun(runId: string) {
+      await index();
+      return runId ? runLaunch.get(runId) : undefined;
     },
     async list(workflowId: string): Promise<RunLogSummary[]> {
       const ids = (await launches(workflowId)).slice(0, maxListed);

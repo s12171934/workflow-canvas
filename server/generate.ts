@@ -1,5 +1,6 @@
 import { effortLevels, forwardEdges, isExecutable, topologicalOrder, waves, workerModels, defaultWorkerModel, kindNames,
   type StageNode, type Workflow } from '../src/model.ts';
+import { autoLayout } from '../src/layout.ts';
 
 // Natural-language generation runs in Orca: the canvas server writes a prompt file, Orca launches a Claude agent in the
 // chosen project, and the agent sends its result back through the canvas API. The server validates every result; the
@@ -30,7 +31,7 @@ curl -s -w '\\n%{http_code}\\n' -X PUT -H 'Content-Type: application/json' ${url
 - 도저히 만들 수 없으면 \`{"error":"<이유>"}\` 를 보내고 멈춘다.
 - 이 프로젝트의 파일은 읽기만 하고 수정하지 않는다. 사용자에게 보이는 모든 텍스트는 한국어로 쓴다.`;
 
-export function workflowPrompt(input: { request: string; resultUrl: string; resultFile: string; saved: { id: string; name: string }[] }): string {
+export function workflowPrompt(input: { request: string; resultUrl: string; resultFile: string; saved: { id: string; name: string }[]; models?: readonly string[] }): string {
   return `# 워크플로 자동 생성
 
 너는 workflow-canvas 의 「자연어로 워크플로 만들기」로 Orca 에서 기동된 에이전트다. 사용자의 요청을 실행 가능한 워크플로 그래프(JSON)로 만들어 캔버스에 보낸다. 필요하면 현재 프로젝트(작업 디렉터리)를 읽어 단계를 구체화한다.
@@ -48,7 +49,7 @@ ${input.request}
   - \`workflow\`: 저장된 다른 워크플로를 그 자리에 펼쳐 실행. \`workflowId\` 는 아래 목록에서만 고른다. \`linkMode: "start"\` 면 뒤 단계가 기다리지 않는다. \`linkMode: "spawn"\` 이면 펼치지 않고, 앞의 워커 하나가 worker_done 에 \`items: a, b\` 로 보고한 항목마다 대상 워크플로를 따로 실행한다(항목 = 대상의 「실행 시 입력」 워크트리 이름. 대상에 그런 그룹이 정확히 하나 있어야 한다).
   - \`note\`: 실행과 무관한 메모.
 - 분기에서 갈라진 경로가 다시 모이는 단계는 \`join: "any"\` 로 둔다(하나라도 오면 진행).
-- 워커·판정 워커 단계는 필요할 때만 \`workerModel\`(${workerModels.join(', ')}; 없으면 ${defaultWorkerModel})과 \`effort\`(${effortLevels.join(', ')}; 없으면 모델 기본)를 지정한다. 단순 작업은 가벼운 모델, 설계·검토처럼 깊은 판단은 높은 effort.
+- 워커·판정 워커 단계는 필요할 때만 \`workerModel\`(${(input.models ?? workerModels).join(', ')}; 없으면 ${defaultWorkerModel})과 \`effort\`(${effortLevels.join(', ')}; 없으면 모델 기본)를 지정한다. 단순 작업은 가벼운 모델, 설계·검토처럼 깊은 판단은 높은 effort.
 - 프로젝트·워크트리 그룹은 만들지 않는다(사용자가 캔버스에서 묶는다). 위치(position)도 쓰지 않는다(캔버스가 배치한다).
 - 단계는 요청을 이루는 데 필요한 만큼만. 한 워커가 할 수 있는 일을 쪼개지 않는다.
 
@@ -114,8 +115,8 @@ ${resultFormat(input.resultUrl, input.resultFile)}
 }
 
 /**
- * Turns what the agent sent into a workflow document: known fields only, fresh edge ids, and a left-to-right layout by
- * longest path. Validation (ids, branches, cycles) is left to the caller's validateWorkflow / checkBranches.
+ * Turns what the agent sent into a workflow document: known fields only, fresh edge ids, and a compact left-to-right layout
+ * (`autoLayout`). Validation (ids, branches, cycles) is left to the caller's validateWorkflow / checkBranches.
  */
 export function generatedWorkflow(raw: unknown, id: string): Workflow {
   if (!raw || typeof raw !== 'object') throw new Error('JSON 객체를 보내세요.');
@@ -144,14 +145,6 @@ export function generatedWorkflow(raw: unknown, id: string): Workflow {
   });
   // Every edge leaving a gate is its 'approve' output; the canvas draws it from the single port.
   for (const edge of edges) if (nodes.find((node) => node.id === edge.source)?.data.kind === 'gate') delete (edge as { sourceHandle?: string }).sourceHandle;
-  const { order } = topologicalOrder(nodes.map((node) => node.id), forwardEdges(edges));
-  const wave = waves(order, forwardEdges(edges));
-  const rows = new Map<number, number>();
-  for (const node of nodes) {
-    const column = wave.get(node.id) ?? 0;
-    const row = rows.get(column) ?? 0;
-    rows.set(column, row + 1);
-    node.position = { x: column * 320, y: row * 190 };
-  }
-  return { version: 1, id, name: body.name.trim().slice(0, 500), description: (str(body.description) ?? '').slice(0, 10000), runId: '', nodes, edges };
+  return { version: 1, id, name: body.name.trim().slice(0, 500), description: (str(body.description) ?? '').slice(0, 10000), runId: '',
+    nodes: autoLayout(nodes, edges), edges };
 }

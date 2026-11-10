@@ -11,7 +11,7 @@
     "start": "tsx server/index.ts",
     "check": "tsc --noEmit",
     "build": "tsc --noEmit && vite build",
-    "test": "tsx --test src/model.test.ts server/*.test.ts"
+    "test": "tsx --test src/model.test.ts src/layout.test.ts src/routing.test.ts server/*.test.ts"
   },
   "dependencies": {
     "@xyflow/react": "^12.0.0",

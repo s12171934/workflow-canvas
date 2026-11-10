@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { pendingDecisions, frameContents, orderNodes, decisionError, skippedStages, topologicalOrder, waves, nodeExecutionStatus, type FlowStage, type StageNode, membershipOf, nodeLocation, aggregateStatus, executionFinished, taskStatus, projectNodes, serializableWorkflow, newWorkflow, fromSnapshot, type TaskSummary, type WorkerSummary, type RunSnapshot, executionRun, inputsKey, mergeSnapshots, workflowRuns, variableRefs, substituteVariables, resolveVariables, applyDecision, canNest, loopBody, stageRound, loggedExecutions, neighbors, relationTo, tallyStatuses, summarizeExecution, type Execution } from './model.ts';
+import { pendingDecisions, frameContents, orderNodes, decisionError, skippedStages, topologicalOrder, waves, nodeExecutionStatus, type FlowStage, type StageNode, membershipOf, nodeLocation, aggregateStatus, executionFinished, taskStatus, projectNodes, serializableWorkflow, newWorkflow, fromSnapshot, type TaskSummary, type WorkerSummary, type RunSnapshot, executionRun, inputsKey, mergeSnapshots, workflowRuns, variableRefs, substituteVariables, resolveVariables, applyDecision, canNest, loopBody, stageRound, loggedExecutions, neighbors, relationTo, tallyStatuses, summarizeExecution, type Execution, cleanTag, validTags, groupByTag } from './model.ts';
 
 const task = (status: string): TaskSummary => ({ id: 'task-a', title: 'A', spec: 'A', status, deps: [] });
 const worker = (liveness: string): WorkerSummary => ({ dispatchId: 'dispatch-a', taskId: 'task-a', liveness, stage: 'working', provider: 'claude', model: 'example-model', outcome: '' });
@@ -369,6 +369,42 @@ test('a loop edge runs its body again: archived passes, cleared decisions, the e
   const [projected] = projectNodes([{ id: 'impl', type: 'stage', position: { x: 0, y: 0 }, data: { label: 'impl', description: '', kind: 'worker' } }], null, false, [third.execution], 'e');
   assert.equal(projected.data.round, 3);
 });
+test('a loop pass archives what its spawn links requested, so the next pass can request the same items again', () => {
+  const flow: FlowStage[] = [
+    { id: 'pick', after: [] }, { id: 'spawn', after: [{ id: 'pick' }] }, { id: 'wait', after: [{ id: 'spawn' }] },
+    { id: 'next', after: [{ id: 'wait' }], branch: { mode: 'exclusive', outputs: ['again', 'stop'] },
+      loops: [{ edge: 'back', output: 'again', to: 'pick', max: 200, exit: 'stop', body: ['pick', 'spawn', 'wait', 'next'] }] },
+    { id: 'report', after: [{ id: 'next', output: 'stop' }] },
+  ];
+  const asked = { item: 'PSD-1', at: '2026-11-10T00:00:00Z', workflowId: 'impl-ticket', launch: 'l1' };
+  const outside = { item: 'x', at: '2026-11-10T00:00:00Z', workflowId: 'other' };
+  const execution: Execution = { id: 'e', label: '#1', bindings: { pick: 't1', spawn: 't2', wait: 't3', next: 't4', report: 't5' },
+    spawned: { spawn: [asked], report: [outside] } };
+  const { execution: after } = applyDecision(flow, execution, 'next', ['again']);
+  assert.deepEqual(after.spawned, { report: [outside] }); // links outside the body keep theirs
+  assert.deepEqual(after.history?.[0].spawned, { spawn: [asked] });
+  const bare = applyDecision(flow, { ...execution, spawned: { spawn: [asked] } }, 'next', ['again']).execution;
+  assert.equal('spawned' in bare, false);
+});
+test('going back reopens stages after the loop that the earlier pass skipped, so a later pass can still reach them', () => {
+  const flow: FlowStage[] = [
+    { id: 'check', after: [] },
+    { id: 'verdict', after: [{ id: 'check' }], branch: { mode: 'exclusive', outputs: ['pass', 'trial', 'fix'] } },
+    { id: 'try', after: [{ id: 'verdict', output: 'trial' }] },
+    { id: 'fixer', after: [{ id: 'verdict', output: 'fix' }] },
+    { id: 'again', after: [{ id: 'fixer' }], branch: { mode: 'exclusive', outputs: ['recheck', 'failed'] },
+      loops: [{ edge: 'back', output: 'recheck', to: 'check', max: 2, exit: 'failed', body: ['check', 'verdict', 'fixer', 'again'] }] },
+    { id: 'report', join: 'any', after: [{ id: 'verdict', output: 'pass' }, { id: 'try' }, { id: 'again', output: 'failed' }] },
+  ];
+  const decided = applyDecision(flow, { id: 'e', label: '#1', bindings: { check: 't1', verdict: 't2', try: 't3', fixer: 't4', again: 't5', report: 't6' } }, 'verdict', ['fix']).execution;
+  assert.deepEqual(decided.skipped, ['try']);
+  const back = applyDecision(flow, decided, 'again', ['recheck']);
+  assert.deepEqual(back.loop?.restart, ['check', 'verdict', 'try', 'fixer', 'again']);
+  assert.deepEqual(back.execution.bindings, { report: 't6' });
+  assert.deepEqual(back.execution.history?.[0].bindings, { check: 't1', verdict: 't2', try: 't3', fixer: 't4', again: 't5' });
+  assert.deepEqual(applyDecision(flow, back.execution, 'again', ['recheck']).loop?.restart, back.loop?.restart); // a retry gives the same list
+  assert.equal(stageRound(back.execution, 'try'), 2);
+});
 test('a memo group may sit in any group: it saves its parent and draws over that group but under groups nested beside it', () => {
   const node = (id: string, kind: StageNode['data']['kind'], parentId?: string, scope?: 'project' | 'worktree'): StageNode => ({ id, type: kind === 'group' ? 'group' : kind === 'frame' ? 'frame' : 'stage',
     position: { x: 0, y: 0 }, ...(parentId ? { parentId } : {}), ...(kind === 'group' || kind === 'frame' ? { width: 400, height: 300 } : {}),
@@ -410,4 +446,30 @@ test('요약 보기 tallies statuses in attention order and summarizes one execu
   assert.deepEqual(summary.running, ['구현']);
   assert.deepEqual(summary.failed, []);
   assert.deepEqual(summary.tally.slice(0, 1), [{ status: 'running', count: 1 }]);
+});
+
+test('tags: cleaned as typed, validated, and grouped with untagged last', () => {
+  assert.equal(cleanTag('  QA   티켓 '), 'QA 티켓');
+  assert.equal(cleanTag('x'.repeat(40)).length, 30);
+  assert.ok(validTags(['QA', '티켓']));
+  assert.ok(!validTags(['QA', 'QA']) && !validTags([' QA']) && !validTags(['']) && !validTags('QA'));
+  assert.ok(!validTags(Array.from({ length: 11 }, (_, index) => `t${index}`)));
+  const sections = groupByTag<{ id: string; tags?: string[] }>([{ id: 'a', tags: ['티켓', 'QA'] }, { id: 'b' }, { id: 'c', tags: ['QA'] }]);
+  assert.deepEqual(sections.map((section) => [section.tag, section.items.map((item) => item.id)]), [['티켓', ['a']], ['QA', ['a', 'c']], ['', ['b']]]);
+  assert.deepEqual(groupByTag<{ id: string; tags?: string[] }>([{ id: 'a' }]).map((section) => section.tag), ['']);
+  const graph = newWorkflow();
+  assert.deepEqual(serializableWorkflow({ ...graph, tags: ['QA'] }).tags, ['QA']);
+  assert.equal('tags' in serializableWorkflow({ ...graph, tags: [] }), false);
+});
+
+test('a resized memo saves its size; other stages and untouched memos save none', () => {
+  const base = newWorkflow();
+  const memo = { id: 'memo', type: 'stage', position: { x: 0, y: 0 }, width: 420.4, height: 260, data: { label: 'm', description: '', kind: 'note' as const } };
+  const plain = { ...memo, id: 'plain', width: undefined, height: undefined };
+  const worker = { ...memo, id: 'w', data: { ...memo.data, kind: 'worker' as const } };
+  const saved = serializableWorkflow({ ...base, nodes: [memo, plain, worker] as StageNode[], edges: [] });
+  const byId = new Map(saved.nodes.map((node) => [node.id, node]));
+  assert.deepEqual([byId.get('memo')!.width, byId.get('memo')!.height], [420, 260]);
+  assert.equal(byId.get('plain')!.width, undefined);
+  assert.equal(byId.get('w')!.width, undefined);
 });
