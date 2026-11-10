@@ -5,10 +5,12 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { createStorage, validId, validateWorkflow } from './storage.ts';
-import { buildBrief, checkBranches, checkCoordinatorGroup, checkGroups, checkLoops, checkSpawns, checkVariables, flowOf, linkedWorkflows } from './execute.ts';
+import { buildBrief, checkBranches, checkScripts, checkCoordinatorGroup, checkGroups, checkLoops, checkSpawns, checkVariables, flowOf, linkedWorkflows, preflight } from './execute.ts';
+import { autoLayout } from '../src/layout.ts';
 import { briefPrompt, generatedWorkflow, generationTimeoutMs, maxPromptLength, workflowPrompt, type Generation } from './generate.ts';
+import { createModelCatalog } from './models.ts';
 import { coordinatorEventTypes, createRunLog, launchDirName } from './runlog.ts';
-import { applyDecision, decisionError, executionResults, executionRun, maxSpawnItems, requestKey, resolveVariables, validVariableValue, spawnsRuns, type SpawnResult, executionTasks, inputsKey, loggedExecutions, skippedStages, type Execution, type RunLogDetail } from '../src/model.ts';
+import { applyDecision, decisionError, executionResults, executionRun, maxSpawnItems, requestKey, resolveVariables, validVariableValue, spawnsRuns, spawnsSubcoordinators, type SpawnResult, type RunLogMeta, executionTasks, inputsKey, loggedExecutions, skippedStages, type Execution, type RunLogDetail } from '../src/model.ts';
 import { defaultCleanup, type AutomationConfig, type AutomationState, type Cleanup, asksAtRun, createsWorktree, parentWorktree, resolvedParentPath, worktreeRepo, executionFinished, executionStatuses, isExecutable, worktreeNamePattern, type RunSnapshot, type Workflow } from '../src/model.ts';
 
 /** Minimum gap between two 실행 requests for the same workflow, so a double click cannot start two coordinators. */
@@ -30,8 +32,9 @@ function localBase(req: Request) {
   return `http://127.0.0.1:${req.socket.localPort}`;
 }
 
-export function createApp(directory: string, bridge = createOrcaBridge(), options: { root?: string; watchMs?: number } = {}) {
-  void options; // root is no longer used: every run names its project.
+export function createApp(directory: string, bridge = createOrcaBridge(), options: { root?: string; watchMs?: number; models?: ReturnType<typeof createModelCatalog> } = {}) {
+  void options.root; // root is no longer used: every run names its project.
+  const models = options.models ?? createModelCatalog();
   const launches = new Map<string, number>();
   // Coordinators of parallel executions write the same document; changes to one workflow's executions run one at a time.
   const queues = new Map<string, Promise<unknown>>();
@@ -74,6 +77,8 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
   });
   app.use(express.json({ limit: '2mb' }));
   app.get('/api/status', async (_req, res) => { res.json(await bridge.status()); });
+  // Worker models offered on the canvas: the newest of each family, fetched from the Anthropic Models API.
+  app.get('/api/models', async (_req, res) => { res.json(await models.list()); });
   app.get('/api/runs', async (_req, res) => { res.json(await bridge.runs()); });
   app.get('/api/locations', async (_req, res) => { res.json(await bridge.locations()); });
   app.get('/api/runs/:id', async (req, res) => {
@@ -98,9 +103,13 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
   app.get('/api/workflows/:id', async (req, res) => { res.json(await storage.load(req.params.id)); });
   app.put('/api/workflows/:id', async (req, res) => {
     if (req.params.id !== req.body?.id) { res.status(400).json({ error: '워크플로 ID가 일치하지 않습니다.' }); return; }
+    // ?layout=auto: positions may be left out; the server lays the graph out compactly (same as the canvas's 자동 정렬).
+    const layout = req.query.layout === 'auto';
+    if (layout && Array.isArray(req.body.nodes)) for (const node of req.body.nodes) if (node && typeof node === 'object' && !node.position) node.position = { x: 0, y: 0 };
     let graph;
     try { graph = validateWorkflow(req.body); }
     catch (error) { res.status(400).json({ error: (error as Error).message }); return; }
+    if (layout) graph = { ...graph, nodes: autoLayout(graph.nodes, graph.edges) };
     res.json(await storage.save(graph));
   });
   app.delete('/api/workflows/:id', async (req, res) => {
@@ -168,6 +177,12 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
     const graph = await storage.load(req.params.id);
     try { res.json(flowOf(graph, await linkedWorkflows(graph, (linkId) => storage.load(linkId)))); }
     catch (error) { res.status(400).json({ error: (error as Error).message }); }
+  });
+  // Read-only: the checks 실행 would run, all of them, without starting a coordinator (used by the 워크플로 검증 workflow).
+  app.get('/api/workflows/:id/check', async (req, res) => {
+    if (!validId(req.params.id)) { res.status(400).json({ error: '올바르지 않은 워크플로 ID입니다.' }); return; }
+    const graph = await storage.load(req.params.id);
+    res.json(await preflight(graph, (linkId) => storage.load(linkId)));
   });
   // Used by the coordinator agent (and by the canvas for user decisions): records a decision and returns the Tasks no taken path reaches any more.
   app.post('/api/workflows/:id/executions/:executionId/decisions', async (req, res) => {
@@ -254,7 +269,11 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
     /** Set when another workflow's spawn link asked for this run: shown in the execution log. */
     origin?: string;
     /** The server starts the coordinator inside the workflow's coordinator worktree group (not an automation's own agent). */
-    coordinatorInGroup?: boolean };
+    coordinatorInGroup?: boolean;
+    /** The coordinator starts inside this group's worktree, prepared by the server (a sub-coordinator's input group). */
+    preparedGroup?: string;
+    /** Prepared for another run's sub-coordinator spawn link: that run's coordinator starts this one as its worker. */
+    parent?: NonNullable<RunLogMeta['parent']> };
   class RunError extends Error { constructor(readonly status: number, message: string) { super(message); } }
 
   /** Checks a run request against the saved graph and Orca; never trusts a path or name the client sends without checking it. */
@@ -296,7 +315,7 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
   async function prepareRun(id: string, graph: Workflow, settings: RunSettings, apiBase: string): Promise<{ briefPath: string; logId: string; launchKey: string }> {
     if (!graph.nodes.some(isExecutable)) throw new RunError(400, '실행할 단계가 없습니다.');
     let linked: Map<string, Workflow>;
-    try { linked = await linkedWorkflows(graph, (linkId) => storage.load(linkId)); checkGroups([graph, ...linked.values()]); checkBranches([graph, ...linked.values()]); checkSpawns([graph, ...linked.values()], linked); checkVariables([graph, ...linked.values()]); checkLoops([graph, ...linked.values()], linked); checkCoordinatorGroup(graph); }
+    try { linked = await linkedWorkflows(graph, (linkId) => storage.load(linkId)); checkGroups([graph, ...linked.values()]); checkBranches([graph, ...linked.values()]); checkSpawns([graph, ...linked.values()], linked); checkScripts([graph, ...linked.values()]); checkVariables([graph, ...linked.values()]); checkLoops([graph, ...linked.values()], linked); checkCoordinatorGroup(graph); }
     catch (error) { throw new RunError(400, (error as Error).message); }
     // Requests with different run-time inputs (one per ticket, say) run side by side; the same inputs never overlap.
     const inputs = inputsKey(settings.inputs);
@@ -329,13 +348,16 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
         project: settings.project, ...(settings.automation ? { automation: settings.automation } : {}),
         ...(inputs !== '[]' ? { inputs: Object.fromEntries(Object.entries(settings.inputs).filter(([, value]) => value)) } : {}),
         ...(Object.keys(settings.values).length ? { values: settings.values } : {}),
-        ...(settings.cleanup.coordinator && !settings.automation ? { closeCoordinator: true } : {}) });
+        ...(settings.cleanup.coordinator && !settings.automation && !settings.parent ? { closeCoordinator: true } : {}),
+        ...(settings.parent ? { parent: settings.parent } : {}) });
       await runlog.append(logId, { type: 'requested', message: `${settings.origin ?? (settings.automation ? `자동화 「${settings.automation.name}」` : '실행 버튼')} · ${settings.count}회 · ${settings.project}`
         + (Object.values(settings.inputs).some(Boolean) ? ` · 입력 ${Object.values(settings.inputs).filter(Boolean).join('·')}` : '') });
       const briefPath = join(artifactDir, 'brief.md');
-      await writeFile(briefPath, buildBrief({ graph, ...(settings.coordinatorInGroup && graph.coordinatorGroup ? { preparedGroup: graph.coordinatorGroup } : {}), linked, count: settings.count, apiBase, workspace: settings.project, artifactDir,
+      const preparedGroup = settings.preparedGroup ?? (settings.coordinatorInGroup && graph.coordinatorGroup ? graph.coordinatorGroup : undefined);
+      await writeFile(briefPath, buildBrief({ graph, ...(preparedGroup ? { preparedGroup } : {}), linked, count: settings.count, apiBase, workspace: settings.project, artifactDir,
         logUrl: `${apiBase}/api/workflows/${id}/logs/${logId}/events`, launchId: logId, values: settings.values,
-        inputs: settings.inputs, cleanup: settings.cleanup, automation: settings.automation }), { mode: 0o600 });
+        inputs: settings.inputs, cleanup: settings.cleanup, automation: settings.automation,
+        ...(settings.parent ? { subcoordinator: { parentName: settings.origin ?? settings.parent.workflowId } } : {}) }), { mode: 0o600 });
       await runlog.append(logId, { type: 'brief', message: '코디네이터 브리프 작성' });
       return { briefPath, logId, launchKey };
     } catch (error) { launches.delete(launchKey); throw error; }
@@ -349,8 +371,8 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
    * Where the coordinator of one 실행 starts: the run's project, or the workflow's coordinator worktree group — an existing
    * worktree's path, or what the server must prepare (reuse or create) first.
    */
-  function coordinatorTarget(graph: Workflow, settings: RunSettings): { path: string; group?: string } | { prepare: { repo: string; name: string; parent?: string; baseBranch?: string }; group: string } {
-    const group = graph.coordinatorGroup ? graph.nodes.find((node) => node.id === graph.coordinatorGroup) : undefined;
+  function coordinatorTarget(graph: Workflow, settings: RunSettings, groupId = graph.coordinatorGroup): { path: string; group?: string } | { prepare: { repo: string; name: string; parent?: string; baseBranch?: string }; group: string } {
+    const group = groupId ? graph.nodes.find((node) => node.id === groupId) : undefined;
     if (!group) return { path: settings.project };
     if (!createsWorktree(group)) return { path: group.data.path ?? '', group: group.data.label };
     const name = group.data.nameSource === 'input' ? settings.inputs[group.id] ?? '' : group.data.worktreeName || `wf-${group.id.slice(0, 8)}`;
@@ -376,7 +398,7 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
         workspace = prepared.path;
         await runlog.append(logId, { type: 'note', message: `코디네이터 워크트리 「${target.group}」 ${prepared.created ? `새로 생성${target.prepare.parent ? ` (부모 ${target.prepare.parent})` : ' (부모 없음)'}` : '재사용'}: ${workspace}` }).catch(() => {});
       }
-      const where = target.group ? ` 너는 이 워크플로의 「${target.group}」 워크트리(${workspace})에서 시작했다.` : '';
+      const where = target.group ? ` 너는 이 워크플로의 「${target.group}」 그룹 위치(${workspace})에서 시작했다.` : '';
       const { terminal } = await bridge.launchCoordinator(workspace, `${briefPath} 파일의 브리프를 읽고 그대로 수행해줘. 워크플로 "${graph.name}"을(를) ${settings.count}회 실행하는 코디네이터 역할이다.${where}`);
       await runlog.append(logId, { type: 'coordinator', message: `코디네이터 기동${target.group ? ` (${workspace})` : ''}${terminal ? ` · ${terminal}` : ''}` }).catch(() => {});
       if (terminal) await runlog.patchMeta(logId, { coordinatorTerminal: terminal }).catch(() => {});
@@ -390,6 +412,34 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
     if ('prepare' in target) { void launch().catch(failed); return logId; }
     try { await launch(); } catch (error) { await failed(error); throw error; }
     return logId;
+  }
+
+  /**
+   * Sub-coordinator spawn item: registers the 실행 (log, brief) and prepares its coordinator worktree, but launches no agent —
+   * the parent run's coordinator starts it as its own worker. The coordinator location is the target's coordinator group, else
+   * its run-time input group (the item's worktree, found in the project repo and reused, or created).
+   */
+  async function prepareSubcoordinator(target: Workflow, settings: RunSettings, parent: NonNullable<RunLogMeta['parent']>, inputGroup: string, apiBase: string) {
+    const groupId = target.coordinatorGroup ?? inputGroup;
+    const where = coordinatorTarget(target, settings, groupId);
+    // A sub-coordinator never closes its own terminal: the parent coordinator releases it after its worker_done.
+    const { briefPath, logId, launchKey } = await prepareRun(target.id, target, { ...settings, cleanup: { ...settings.cleanup, coordinator: false },
+      preparedGroup: groupId, parent }, apiBase);
+    try {
+      let worktree = 'path' in where ? where.path : '';
+      if ('prepare' in where) {
+        const prepared = await bridge.prepareWorktree(where.prepare);
+        worktree = prepared.path;
+        await runlog.append(logId, { type: 'note', message: `코디네이터 워크트리 「${where.group}」 ${prepared.created ? `새로 생성${where.prepare.parent ? ` (부모 ${where.prepare.parent})` : ' (부모 없음)'}` : '재사용'}: ${worktree}` }).catch(() => {});
+      }
+      if (!worktree.startsWith('/')) throw new Error('하위 코디네이터를 띄울 워크트리 경로를 확인할 수 없습니다.');
+      await runlog.append(logId, { type: 'coordinator', message: `하위 코디네이터로 준비 · 상위 코디네이터가 워커로 띄운다 (${worktree})` }).catch(() => {});
+      return { launch: logId, brief: briefPath, worktree };
+    } catch (error) {
+      launches.delete(launchKey);
+      await runlog.append(logId, { type: 'coordinator-failed', message: `하위 코디네이터 준비 실패: ${(error as Error).message}` }).catch(() => {});
+      throw error;
+    }
   }
 
   app.post('/api/workflows/:id/execute', async (req, res) => {
@@ -426,18 +476,28 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
     const master = (await runlog.metaOfRun(executionRun(graph, execution)).catch(() => undefined))?.values ?? {};
     const passed = Object.fromEntries((target.variables ?? []).filter((item) => master[item.key]).map((item) => [item.key, master[item.key]]));
     const origin = `「${graph.name}」 ${execution.label} 의 ${link.data.label || '링크'}`;
-    const results: (SpawnResult & { status: 'requested' | 'already' | 'failed' })[] = [];
+    const sub = spawnsSubcoordinators(link);
+    const parentRun = executionRun(graph, execution);
+    const parentLaunch = sub ? await runlog.launchOfRun(parentRun).catch(() => undefined) : undefined;
+    const results: (SpawnResult & { status: 'requested' | 'prepared' | 'already' | 'failed' })[] = [];
     for (const item of [...new Set(items as string[])]) {
       const at = new Date().toISOString();
       if (requested.has(item)) { results.push({ item, at, workflowId: target.id, status: 'already' }); continue; }
       try {
         const settings = await settingsFor(target, { count: 1, project, inputs: { [inputGroups[0].id]: item }, cleanup: target.cleanup ?? defaultCleanup, values: passed });
-        const launch = await startRun(target.id, target, { ...settings, origin }, localBase(req));
-        results.push({ item, at, workflowId: target.id, launch, status: 'requested' });
+        if (!sub) {
+          const launch = await startRun(target.id, target, { ...settings, origin }, localBase(req));
+          results.push({ item, at, workflowId: target.id, launch, status: 'requested' });
+          continue;
+        }
+        results.push({ item, at, workflowId: target.id, ...await prepareSubcoordinator(target, { ...settings, origin },
+          { workflowId: id, executionId, node, ...(parentLaunch ? { launch: parentLaunch } : {}) }, inputGroups[0].id, localBase(req)), status: 'prepared' });
       } catch (error) {
         results.push({ item, at, workflowId: target.id, error: (error as Error).message.slice(0, 500), status: 'failed' });
       }
     }
+    // The parent coordinator now has sub-coordinators among its workers: it closes itself once they settle, not the server.
+    if (parentLaunch && results.some((result) => result.status === 'prepared')) await runlog.patchMeta(parentLaunch, { subcoordinators: true }).catch(() => {});
     const fresh = results.filter((result) => result.status !== 'already').map(({ status: _status, ...result }) => result);
     if (fresh.length) {
       await serial(id, async () => {
@@ -592,7 +652,7 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
     const resultFile = join(dir, 'result.json');
     const promptPath = join(dir, 'prompt.md');
     await writeFile(promptPath, kind === 'workflow'
-      ? workflowPrompt({ request, resultUrl, resultFile, saved: await storage.list() })
+      ? workflowPrompt({ request, resultUrl, resultFile, saved: await storage.list(), models: (await models.list()).models })
       : briefPrompt({ request, resultUrl, resultFile, graph: graph!, nodeId }), { mode: 0o600 });
     const item: Generation = { id, kind, status: 'pending', createdAt: Date.now(), project, ...(kind === 'brief' ? { nodeId } : {}) };
     generations.set(id, item);

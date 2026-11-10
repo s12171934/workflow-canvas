@@ -1,4 +1,4 @@
-import { asksAtRun, forwardEdges, loopBody, spawnsRuns, maxSpawnItems, resolveVariables, substituteVariables, variableRefs, createsWorktree, gateOutputs, defaultWorkerModel, launchesWorker, isBranch, isExecutable, isGroup, membershipOf, newWorktreeToken, orderNodes, parentWorktree, resolvedParentPath, topologicalOrder, waves, worktreeRepo, type FlowStage, type StageNode, type Workflow, type Cleanup, defaultCleanup } from '../src/model.ts';
+import { asksAtRun, reportsResults, forwardEdges, loopBody, spawnsRuns, spawnsSubcoordinators, maxSpawnItems, resolveVariables, substituteVariables, variableRefs, createsWorktree, gateOutputs, defaultWorkerModel, launchesWorker, isBranch, isExecutable, isGroup, membershipOf, newWorktreeToken, orderNodes, parentWorktree, resolvedParentPath, topologicalOrder, waves, worktreeRepo, type FlowStage, type StageNode, type Workflow, type Cleanup, defaultCleanup } from '../src/model.ts';
 
 export type BriefInput = {
   graph: Workflow;
@@ -23,6 +23,8 @@ export type BriefInput = {
   launchId?: string;
   /** Setting values of this run (defaults applied): they replace {{key}} in instructions, here and in linked workflows. */
   values?: Record<string, string>;
+  /** Prepared by another run's sub-coordinator spawn link: this coordinator is also that run's worker (`parentName` names the link). */
+  subcoordinator?: { parentName: string };
 };
 
 /** How deep workflow links may nest; deeper links are refused before a coordinator starts. */
@@ -72,8 +74,8 @@ export function checkGroups(workflows: Workflow[]) {
 }
 
 /**
- * Refuses spawn links that could not be carried out: the one worker in front reports the items, and the target takes each
- * item as its single run-time worktree name.
+ * Refuses spawn links that could not be carried out: the one worker in front reports the items (a branch output may lead
+ * there too — it brings no items), and the target takes each item as its single run-time worktree name.
  */
 export function checkSpawns(workflows: Workflow[], linked: Map<string, Workflow>) {
   for (const workflow of workflows) {
@@ -82,7 +84,11 @@ export function checkSpawns(workflows: Workflow[], linked: Map<string, Workflow>
     for (const node of workflow.nodes.filter(spawnsRuns)) {
       const name = `${where}'${node.data.label || '링크'}'`;
       const sources = workflow.edges.filter((edge) => edge.target === node.id && executable.has(edge.source)).map((edge) => executable.get(edge.source)!);
-      if (sources.length !== 1 || sources[0].data.kind !== 'worker') throw new Error(`${name} 링크가 항목마다 따로 실행하려면 항목 목록을 보고할 워커 하나만 앞에 연결해야 합니다.`);
+      const reporters = sources.filter((source) => !isBranch(source));
+      if (!sources.length || reporters.length > 1 || (reporters.length === 1 && !reportsResults(reporters[0]))) {
+        throw new Error(`${name} 링크가 항목마다 따로 실행하려면 항목 목록을 보고할 워커 하나만(또는 출력을 읽는 스크립트 드라이버 하나만) 앞에 연결해야 합니다. 분기 출력에서 오는 연결은 빈 항목으로 더할 수 있습니다.`);
+      }
+      if (sources.length > 1 && node.data.join !== 'any') throw new Error(`${name} 링크에 들어오는 연결이 여럿이면 합류 방식을 「하나라도 오면 진행」으로 두세요.`);
       const target = node.data.workflowId ? linked.get(node.data.workflowId) : undefined;
       const inputs = target?.nodes.filter(asksAtRun) ?? [];
       if (target && inputs.length !== 1) {
@@ -127,8 +133,10 @@ export function checkVariables(workflows: Workflow[]) {
 export function checkCoordinatorGroup(workflow: Workflow) {
   if (!workflow.coordinatorGroup) return;
   const group = workflow.nodes.find((node) => node.id === workflow.coordinatorGroup);
-  if (!group || !isGroup(group) || group.data.scope !== 'worktree') throw new Error('코디네이터 위치로 고른 워크트리 그룹이 없습니다.');
+  if (!group || !isGroup(group) || (group.data.scope !== 'worktree' && group.data.scope !== 'project')) throw new Error('코디네이터 위치로 고른 프로젝트·워크트리 그룹이 없습니다.');
   const name = `'${group.data.label}'`;
+  // A project group: the coordinator starts in its path, like the stages inside it.
+  if (group.data.scope === 'project') { if (!group.data.path) throw new Error(`${name} 그룹의 대상을 고르세요.`); return; }
   if (!createsWorktree(group)) { if (!group.data.path) throw new Error(`${name} 그룹의 대상을 고르세요.`); return; }
   if (group.data.nameSource === 'agent') throw new Error(`코디네이터 위치 ${name} 의 이름을 이전 단계가 정하면 코디네이터를 띄우기 전에 만들 수 없습니다. 이름을 직접 지정하거나 실행 시 입력으로 받으세요.`);
   if (group.data.perExecution) throw new Error(`코디네이터 위치 ${name} 는 「실행마다 따로 만들기」를 끄세요. 코디네이터는 하나입니다.`);
@@ -160,8 +168,8 @@ export function checkBranches(workflows: Workflow[]) {
       if (outputs.some((output) => !output.label.trim())) throw new Error(`${name} 분기의 출력마다 조건을 적으세요.`);
       const sources = workflow.edges.filter((edge) => edge.target === node.id && executable.has(edge.source)).map((edge) => executable.get(edge.source)!);
       if (!sources.length) throw new Error(`${name} 분기 앞에 판정 근거가 될 단계를 연결하세요.`);
-      if ((node.data.judge ?? 'previous') === 'previous' && (sources.length !== 1 || sources[0].data.kind !== 'worker')) {
-        throw new Error(`${name} 분기를 직전 단계 워커가 판정하려면 앞에 워커 하나만 연결해야 합니다.`);
+      if ((node.data.judge ?? 'previous') === 'previous' && (sources.length !== 1 || !reportsResults(sources[0]))) {
+        throw new Error(`${name} 분기를 직전 단계 워커가 판정하려면 앞에 워커 하나만(또는 JSON 줄로 판정을 내는 스크립트 드라이버 하나만) 연결해야 합니다.`);
       }
     }
     // A gate asked in the worker before it needs exactly that one worker in front.
@@ -172,6 +180,72 @@ export function checkBranches(workflows: Workflow[]) {
       }
     }
   }
+}
+
+/** Refuses script drivers the coordinator could not run: no command, or a regex without a pattern. */
+export function checkScripts(workflows: Workflow[]) {
+  for (const workflow of workflows) {
+    const where = workflows.length > 1 ? `'${workflow.name}'의 ` : '';
+    for (const node of workflow.nodes.filter((item) => item.data.kind === 'script')) {
+      const name = `${where}'${node.data.label || '스크립트 드라이버'}'`;
+      if (!node.data.command?.trim()) throw new Error(`${name} 스크립트 드라이버에 실행할 명령을 적으세요.`);
+      if (node.data.parse === 'regex' && !node.data.itemPattern) throw new Error(`${name} 스크립트 드라이버의 항목 정규식을 적으세요.`);
+    }
+  }
+}
+
+export type PreflightReport = {
+  /** True when every check that 실행 runs passed: the workflow would be accepted (run-time settings aside). */
+  ok: boolean;
+  /** Each 실행 check in the order 실행 runs them. A failed check names only its first problem, as 실행 does. */
+  checks: { name: string; ok: boolean; message?: string }[];
+  /** Not refused by 실행, but likely a mistake: a branch output that leads nowhere, a stage connected to nothing. */
+  warnings: string[];
+  /** Linked workflows that were loaded, by id. */
+  linked: string[];
+};
+
+/**
+ * Runs the checks 실행 runs before a coordinator starts, without starting one, and keeps going after a failure so
+ * one report covers every check. Run-time settings (project, inputs, required values) are not part of it.
+ */
+export async function preflight(graph: Workflow, load: (id: string) => Promise<Workflow>): Promise<PreflightReport> {
+  const checks: PreflightReport['checks'] = [];
+  const attempt = (name: string, check: () => void) => {
+    try { check(); checks.push({ name, ok: true }); }
+    catch (error) { checks.push({ name, ok: false, message: (error as Error).message }); }
+  };
+  let linked = new Map<string, Workflow>();
+  try { linked = await linkedWorkflows(graph, load); checks.push({ name: 'links', ok: true }); }
+  catch (error) { checks.push({ name: 'links', ok: false, message: (error as Error).message }); }
+  const all = [graph, ...linked.values()];
+  attempt('stages', () => { if (!graph.nodes.some(isExecutable)) throw new Error('실행할 단계가 없습니다.'); });
+  attempt('groups', () => checkGroups(all));
+  attempt('branches', () => checkBranches(all));
+  attempt('spawns', () => checkSpawns(all, linked));
+  attempt('scripts', () => checkScripts(all));
+  attempt('variables', () => checkVariables(all));
+  attempt('loops', () => checkLoops(all, linked));
+  attempt('coordinator', () => checkCoordinatorGroup(graph));
+  attempt('flow', () => { flowOf(graph, linked); });
+  const warnings: string[] = [];
+  for (const workflow of all) {
+    const where = all.length > 1 ? `'${workflow.name}'의 ` : '';
+    const stages = workflow.nodes.filter(isExecutable);
+    for (const branch of workflow.nodes.filter(isBranch)) {
+      for (const output of branch.data.outputs ?? []) {
+        if (!workflow.edges.some((edge) => edge.source === branch.id && edge.sourceHandle === output.id)) {
+          warnings.push(`${where}'${branch.data.label || '분기'}' 분기의 출력 '${output.label || output.id}'(${output.id}) 에 이어진 단계가 없습니다.`);
+        }
+      }
+    }
+    if (stages.length > 1) {
+      for (const stage of stages) {
+        if (!workflow.edges.some((edge) => edge.source === stage.id || edge.target === stage.id)) warnings.push(`${where}'${stage.data.label || '단계'}' 이(가) 어느 단계와도 연결되지 않아 실행 시작과 함께 따로 돕니다.`);
+      }
+    }
+  }
+  return { ok: checks.every((check) => check.ok), checks, warnings, linked: [...linked.keys()] };
 }
 
 type BriefStage = {
@@ -196,10 +270,15 @@ type BriefStage = {
   effort?: string;
   /** `wait: false`: stages after this link do not wait for its sub-graph; they follow the link's own predecessors. */
   workflow?: { id: string; name: string; wait: boolean; stages: BriefStage[] };
-  /** A link that is not expanded: it requests one separate 실행 of the target per item its predecessor reports. */
-  spawn?: { workflowId: string; name: string; input: string };
+  /**
+   * A link that is not expanded: it requests one separate 실행 of the target per item its predecessor reports.
+   * `as: subcoordinator`: each item's coordinator is started by this coordinator as its worker (`title`: its terminal name).
+   */
+  spawn?: { workflowId: string; name: string; input: string; as?: 'subcoordinator'; title?: string };
   /** This worker reports the items for these spawn links (`items:` line of worker_done). */
   reportsItems?: string[];
+  /** kind 'script': what the coordinator runs and how it reads the output (see ScriptParse in model.ts). */
+  script?: { command: string; parse: string; itemPattern?: string; detach: boolean; timeoutSec: number };
 };
 
 type BriefContext = { linked: Map<string, Workflow>; project: string; inputs: Record<string, string>; worktrees: WorktreeSpec[]; preparedGroup?: string;
@@ -237,6 +316,8 @@ function stagesOf(graph: Workflow, ctx: BriefContext, fallback: string, prefix =
   const { order } = topologicalOrder([...executable], stageEdges);
   const wave = waves(order, stageEdges);
   const byId = new Map(graph.nodes.map((node) => [node.id, node]));
+  // A declared setting left empty becomes an empty string in instructions, not a raw {{key}} the worker might read as a value.
+  const textValues = { ...Object.fromEntries((graph.variables ?? []).map((item) => [item.key, ''])), ...ctx.values };
   return order.map((id) => byId.get(id)!).map((node: StageNode) => {
     // Innermost worktree group wins, then a project group, then the fallback (the run project, or the link's own location).
     const { project, worktrees } = membershipOf(graph, node);
@@ -247,7 +328,7 @@ function stagesOf(graph: Workflow, ctx: BriefContext, fallback: string, prefix =
     const spawnTarget = spawnsRuns(node) ? target : undefined;
     const feeds = stageEdges.filter((edge) => edge.source === node.id).map((edge) => byId.get(edge.target)!).filter(spawnsRuns);
     return {
-      nodeId: `${prefix}${node.id}`, label: node.data.label, kind: node.data.kind, instructions: substituteVariables(node.data.description, ctx.values), location,
+      nodeId: `${prefix}${node.id}`, label: node.data.label, kind: node.data.kind, instructions: substituteVariables(node.data.description, textValues), location,
       wave: wave.get(node.id) ?? 0,
       after: stageEdges.filter((edge) => edge.target === node.id).map((edge) => {
         const source = byId.get(edge.source)!;
@@ -280,8 +361,12 @@ function stagesOf(graph: Workflow, ctx: BriefContext, fallback: string, prefix =
       ...(namers.has(node.id) ? { namesWorktree: namers.get(node.id) } : {}),
       ...(launchesWorker(node) ? { model: node.data.workerModel || defaultWorkerModel, ...(node.data.effort ? { effort: node.data.effort } : {}) } : {}),
       ...(sub ? { workflow: { id: sub.id, name: sub.name, wait: node.data.linkMode !== 'start', stages: stagesOf(sub, { ...ctx, values: { ...resolveVariables(sub.variables).values, ...ctx.values } }, location, `${prefix}${node.id}.`) } } : {}),
-      ...(spawnTarget ? { spawn: { workflowId: spawnTarget.id, name: spawnTarget.name, input: spawnTarget.nodes.find(asksAtRun)?.id ?? '' } } : {}),
+      ...(spawnTarget ? { spawn: { workflowId: spawnTarget.id, name: spawnTarget.name, input: spawnTarget.nodes.find(asksAtRun)?.id ?? '',
+        ...(spawnsSubcoordinators(node) ? { as: 'subcoordinator' as const, title: spawnTarget.name.slice(0, 24) } : {}) } } : {}),
       ...(feeds.length ? { reportsItems: feeds.map((item) => `${prefix}${item.id}`) } : {}),
+      ...(node.data.kind === 'script' ? { script: { command: substituteVariables(node.data.command ?? '', textValues), parse: node.data.parse ?? 'none',
+        ...(node.data.parse === 'regex' && node.data.itemPattern ? { itemPattern: node.data.itemPattern } : {}),
+        detach: !!node.data.detach, timeoutSec: node.data.timeoutSec ?? (node.data.detach ? 86400 : 600) } } : {}),
     };
   });
 }
@@ -320,12 +405,37 @@ export function flowOf(graph: Workflow, linked: Map<string, Workflow>): FlowStag
  * judges the natural-language conditions in node instructions, and reports bindings back
  * through the canvas API so the graph can observe the executions.
  */
-export function buildBrief({ graph, preparedGroup, linked = new Map(), count, apiBase, workspace, artifactDir, logUrl, launchId, inputs = {}, cleanup = defaultCleanup, automation, values }: BriefInput): string {
+export function buildBrief({ graph, preparedGroup, linked = new Map(), count, apiBase, workspace, artifactDir, logUrl, launchId, inputs = {}, cleanup = defaultCleanup, automation, values, subcoordinator }: BriefInput): string {
   const automationJson = automation ? `,"automation":${JSON.stringify(automation)}` : '';
   const settings = values ?? resolveVariables(graph.variables).values;
   const ctx: BriefContext = { linked, project: workspace, inputs, worktrees: [], values: settings, ...(preparedGroup ? { preparedGroup } : {}) };
   const stages = stagesOf(graph, ctx, workspace);
   const worktrees = ctx.worktrees;
+  const spawnsSub = (list: BriefStage[]): boolean => list.some((stage) => stage.spawn?.as === 'subcoordinator' || (stage.workflow ? spawnsSub(stage.workflow.stages) : false));
+  const subSpawnSection = spawnsSub(stages) ? `
+   - **하위 코디네이터로 띄우기(\`spawn.as\` 가 \`subcoordinator\` 인 링크)**: 요청은 위와 같지만 캔버스는 에이전트를 띄우지 않는다. 항목마다 실행 등록·브리프·워크트리만 준비해 \`status: "prepared"\` 와 \`launch\`(하위 실행 로그 id)·\`brief\`(브리프 절대경로)·\`worktree\`(하위 코디네이터 위치 절대경로)를 돌려준다. 하위 코디네이터는 **너의 워커**로 띄운다. 위 "기다리지 않는다" 대신 아래를 따른다.
+     - 선행이 끝나면 링크 Task 를 \`task-update --status dispatched\` 로 둔다. 항목이 있으면 위 요청을 보내고, 분기 출력으로 왔으면(빈 항목) 요청을 보내지 않는다.
+     - 응답의 \`prepared\` 항목마다(\`failed\` 는 띄우지 않고, \`already\` 는 이미 띄운 하위로 친다):
+       1. spec 을 Write 도구로 파일에 쓴다: "<brief> 를 읽고 그대로 수행한다. 너는 「<spawn.name>」 실행의 코디네이터이고, 동시에 상위 코디네이터가 띄운 워커다(브리프의 하위 코디네이터 절을 따른다)."
+       2. \`orca orchestration task-create --run <run_id> --parent <링크 Task> --task-title "<spawn.title> <항목>" --display-name "<spawn.title> <항목>" --spec "$(cat <파일>)"\` 로 링크 Task 의 자식 Task 를 만든다.
+       3. \`orca orchestration worker-start --run <run_id> --task <자식 Task> --worktree path:<worktree> --agent claude --model claude-opus-5-5\` 로 띄운다(하위 코디네이터는 캔버스 코디네이터와 같은 모델이다. \`--effort\` 는 넣지 않는다).
+       4. 받은 터미널을 \`orca terminal rename --terminal <터미널> --title "<spawn.title> <항목>"\` 로 바꾼다.
+       결과를 산출물 \`<n>-<링크 nodeId>.txt\`(2회차 이상이면 \`<n>-<링크 nodeId>-r<회차>.txt\`)에 항목마다 한 줄 \`<항목> · launch <launch> · task <자식 Task> · dispatch <dispatch id> · terminal <터미널> · <status>[ · <error>]\` 로 쓰고, 이 실행의 하위 목록 \`<n>-<링크 nodeId>-children.txt\`(회차를 넘어 하나로 유지한다)에 같은 줄을 \`open\` 표시와 함께 덧붙인다. 워커를 띄우지 못한 항목은 자식 Task 를 \`failed\` 로 닫고 두 파일에 \`failed\` 로 적는다.
+     - **링크 Task 를 닫는 시점 — 하나라도 끝나면.** 하위 목록에 아직 \`open\` 인 하위 코디네이터(앞 회차에 띄운 것 포함)가 있으면, 그중 **하나**의 worker_done 이 올 때까지 링크 Task 를 열어 두고 \`check --wait\` 반복을 계속한다(다른 실행·단계의 진행은 그대로 한다). 하나가 오면 링크 Task 를 \`task-update --status completed --result "요청 <n>건 · 실패 <k>건 · 끝남 <항목>"\` 으로 닫고, 같은 줄을 링크 산출물 끝에 쓴 뒤 다음 단계를 띄운다. 이 링크 Task 를 \`dispatched\` 로 두기 전에 이미 끝났지만 아직 어느 링크 결과에도 \`끝남\` 으로 적지 않은 하위가 있으면 기다리지 않고 그것으로 닫는다. 열린 하위가 하나도 없으면(모두 실패했거나 끝남) 바로 \`끝남 없음\` 으로 닫는다. 빈 항목으로 왔어도 같은 규칙이다.
+     - **하위의 worker_done**(언제 오든, 앞 회차 것 포함): 자식 Task 가 아직 열려 있으면 보고의 outcome 대로 닫고(\`completed\`·\`failed\`), 하위 목록의 그 줄을 \`done\`·\`failed\` 와 끝난 시각·본문 첫 줄로 고친다. 실행 로그 \`worker\` 에 "<spawn.title> <항목>: <본문 첫 줄>" 을 남기고 그 워커를 \`worker-release\` 한다. 자식 Task 가 실패로 끝나도 이 실행을 멈추지 않고 그 Task 에 의존하는 단계도 없다 — 판단은 뒤 단계가 산출물(하위 그래프가 남긴 \`_index\` 줄 등)로 한다.
+     - 하위 코디네이터 터미널이 worker_done 없이 닫히면(죽은 워커 규칙) 자식 Task 를 \`failed\` 로 닫고 \`failed\` 로 끝난 것으로 친다. 링크 Task 와 뒤 단계를 실패로 만들지 않는다.
+     - 하위가 \`ask\`·escalation 을 보내면 실행 로그 \`note\`(escalation 은 \`error\`)에 남긴다. 그래프 지침으로 답할 수 있으면 \`reply\` 로 답하고, 사용자 판단이 필요하면 "그 실행의 캔버스 결정 카드로 넘겨라" 로 답한다. 단계 지침이 하위에 지시를 전하라고 하면(예: 계약 정정) \`orca orchestration send --to dispatch:<dispatch id> --subject "<요지>" --body "<지시>"\` 로 보낸다.
+     - 이 실행이 끝날 때(절차 6) 열린 하위가 남아 있으면 기다리지 않고 마무리 보고에 열린 하위 목록을 적는다. 그래도 코디네이터 터미널은 닫지 않는다(하위의 worker_done 을 받을 곳이 사라진다) — \`check --wait\` 반복으로 남은 worker_done 을 위처럼 처리하고, 모두 끝나면 완료 시 정리 규칙대로 마친다.` : '';
+  const subSection = subcoordinator ? `
+## 하위 코디네이터로 기동됨
+이 실행은 「${subcoordinator.parentName.replace(/`/g, "'")}」 링크가 준비했고, 그 실행의 코디네이터(상위 코디네이터)가 너를 **워커로** 띄웠다. 너는 상위 Run 의 워커이면서 이 실행의 코디네이터다. 이 절은 아래 절차보다 우선한다.
+- 이 실행용 Run 은 아래 절차 1 대로 \`run-create\` 로 따로 만든다. 그 뒤 모든 \`task-*\`·\`gate-*\`·\`worker-*\`·\`check\` 명령에 \`--run <run_id>\`(자기 Run)를 붙인다. \`run-use\` 는 쓰지 않는다(다른 바인딩이 풀린다).
+- 메일은 두 갈래다. 자기 Run 의 워커 보고는 \`check --run <run_id>\`, 상위 코디네이터가 보낸 메일은 plain \`check\`(\`--run\` 없이)로 받는다.
+- 기다림은 \`check --wait --run <run_id> --timeout-ms 30000\` 반복이다(절차 5 의 \`check --wait\` 는 모두 이것이다). **턴을 끝내서 기다리지 않는다** — 워커가 보고 없이 턴을 끝내면 상위에 escalation 이 쌓이고 세 번이면 이 Task 가 실패 처리된다. 반복마다 plain \`check\`(대기 없이)로 상위 메일을 확인하고, 상위가 보낸 지시(예: 계약 정정)는 해당 단계 워커에게 전달하고 실행 로그 \`note\` 에 남긴다.
+- 사용자에게 직접 묻지 않는다(질문 도구도 쓰지 않는다). 사용자 결정은 아래 게이트 규칙 그대로 캔버스 결정 카드로 받는다.
+- 실행이 끝나면(완료·막힘·중단 어느 쪽이든. 사용자 결정이 열려 있으면 아직 끝나지 않은 것이다) 마무리 보고와 실행 로그 \`report\` 뒤 상위에 **worker_done** 을 한 번 보낸다. 명령은 너를 띄운 워커 프리앰블의 것(\`--task-id\`·\`--dispatch-id\`)을 그대로 쓴다. 본문 3줄: 결과 한 줄(완료/막힘/중단 + 배치 단위, 즉 실행 시 입력 값), 근거 경로(그래프가 남긴 \`_index\` 등 보고 파일), 판단할 것. 완료가 아니면 프리앰블이 정한 대로 실패 outcome(\`--outcome failed\`)으로 보낸다.
+- 자기 터미널을 닫지 않는다(상위가 release 한다). 정리 규칙의 워크트리 삭제가 네가 시작한 워크트리를 지우게 되면 그것은 하지 않고 보고에 남긴다.
+` : '';
   const worktreeSection = worktrees.length ? `
 ## 워크트리
 단계의 \`location\` 이 아래 표의 \`location\` 과 같으면 그 워크트리에서 작업한다. 표 순서대로(바깥 워크트리 먼저) 준비한다. \`new-worktree:\` 로 시작하는 location 은 실행 중에 만들어질 워크트리다.
@@ -358,7 +468,7 @@ ${JSON.stringify(worktrees, null, 2)}
 ## 먼저 할 일
 1. \`orca-orchestration-rules\` 와 \`orchestration\` 스킬을 로드하고 \`orca skills get orchestration\` 으로 버전에 맞는 가이드를 읽는다. 명령과 플래그는 그 가이드만 따른다.
 2. 사용자에게 보이는 모든 텍스트는 한국어로 쓴다.
-
+${subSection}
 ## 그래프
 - 워크플로: ${graph.name} (id \`${graph.id}\`)
 - 실행 프로젝트: \`${workspace}\` (사용자가 실행할 때 고른 프로젝트. 그룹 밖 단계는 여기서 작업한다)
@@ -368,6 +478,7 @@ ${graph.variables.map((item) => `  - \`${item.key}\` ${item.label}: ${settings[i
 - 단계 종류(\`kind\`):
   - \`worker\`: 워커 하나가 지침을 수행한다.
   - 들어오는 연결이 여럿인 단계: 기본은 **모두 필요**다. 앞 경로 중 하나라도 건너뛰어지면(고르지 않은 분기 출력, 건너뛴 단계) 이 단계도 건너뛴다. \`join: any\` 인 단계는 분기에서 갈라진 경로가 다시 모이는 곳이라 하나라도 오면 진행한다. 어느 쪽이든 건너뜀 계산은 캔버스가 하고, 너는 건너뛰지 않은 선행이 모두 끝났을 때 띄운다.
+  - \`script\`: 스크립트 드라이버. **워커를 띄우지 않는다.** 아래 "스크립트 단계" 대로 네가 \`script.command\` 를 그 단계의 \`location\` 에서 그대로 실행하고, 종료 코드와 출력으로 단계를 닫는다. 명령을 고치거나 해석해 바꾸지 않는다.
   - \`gate\`: 사용자 개입 게이트. 워커를 띄우지 않는다. 출력이 \`approve\`(통과)·\`reject\`(거절) 두 개인 사용자 결정이다. 게이트에서 나가는 연결은 모두 \`approve\` 출력이다. \`branch.judge\` 가 \`user\` 면 코디네이터(캔버스 결정 대기 카드)가 묻고, \`previous\` 면 직전 워커가 자기 터미널에서 사용자에게 묻는다(그 워커의 \`decides\` 에 \`ask\` 로 들어 있다). \`auto\` 면 묻지 않는다 — 자동 승인 게이트다.
   - \`branch\`: 분기. 어느 출력으로 갈지 판정만 한다. \`branch.mode\` 가 \`exclusive\` 면 출력 하나, \`inclusive\` 면 조건에 맞는 출력 모두(하나 이상)를 고른다. \`branch.judge\` 가 판정 주체다: \`previous\` 직전 워커, \`worker\` 판정 전용 워커, \`user\` 사용자. \`after\` 항목에 \`output\` 이 있으면 그 분기가 그 출력을 골랐을 때만 이어지는 연결이다.
   - \`workflow\` 이고 \`spawn\` 이 있는 단계: **펼치지 않는다.** 대상 워크플로를 항목마다 **따로 실행 요청**하는 단계다. 워커를 띄우지 않는다. 아래 "항목마다 따로 실행" 을 따른다.
@@ -419,14 +530,24 @@ ${worktreeSection}
        \`\`\`
        새로 생긴 판정은 \`gate-resolve --resolution "<출력 id>"\` 로 게이트를 닫고 "판정 반영" 을 한다.
      - 사용자가 이 터미널에 직접 답하면 그 답을 "판정 등록" 으로 보낸다. 409 면 캔버스에서 먼저 고른 것이므로 등록된 판정을 따른다.
-   - **항목마다 따로 실행(\`spawn\` 이 있는 단계)**: 선행 워커가 끝나면, 그 worker_done 의 \`items: <항목>, <항목>, ...\` 줄을 항목 목록으로 읽는다(줄이 없거나 비었으면 빈 목록). 항목을 고치거나 더하지 않는다. 한 번에 ${maxSpawnItems}개까지 보낸다.
+   - **스크립트 단계(kind \`script\`)**: 선행 단계가 모두 끝나면 Task 를 dispatched 로 두고 실행한다. 출력은 \`${artifactDir}/<실행 번호>-<nodeId>.out\`(표준 출력), \`.err\`(표준 오류), \`.exit\`(종료 코드 한 줄)에 남긴다.
+     - 명령은 Write 도구로 \`${artifactDir}/<실행 번호>-<nodeId>.sh\` 에 그대로 쓰고(첫 줄 \`cd <location>\`, 끝에 출력·종료 코드를 위 파일로 남기는 줄), \`sh <그 파일>\` 로 돌린다. 명령을 한 줄 Bash 에 직접 넣지 않는다.
+     - \`script.detach: false\`: 이 터미널에서 돌리고 \`script.timeoutSec\` 초를 넘기면 멈추고 실패로 닫는다.
+     - \`script.detach: true\`: \`orca terminal create --worktree path:<location> --title "<단계 이름> #<n>" --command "sh <그 파일>"\` 로 따로 띄우고 기다리지 않는다. \`check\` 가 깨거나 시간이 다 될 때마다 \`.exit\` 파일이 생겼는지 본다. \`script.timeoutSec\` 초가 지나도 없으면 실패로 닫는다.
+     - 종료 코드가 0 이 아니면 \`task-update --status failed --result "<exit N · .err 마지막 줄>"\` 로 닫고, 그 단계에 의존하는 단계는 띄우지 않는다. 다시 돌리지 않는다.
+     - 0 이면 \`script.parse\` 대로 출력을 읽는다. 항목과 판정은 출력에서만 얻는다 — 고치거나 더하거나 빼지 않는다.
+       - \`jsonl\`: 표준 출력의 줄마다 JSON 객체다(JSON 이 아닌 줄은 무시). \`item\` 이 있는 줄 중 \`"selected": false\` 가 아닌 것의 \`item\` 이 항목이다. \`{"decision": "<출력 id>[,<출력 id>...]"}\` 줄이 있으면 그것이 이 단계의 판정이다(\`decides\` 의 분기·게이트).
+       - \`regex\`: 표준 출력의 줄마다 \`script.itemPattern\` 을 찾아, 맞은 줄의 첫 캡처 그룹(없으면 맞은 부분)이 항목이다.
+       - \`none\`: 항목도 판정도 없다.
+     - \`task-update --status completed --result "<exit 0 · 항목 N개 · 출력 파일 경로>"\` 로 닫는다. 항목·판정은 아래 "항목마다 따로 실행" 과 판정 규칙에서 워커의 \`items:\`·\`decision:\` 줄과 똑같이 쓴다. 고르지 않은 줄(\`"selected": false\`)은 실행 로그 \`note\` 에 \`<item>: <reason>\` 으로 남긴다.
+   - **항목마다 따로 실행(\`spawn\` 이 있는 단계)**: 선행 워커가 끝나면, 그 worker_done 의 \`items: <항목>, <항목>, ...\` 줄을 항목 목록으로 읽는다(줄이 없거나 비었으면 빈 목록). 선행 단계가 스크립트 드라이버면 위 "스크립트 단계" 에서 읽은 항목을 쓴다. 항목을 고치거나 더하지 않는다. 한 번에 ${maxSpawnItems}개까지 보낸다.
      \`\`\`sh
      curl -s -X POST -H 'Content-Type: application/json' ${apiBase}/api/workflows/${graph.id}/executions/<실행 id>/spawn \\
        --data '{"node":"<링크 nodeId>","project":"${workspace}","items":["<항목>", ...]}'
      \`\`\`
-     캔버스가 항목마다 대상 워크플로의 코디네이터를 따로 띄우고(항목 = 대상의 실행 시 입력 워크트리 이름) \`results\` 를 돌려준다. 이 실행에서 이미 요청한 항목은 다시 띄우지 않는다. 응답 \`results\` 를 그대로 산출물 \`<n>-<링크 nodeId>.txt\` 에 쓰고, 링크 Task 를 \`task-update --status completed --result "요청 <성공 수>건 · 실패 <실패 수>건"\` 으로 닫은 뒤 다음 단계를 띄운다. 일부 항목이 실패해도 막지 않는다(뒤 단계가 산출물로 처리한다). 요청 자체가 400 이면 오류를 실행 로그 \`error\` 로 남기고 링크 Task 를 blocked 로 둔다. 따로 띄운 실행은 이 실행의 일부가 아니다 — 기다리지 않고, 정리하지도 않는다.
+     분기 출력으로 이 링크에 왔으면(그 분기의 \`after\` 연결로 도착하고 항목을 보고할 워커는 건너뜀) 항목은 빈 목록이다 — 요청을 보내지 않는다. \`spawn.as\` 가 없으면 캔버스가 항목마다 대상 워크플로의 코디네이터를 따로 띄우고(항목 = 대상의 실행 시 입력 워크트리 이름) \`results\` 를 돌려준다. 이 실행에서 이미 요청한 항목은 다시 띄우지 않는다(링크가 되돌아가기 구간 안에 있으면 회차마다 새로 요청할 수 있다. 같은 입력의 대상 실행이 아직 돌고 있으면 그 항목은 실패로 돌아온다). 응답 \`results\` 를 그대로 산출물 \`<n>-<링크 nodeId>.txt\` 에 쓰고, 링크 Task 를 \`task-update --status completed --result "요청 <성공 수>건 · 실패 <실패 수>건"\` 으로 닫은 뒤 다음 단계를 띄운다. 일부 항목이 실패해도 막지 않는다(뒤 단계가 산출물로 처리한다). 요청 자체가 400 이면 오류를 실행 로그 \`error\` 로 남기고 링크 Task 를 blocked 로 둔다. 따로 띄운 실행은 이 실행의 일부가 아니다 — 기다리지 않고, 정리하지도 않는다.${subSpawnSection}
    - **되돌아가기(\`branch.loops\` 의 출력)**: 판정은 다른 출력과 똑같이 "판정 등록" 으로 보낸다. 응답이 회차를 알려 준다.
-     - 응답에 \`loop\` 가 있으면 되돌아간 것이다: 분기 Task 를 \`task-update --status completed --result "decision: <출력 id> · <loop.pass - 1>회차 종료"\` 로 닫고, \`loop.restart\` 의 단계(순서대로)마다 **새 Task** 를 만든다 — title·display-name "<단계 이름> #<n> · <loop.pass>회차", deps 는 같은 회차에 새로 만든 선행 단계 Task(첫 단계 \`loop.to\` 는 deps 없음). 앞 회차 Task 는 그대로 둔다. 만든 Task 를 아래처럼 등록한 뒤 진행 규칙대로 \`loop.to\` 부터 띄운다. 이후 이 단계들의 완료·판정은 새 Task 기준이다.
+     - 응답에 \`loop\` 가 있으면 되돌아간 것이다: 분기 Task 를 \`task-update --status completed --result "decision: <출력 id> · <loop.pass - 1>회차 종료"\` 로 닫고, \`loop.restart\` 의 단계(순서대로)마다 **새 Task** 를 만든다 — title·display-name "<단계 이름> #<n> · <loop.pass>회차", deps 는 같은 회차에 새로 만든 선행 단계 Task(첫 단계 \`loop.to\` 는 deps 없음). \`restart\` 에는 되돌아가기 구간 밖이지만 앞 회차에서 건너뜀으로 닫혀 이번 회차에 다시 닿을 수 있게 된 단계도 들어 있다 — 그 단계도 같은 방법으로 새 Task 를 만든다. 앞 회차 Task 는 그대로 둔다. 만든 Task 를 아래처럼 등록한 뒤 진행 규칙대로 \`loop.to\` 부터 띄운다. 이후 이 단계들의 완료·판정은 새 Task 기준이다.
        \`\`\`sh
        curl -s -X PATCH -H 'Content-Type: application/json' ${apiBase}/api/workflows/${graph.id}/executions/<실행 id>/bindings \\
          --data '{"bindings":{"<nodeId>":"<새 task_id>", ...}}'

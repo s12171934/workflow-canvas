@@ -180,7 +180,7 @@ export function createOrcaBridge(command: Command = orcaCommand, cacheTimes: Cac
       let cursor: unknown;
       const visited = new Set<string>();
       do {
-        const page = await command(['orchestration', 'run-list', '--limit', '100', ...(cursor == null ? [] : ['--cursor', String(cursor)])]);
+        const page = await command(['orchestration', 'run-list', '--full', '--limit', '100', ...(cursor == null ? [] : ['--cursor', String(cursor)])]);
         runs.push(...(page.runs ?? []).map(runSummary));
         cursor = page.nextCursor;
         if (cursor != null && visited.has(String(cursor))) throw new Error('Orca Run 페이지 커서가 반복되었습니다.');
@@ -194,14 +194,14 @@ export function createOrcaBridge(command: Command = orcaCommand, cacheTimes: Cac
     },
     async loadSnapshot(runId: string): Promise<RunSnapshot> {
       const [detail, tasks] = await Promise.all([
-        command(['orchestration', 'run-show', '--id', runId]),
-        command(['orchestration', 'task-list', '--run', runId]),
+        command(['orchestration', 'run-show', '--full', '--id', runId]),
+        command(['orchestration', 'task-list', '--full', '--run', runId]),
       ]);
       const workers: WorkerSummary[] = [];
       let cursor: unknown;
       const visited = new Set<string>();
       do {
-        const page = await command(['orchestration', 'worker-list', '--run', runId, '--include-remote', '--limit', '100',
+        const page = await command(['orchestration', 'worker-list', '--full', '--run', runId, '--include-remote', '--limit', '100',
           ...(cursor == null ? [] : ['--cursor', String(cursor)])]);
         workers.push(...(page.workers ?? []).map(normalizeWorker));
         cursor = page.page?.hasMore ? page.page.nextCursor : null;

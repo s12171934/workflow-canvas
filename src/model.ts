@@ -1,8 +1,20 @@
 import type { Edge, Node } from '@xyflow/react';
+import { autoLayout } from './layout.ts';
 
 export type StageStatus = 'unbound' | 'pending' | 'running' | 'blocked' | 'completed' | 'failed' | 'unknown' | 'skipped';
 /** Normal (executable or annotation) node kinds. `workflow` links to another saved workflow. */
-export type StageKind = 'worker' | 'gate' | 'note' | 'workflow' | 'branch';
+export type StageKind = 'worker' | 'gate' | 'note' | 'workflow' | 'branch' | 'script';
+/**
+ * Script driver: the coordinator runs `command` itself (no agent) at the stage's location and reads its output.
+ * 'jsonl' — one JSON object per line: {"item", "selected"?, "label"?, "reason"?} lines give the items (selected unless
+ * `"selected": false`), a {"decision": "<output id>[,…]"} line decides a branch or gate right after it.
+ * 'regex' — every line matching `itemPattern` gives an item (its first capture group, else the whole match).
+ * 'none' — only the exit code counts. A non-zero exit fails the stage.
+ */
+export type ScriptParse = 'none' | 'jsonl' | 'regex';
+export const scriptParses: ScriptParse[] = ['none', 'jsonl', 'regex'];
+export const scriptParseNames: Record<ScriptParse, string> = { none: '종료 코드만', jsonl: 'JSON 줄 (선별 결과)', regex: '정규식으로 항목 추출' };
+export const maxScriptTimeout = 86400;
 /** Branch: 'exclusive' takes exactly one output, 'inclusive' every output whose condition holds (at least one). */
 export type BranchMode = 'exclusive' | 'inclusive';
 /** Who decides a branch: the worker of the stage right before it, a judging worker of its own, or the user. */
@@ -22,10 +34,22 @@ export const linkModes: LinkMode[] = ['wait', 'start', 'spawn'];
 export const linkModeNames: Record<LinkMode, string> = { wait: '끝날 때까지 대기', start: '시작만 하고 진행', spawn: '항목마다 따로 실행' };
 /** A link that requests separate executions of its target instead of expanding it. */
 export const spawnsRuns = (node: Pick<StageNode, 'data'>) => node.data.kind === 'workflow' && node.data.linkMode === 'spawn';
+/**
+ * Spawn link: who supervises each item's 실행. 'coordinator' (default) — the server launches an independent coordinator;
+ * 'subcoordinator' — the server only prepares the 실행 (log, brief, worktree) and this run's coordinator starts it as its own
+ * worker (a child Task of the link), which reports back with worker_done.
+ */
+export type SpawnAs = 'coordinator' | 'subcoordinator';
+export const spawnAsModes: SpawnAs[] = ['coordinator', 'subcoordinator'];
+export const spawnAsNames: Record<SpawnAs, string> = { coordinator: '독립 코디네이터로 띄우기', subcoordinator: '하위 코디네이터로 띄우기' };
+/** A spawn link whose items run as sub-coordinators: workers of this run's coordinator. */
+export const spawnsSubcoordinators = (node: Pick<StageNode, 'data'>) => spawnsRuns(node) && node.data.spawnAs === 'subcoordinator';
 /** How many separate executions one spawn request may start. */
 export const maxSpawnItems = 20;
 /** One item a spawn link asked to run: the launch it started, or why it could not. */
-export type SpawnResult = { item: string; at: string; workflowId: string; launch?: string; error?: string };
+export type SpawnResult = { item: string; at: string; workflowId: string; launch?: string; error?: string;
+  /** Sub-coordinator links: the brief the coordinator's worker reads, and the worktree the server prepared for it. */
+  brief?: string; worktree?: string };
 export const gateAskerNames: Record<GateAsker, string> = { coordinator: '코디네이터', previous: '직전 워커', auto: '자동 승인' };
 export const maxBranchOutputs = 8;
 export type JoinMode = 'all' | 'any';
@@ -34,8 +58,11 @@ export const joinNames: Record<JoinMode, string> = { all: '모두 필요', any: 
 export type GroupScope = 'project' | 'worktree';
 /** `frame`: a memo group — a resizable box that only gathers nodes visually (moving it moves what lies inside); never executes or sets a location. */
 export type NodeKind = StageKind | 'group' | 'frame';
-/** Agent model ids offered per launching node; unset means `defaultWorkerModel`. */
-export const workerModels = ['claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5', 'claude-fable-5-1'] as const;
+/**
+ * Fallback model ids offered per launching node, used only when the server cannot reach the Anthropic Models API
+ * (`server/models.ts` serves the newest of each family at /api/models); unset means `defaultWorkerModel`.
+ */
+export const workerModels = ['claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5', 'claude-fable-5-2'] as const;
 export const defaultWorkerModel = 'claude-opus-5-5';
 /** Reasoning effort per launching node; unset means the model's own default (no --effort). */
 export const effortLevels = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
@@ -101,6 +128,8 @@ export type StageData = {
   /** kind 'workflow': the linked saved workflow, and whether what follows waits for it (unset: 'wait'). */
   workflowId?: string;
   linkMode?: LinkMode;
+  /** Spawn links: how each item's 실행 is supervised (unset: 'coordinator'). */
+  spawnAs?: SpawnAs;
   /** Display only: the round a looped stage is on (2 and up), in the selected execution or the furthest visible one. */
   round?: number;
   /** Display only, spawn links: the separate executions requested (by the selected execution, or the visible ones). */
@@ -128,6 +157,13 @@ export type StageData = {
   /** Launching nodes (see `launchesWorker`): the worker's model and reasoning effort; unset uses the defaults. */
   workerModel?: string;
   effort?: Effort;
+  /** kind 'script': the command (a shell script, {{settings}} allowed), how its output is read, and how it runs. */
+  command?: string;
+  parse?: ScriptParse;
+  itemPattern?: string;
+  /** Run in its own Orca terminal instead of the coordinator's (long-running drivers); the coordinator polls its exit file. */
+  detach?: boolean;
+  timeoutSec?: number;
 };
 export type StageNode = Node<StageData, 'stage' | 'group' | 'frame'>;
 export const isGroup = (node: Pick<StageNode, 'data'>) => node.data.kind === 'group';
@@ -157,15 +193,19 @@ export const createsWorktree = (node: Pick<StageNode, 'data'>) => isGroup(node) 
 /** Location token for stages in a create-mode group; the coordinator swaps it for the created worktree's path. */
 export const newWorktreeToken = (groupId: string) => `new-worktree:${groupId}`;
 /** Nodes that become Tasks (or, for links, a sub-graph of Tasks) when the workflow runs. */
-export const isExecutable = (node: Pick<StageNode, 'data'>) => ['worker', 'gate', 'workflow', 'branch'].includes(node.data.kind);
+export const isExecutable = (node: Pick<StageNode, 'data'>) => ['worker', 'gate', 'workflow', 'branch', 'script'].includes(node.data.kind);
+/** Stages that can report items for a spawn link or a decision for the branch/gate after them: a worker or a script that parses its output. */
+export const reportsResults = (node: Pick<StageNode, 'data'>) => node.data.kind === 'worker' || (node.data.kind === 'script' && (node.data.parse ?? 'none') !== 'none');
 export const isBranch = (node: Pick<StageNode, 'data'>) => node.data.kind === 'branch';
-export const kindNames: Record<NodeKind, string> = { worker: '워커', gate: '사용자 개입 게이트', branch: '분기', note: '메모', workflow: '워크플로 링크', group: '그룹', frame: '메모 그룹' };
+export const kindNames: Record<NodeKind, string> = { worker: '워커', gate: '사용자 개입 게이트', branch: '분기', script: '스크립트 드라이버', note: '메모', workflow: '워크플로 링크', group: '그룹', frame: '메모 그룹' };
 export const scopeNames: Record<GroupScope, string> = { project: 'Orca 프로젝트', worktree: '워크트리' };
 export type Workflow = {
   version: 1;
   id: string;
   name: string;
   description: string;
+  /** Labels the sidebar groups saved workflows by; a workflow with several tags shows under each. */
+  tags?: string[];
   runId: string;
   nodes: StageNode[];
   edges: WorkflowEdge[];
@@ -184,13 +224,26 @@ export type Workflow = {
    */
   coordinatorGroup?: string;
 };
+export const maxTags = 10;
+export const maxTagLength = 30;
+/** A tag as typed: inner whitespace collapsed, trimmed, cut to the length limit. Empty when nothing usable is left. */
+export const cleanTag = (value: string) => value.replace(/[\u0000-\u001f]/g, '').replace(/\s+/g, ' ').trim().slice(0, maxTagLength);
+export const validTags = (value: unknown): value is string[] => Array.isArray(value) && value.length <= maxTags
+  && value.every((tag) => typeof tag === 'string' && tag !== '' && cleanTag(tag) === tag) && new Set(value).size === value.length;
+/** Sidebar sections: one per tag in name order, then untagged items last (key ''). Item order inside a section is kept. */
+export function groupByTag<T extends { tags?: string[] }>(items: T[]): { tag: string; items: T[] }[] {
+  const tags = [...new Set(items.flatMap((item) => item.tags ?? []))].sort((a, b) => a.localeCompare(b, 'ko'));
+  const sections = tags.map((tag) => ({ tag, items: items.filter((item) => item.tags?.includes(tag)) }));
+  const untagged = items.filter((item) => !item.tags?.length);
+  return untagged.length ? [...sections, { tag: '', items: untagged }] : sections;
+}
 /**
  * A loop edge goes back from an output of an exclusive branch to a stage before it. Choosing that output runs the stages
  * from the target to the branch again (a new round), at most `max` times; after that the choice becomes `exit`.
  */
 export type EdgeLoop = { max: number; exit: string };
 export type WorkflowEdge = Edge & { loop?: EdgeLoop };
-export const maxLoopRounds = 10;
+export const maxLoopRounds = 200;
 /** Edges that are not loops: the graph they form must be acyclic. */
 export const forwardEdges = <T extends { loop?: EdgeLoop }>(edges: T[]) => edges.filter((edge) => !edge.loop);
 /** Stages a loop runs again: on a forward path from its target to its source, both included. */
@@ -265,8 +318,12 @@ export type Execution = { id: string; label: string; bindings: Record<string, st
   loops?: Record<string, number>;
   /** Earlier rounds of looped stages: what each pass bound and decided before the loop sent it back. */
   history?: LoopPass[] };
-/** One finished pass of a loop body: its stages, their Tasks and decisions (the branch's own loop choice included). */
-export type LoopPass = { edge: string; pass: number; nodes: string[]; bindings: Record<string, string>; decisions?: Record<string, string[]> };
+/**
+ * One finished pass of a loop body: its stages, their Tasks and decisions (the branch's own loop choice included), and
+ * what its spawn links requested — a spawn link inside the body asks for the same items again on the next pass.
+ */
+export type LoopPass = { edge: string; pass: number; nodes: string[]; bindings: Record<string, string>; decisions?: Record<string, string[]>;
+  spawned?: Record<string, SpawnResult[]> };
 /** Which round a stage is on in one execution: 1 plus the earlier passes that included it. */
 export const stageRound = (execution: Pick<Execution, 'history'>, nodeId: string) =>
   1 + (execution.history ?? []).filter((pass) => pass.nodes.includes(nodeId)).length;
@@ -484,9 +541,9 @@ export function serializableWorkflow(workflow: Workflow): Workflow {
       ...(execution.spawned && Object.keys(execution.spawned).some((nodeId) => nodeIds.has(nodeId))
         ? { spawned: Object.fromEntries(Object.entries(execution.spawned).filter(([nodeId]) => nodeIds.has(nodeId))) } : {}) };
   });
-  const { executions: _omit, workspace, cleanup, automations, variables, coordinatorGroup, ...rest } = workflow;
+  const { executions: _omit, workspace, cleanup, automations, variables, coordinatorGroup, tags, ...rest } = workflow;
   const ordered = orderNodes(workflow.nodes);
-  return { ...rest, ...(workspace ? { workspace } : {}),
+  return { ...rest, ...(tags?.length ? { tags } : {}), ...(workspace ? { workspace } : {}),
     ...(coordinatorGroup && groupIds.has(coordinatorGroup) ? { coordinatorGroup } : {}),
     ...(variables?.length ? { variables: variables.map((item) => ({ key: item.key, label: item.label.trim() || item.key,
       ...(item.description ? { description: item.description } : {}), ...(item.default ? { default: item.default } : {}), ...(item.required ? { required: true } : {}) })) } : {}),
@@ -509,17 +566,26 @@ export function serializableWorkflow(workflow: Workflow): Workflow {
       ...(node.data.ref ? { ref: node.data.ref } : {}), ...(node.data.repoPath ? { repoPath: node.data.repoPath } : {}),
       ...(node.data.worktreeName ? { worktreeName: node.data.worktreeName } : {}), ...(node.data.branch ? { branch: node.data.branch } : {}) });
     else if (group) Object.assign(data, { scope: node.data.scope ?? 'project', path: node.data.path ?? '', ...(node.data.ref ? { ref: node.data.ref } : {}) });
-    else if (node.data.kind === 'workflow') Object.assign(data, node.data.workflowId ? { workflowId: node.data.workflowId } : {}, node.data.linkMode && node.data.linkMode !== 'wait' ? { linkMode: node.data.linkMode } : {});
+    else if (node.data.kind === 'workflow') Object.assign(data, node.data.workflowId ? { workflowId: node.data.workflowId } : {}, node.data.linkMode && node.data.linkMode !== 'wait' ? { linkMode: node.data.linkMode } : {},
+      node.data.linkMode === 'spawn' && node.data.spawnAs === 'subcoordinator' ? { spawnAs: 'subcoordinator' } : {});
     else if (isBranch(node)) Object.assign(data, { mode: node.data.mode ?? 'exclusive', judge: node.data.judge ?? 'previous',
       outputs: (node.data.outputs ?? []).map((output) => ({ id: output.id, label: output.label })), ...(node.data.taskId ? { taskId: node.data.taskId } : {}) });
-    else if (node.data.taskId) data.taskId = node.data.taskId;
+    else if (node.data.kind === 'script') {
+      const parse = node.data.parse ?? 'none';
+      Object.assign(data, { command: node.data.command ?? '', ...(parse !== 'none' ? { parse } : {}),
+        ...(parse === 'regex' && node.data.itemPattern ? { itemPattern: node.data.itemPattern } : {}),
+        ...(node.data.detach ? { detach: true } : {}), ...(node.data.timeoutSec ? { timeoutSec: node.data.timeoutSec } : {}),
+        ...(node.data.taskId ? { taskId: node.data.taskId } : {}) });
+    } else if (node.data.taskId) data.taskId = node.data.taskId;
     if (launchesWorker(node)) Object.assign(data, { ...(node.data.workerModel ? { workerModel: node.data.workerModel } : {}), ...(node.data.effort ? { effort: node.data.effort } : {}) });
     if (!group && isExecutable(node) && node.data.join === 'any') data.join = 'any';
     if (node.data.kind === 'gate' && (node.data.asker === 'previous' || node.data.asker === 'auto')) data.asker = node.data.asker;
     const width = node.width ?? node.measured?.width;
     const height = node.height ?? node.measured?.height;
     return { id: node.id, type: group ? 'group' : frame ? 'frame' : 'stage', position: node.position, ...(parentId ? { parentId } : {}),
-      ...(group || frame ? { width: Math.round(width ?? (frame ? 560 : 640)), height: Math.round(height ?? (frame ? 320 : 360)) } : {}), data } as StageNode;
+      ...(group || frame ? { width: Math.round(width ?? (frame ? 560 : 640)), height: Math.round(height ?? (frame ? 320 : 360)) } : {}),
+      // A note keeps a size only once it has been resized (otherwise it fits its text).
+      ...(node.data.kind === 'note' && node.width && node.height ? { width: Math.round(node.width), height: Math.round(node.height) } : {}), data } as StageNode;
   }), edges: workflow.edges.filter((edge) => ![edge.source, edge.target].some((id) => groupIds.has(id) || frameIds.has(id)))
     // Only a branch's edges name an output (its source handle); every other edge leaves the single source port.
     .map((edge) => ({ id: edge.id, source: edge.source, target: edge.target, label: edge.label,
@@ -528,29 +594,13 @@ export function serializableWorkflow(workflow: Workflow): Workflow {
 }
 
 export function fromSnapshot(snapshot: RunSnapshot): Pick<Workflow, 'nodes' | 'edges' | 'runId' | 'name'> {
-  const levels = new Map<string, number>();
   const tasks = new Map(snapshot.tasks.map((task) => [task.id, task]));
-  function level(id: string, visiting = new Set<string>()): number {
-    if (levels.has(id)) return levels.get(id)!;
-    if (visiting.has(id)) return 0;
-    const next = new Set(visiting).add(id);
-    const dependencies = tasks.get(id)?.deps.filter((dep) => tasks.has(dep)) ?? [];
-    const value = dependencies.length ? Math.min(30, 1 + Math.max(...dependencies.map((dep) => level(dep, next)))) : 0;
-    levels.set(id, value);
-    return value;
-  }
-  const rows = new Map<number, number>();
-  const nodes: StageNode[] = snapshot.tasks.map((task) => {
-    const column = level(task.id);
-    const row = rows.get(column) ?? 0;
-    rows.set(column, row + 1);
-    return { id: task.id, type: 'stage', position: { x: column * 320, y: row * 190 },
-      data: { label: task.title || task.spec.slice(0, 60), description: task.spec, taskId: task.id, kind: 'worker' } };
-  });
-  return { name: snapshot.run.objective, runId: snapshot.run.id, nodes,
-    edges: snapshot.tasks.flatMap((task) => task.deps.filter((dep) => tasks.has(dep)).map((dep) => ({
-      id: `${dep}-${task.id}`, source: dep, target: task.id,
-    }))) };
+  const nodes: StageNode[] = snapshot.tasks.map((task) => ({ id: task.id, type: 'stage', position: { x: 0, y: 0 },
+    data: { label: task.title || task.spec.slice(0, 60), description: task.spec, taskId: task.id, kind: 'worker' } }));
+  const edges = snapshot.tasks.flatMap((task) => task.deps.filter((dep) => tasks.has(dep)).map((dep) => ({
+    id: `${dep}-${task.id}`, source: dep, target: task.id,
+  })));
+  return { name: snapshot.run.objective, runId: snapshot.run.id, nodes: autoLayout(nodes, edges), edges };
 }
 
 export function newWorkflow(): Workflow {
@@ -645,7 +695,7 @@ export function frameContents(frameId: string, nodes: Pick<StageNode, 'id' | 'da
 
 /** Brings documents from older canvases or servers up to the current node kinds ('task' → 'worker'; unknown → 'note'). */
 export function normalizeNodes(nodes: StageNode[]): StageNode[] {
-  const known: NodeKind[] = ['worker', 'gate', 'branch', 'note', 'workflow', 'group', 'frame'];
+  const known: NodeKind[] = ['worker', 'gate', 'branch', 'script', 'note', 'workflow', 'group', 'frame'];
   return nodes.map((node) => {
     const kind = node.data.kind as string;
     if (known.includes(kind as NodeKind)) return node;
@@ -685,6 +735,10 @@ export type RunLogMeta = {
   coordinatorTerminal?: string;
   /** 완료 시 정리 asked the coordinator to close itself: the server closes it when it is still open after the run ends. */
   closeCoordinator?: boolean;
+  /** Started by another run's sub-coordinator spawn link: its coordinator is that run's worker and reports back with worker_done. */
+  parent?: { workflowId: string; executionId: string; node: string; launch?: string };
+  /** This run's coordinator started sub-coordinators as its workers: it closes itself once they have settled, not the server. */
+  subcoordinators?: boolean;
 };
 export type LoggedExecution = { id: string; label: string; tasks: string[];
   /** Tasks of stages no taken branch reaches; the coordinator closes them as completed, the log shows them as skipped. */
@@ -776,7 +830,7 @@ export function applyDecision(flow: FlowStage[], execution: Execution, node: str
   if (loop && last?.edge === loop.edge && !execution.bindings[node] && !execution.decisions?.[node]
     && JSON.stringify(last.decisions?.[node]) === JSON.stringify(outputs)) {
     const count = execution.loops?.[loop.edge] ?? 0;
-    return { execution, loop: { edge: loop.edge, to: loop.to, restart: loop.body, pass: count + 1, max: loop.max, remaining: loop.max - count }, repeated: true };
+    return { execution, loop: { edge: loop.edge, to: loop.to, restart: last.nodes, pass: count + 1, max: loop.max, remaining: loop.max - count }, repeated: true };
   }
   const decide = (chosen: string[]) => {
     const decisions = { ...execution.decisions, [node]: chosen };
@@ -785,14 +839,26 @@ export function applyDecision(flow: FlowStage[], execution: Execution, node: str
   if (!loop) return { execution: decide(outputs), ...(execution.decisions?.[node] ? { repeated: true } : {}) };
   const count = execution.loops?.[loop.edge] ?? 0;
   if (count >= loop.max) return { execution: decide([loop.exit]), exhausted: { output: loop.exit, max: loop.max } };
-  const body = new Set(loop.body);
+  const inBody = new Set(loop.body);
+  const kept = { ...execution.decisions };
+  for (const id of inBody) delete kept[id];
+  const skipped = skippedStages(flow, kept);
+  // Stages after the loop that the earlier pass skipped (their Tasks were closed as skipped) are reachable again once the
+  // body's decisions are cleared: they get new Tasks with the body, or they would stay closed for good.
+  const before = new Set(execution.skipped ?? []);
+  const reopened = new Set(flow.map((stage) => stage.id).filter((id) => !inBody.has(id) && before.has(id) && !skipped.includes(id) && execution.bindings[id]));
+  const body = new Set([...inBody, ...reopened]);
+  const restart = flow.map((stage) => stage.id).filter((id) => body.has(id));
   const part = <T,>(record: Record<string, T> | undefined, inside: boolean) => Object.fromEntries(Object.entries(record ?? {}).filter(([id]) => body.has(id) === inside));
   const decisions = part(execution.decisions, false);
-  const pass: LoopPass = { edge: loop.edge, pass: count + 1, nodes: loop.body, bindings: part(execution.bindings, true),
-    decisions: { ...part(execution.decisions, true), [node]: outputs } };
-  const next: Execution = { ...execution, bindings: part(execution.bindings, false), decisions, skipped: skippedStages(flow, decisions),
+  const spawned: Record<string, SpawnResult[]> = part(execution.spawned, true);
+  const pass: LoopPass = { edge: loop.edge, pass: count + 1, nodes: restart, bindings: part(execution.bindings, true),
+    decisions: { ...part(execution.decisions, true), [node]: outputs }, ...(Object.keys(spawned).length ? { spawned } : {}) };
+  const spawnedKept: Record<string, SpawnResult[]> = part(execution.spawned, false);
+  const { spawned: _spawned, ...rest } = execution;
+  const next: Execution = { ...rest, ...(Object.keys(spawnedKept).length ? { spawned: spawnedKept } : {}), bindings: part(execution.bindings, false), decisions, skipped: skippedStages(flow, decisions),
     loops: { ...execution.loops, [loop.edge]: count + 1 }, history: [...(execution.history ?? []), pass] };
-  return { execution: next, loop: { edge: loop.edge, to: loop.to, restart: loop.body, pass: count + 2, max: loop.max, remaining: loop.max - count - 1 } };
+  return { execution: next, loop: { edge: loop.edge, to: loop.to, restart, pass: count + 2, max: loop.max, remaining: loop.max - count - 1 } };
 }
 /** A gate is a user decision with two outputs; every edge leaving it is the 'approve' output. */
 export const gateOutputs: BranchOutput[] = [{ id: 'approve', label: '통과' }, { id: 'reject', label: '거절' }];

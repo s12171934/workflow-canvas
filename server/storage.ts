@@ -2,9 +2,25 @@ import { mkdir, readFile, readdir, rename, stat, writeFile, unlink, utimes } fro
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { Workflow } from '../src/model.ts';
-import { effortLevels, forwardEdges, loopBody, maxLoopRounds, linkModes, maxBranchOutputs, maxSpawnItems, maxVariables, validVariableValue, variableKeyPattern, maxGroupDepth, workerModelPattern, serializableWorkflow, topologicalOrder, validTrigger, worktreeNamePattern } from '../src/model.ts';
+import { spawnsRuns, effortLevels, maxScriptTimeout, scriptParses, forwardEdges, loopBody, maxLoopRounds, linkModes, spawnAsModes, maxBranchOutputs, maxSpawnItems, maxVariables, validVariableValue, variableKeyPattern, maxGroupDepth, workerModelPattern, serializableWorkflow, topologicalOrder, validTrigger, worktreeNamePattern, validTags, maxTags, maxTagLength } from '../src/model.ts';
 
 export function validId(id: string): boolean { return /^[a-zA-Z0-9_-]{1,128}$/.test(id); }
+
+/** Loop passes an execution may keep: every loop edge can run up to maxLoopRounds passes. */
+const maxHistoryPasses = 1000;
+/** Spawn link results, per link node: what an execution (or one finished loop pass of it) requested. */
+function validSpawned(spawned: unknown, ids: Set<string>): boolean {
+  return !!spawned && typeof spawned === 'object' && !Array.isArray(spawned)
+    && Object.entries(spawned as Record<string, unknown>).every(([nodeId, results]) => ids.has(nodeId) && Array.isArray(results) && results.length <= maxSpawnItems * 10
+      && results.every((result) => !!result && typeof result.item === 'string' && worktreeNamePattern.test(result.item) && typeof result.at === 'string'
+        && result.at.length <= 40 && typeof result.workflowId === 'string' && validId(result.workflowId)
+        && (result.launch === undefined || (typeof result.launch === 'string' && /^[a-zA-Z0-9_-]{1,200}$/.test(result.launch)))
+        && (result.error === undefined || (typeof result.error === 'string' && result.error.length <= 500))
+        && (result.brief === undefined || validPath(result.brief, false)) && (result.worktree === undefined || validPath(result.worktree, false))));
+}
+function validRegex(pattern: string): boolean {
+  try { new RegExp(pattern); return true; } catch { return false; }
+}
 
 /** Absolute path without control characters; empty allowed when `allowEmpty`. */
 function validPath(value: unknown, allowEmpty: boolean): boolean {
@@ -18,6 +34,7 @@ export function validateWorkflow(value: unknown): Workflow {
     || typeof graph.description !== 'string' || graph.description.length > 10000 || typeof graph.runId !== 'string'
     || (graph.runId !== '' && !validId(graph.runId)) || !Array.isArray(graph.nodes) || !Array.isArray(graph.edges)
     || graph.nodes.length > 500 || graph.edges.length > 2000) throw new Error('워크플로 형식 또는 크기가 올바르지 않습니다.');
+  if (graph.tags !== undefined && !validTags(graph.tags)) throw new Error(`태그는 ${maxTags}개까지, 겹치지 않게 ${maxTagLength}자 이하로 적으세요.`);
   const ids = new Set<string>();
   const groups = new Set<string>();
   // v1 documents used 'task' for agent work; it is now a worker node.
@@ -29,10 +46,11 @@ export function validateWorkflow(value: unknown): Workflow {
       || !Number.isFinite(node.position.x) || !Number.isFinite(node.position.y)
       || !node.data || typeof node.data.label !== 'string' || node.data.label.length > 500
       || typeof node.data.description !== 'string' || node.data.description.length > 20000
-      || !['worker', 'gate', 'branch', 'note', 'workflow', 'group', 'frame'].includes(node.data.kind)
+      || !['worker', 'gate', 'branch', 'script', 'note', 'workflow', 'group', 'frame'].includes(node.data.kind)
       || (node.data.workerModel !== undefined && (typeof node.data.workerModel !== 'string' || !workerModelPattern.test(node.data.workerModel)))
       || (node.data.effort !== undefined && !(effortLevels as readonly string[]).includes(node.data.effort))
       || (node.data.linkMode !== undefined && (node.data.kind !== 'workflow' || !(linkModes as string[]).includes(node.data.linkMode)))
+      || (node.data.spawnAs !== undefined && (node.data.kind !== 'workflow' || !(spawnAsModes as string[]).includes(node.data.spawnAs)))
       || (node.data.asker !== undefined && (node.data.kind !== 'gate' || !['coordinator', 'previous', 'auto'].includes(node.data.asker)))
       || (node.data.taskId !== undefined && node.data.taskId !== '' && (typeof node.data.taskId !== 'string' || !validId(node.data.taskId)))
       || (node.data.workflowId !== undefined && node.data.workflowId !== '' && (typeof node.data.workflowId !== 'string' || !validId(node.data.workflowId)))) {
@@ -63,6 +81,16 @@ export function validateWorkflow(value: unknown): Workflow {
       throw new Error('메모 그룹의 크기가 올바르지 않습니다.');
     }
     if (node.data.join !== undefined && !['all', 'any'].includes(node.data.join)) throw new Error('합류 방식은 all 또는 any 여야 합니다.');
+    const scriptFields = ['command', 'parse', 'itemPattern', 'detach', 'timeoutSec'] as const;
+    if (node.data.kind !== 'script' ? scriptFields.some((key) => node.data[key] !== undefined)
+      : (node.data.command !== undefined && (typeof node.data.command !== 'string' || node.data.command.length > 20000 || /\u0000/.test(node.data.command)))
+        || (node.data.parse !== undefined && !(scriptParses as string[]).includes(node.data.parse))
+        || (node.data.itemPattern !== undefined && (typeof node.data.itemPattern !== 'string' || node.data.itemPattern.length > 500
+          || node.data.parse !== 'regex' || !validRegex(node.data.itemPattern)))
+        || (node.data.detach !== undefined && typeof node.data.detach !== 'boolean')
+        || (node.data.timeoutSec !== undefined && !(Number.isInteger(node.data.timeoutSec) && node.data.timeoutSec > 0 && node.data.timeoutSec <= maxScriptTimeout))) {
+      throw new Error('스크립트 드라이버 노드의 명령·출력 해석·정규식·제한 시간이 올바르지 않습니다.');
+    }
     if (node.data.kind === 'branch') {
       const outputs = node.data.outputs;
       const outputIds = new Set<string>();
@@ -78,8 +106,8 @@ export function validateWorkflow(value: unknown): Workflow {
     if (group) groups.add(node.id);
   }
   if (graph.coordinatorGroup !== undefined && (typeof graph.coordinatorGroup !== 'string'
-    || !graph.nodes.some((node) => node.id === graph.coordinatorGroup && node.data.kind === 'group' && node.data.scope === 'worktree'))) {
-    throw new Error('코디네이터 위치는 이 워크플로의 워크트리 그룹이어야 합니다.');
+    || !graph.nodes.some((node) => node.id === graph.coordinatorGroup && node.data.kind === 'group' && (node.data.scope === 'worktree' || node.data.scope === 'project')))) {
+    throw new Error('코디네이터 위치는 이 워크플로의 프로젝트 그룹이나 워크트리 그룹이어야 합니다.');
   }
   // The naming stage must be a real, executable stage of this workflow.
   if (graph.nodes.some((node) => node.data.kind === 'group' && node.data.nameFrom
@@ -134,8 +162,10 @@ export function validateWorkflow(value: unknown): Workflow {
     }
     const body = loopBody(graph.edges, edge);
     if (!body.includes(edge.source)) throw new Error(`${where}은 분기보다 앞에 있는(분기로 이어지는) 단계로만 돌아갈 수 있습니다.`);
-    const link = body.map((id) => byId.get(id)!).find((node) => node.data.kind === 'workflow');
-    if (link) throw new Error(`${where}이 반복하는 구간에 워크플로 링크 '${name(link.id)}' 를 둘 수 없습니다.`);
+    // A spawn link starts separate executions and keeps no Tasks in this one; each pass archives what it requested and
+    // asks again. A link that expands its graph here (wait·start) would have to re-run another workflow's Tasks.
+    const link = body.map((id) => byId.get(id)!).find((node) => node.data.kind === 'workflow' && !spawnsRuns(node));
+    if (link) throw new Error(`${where}이 반복하는 구간에 워크플로 링크 '${name(link.id)}' 를 둘 수 없습니다. 「항목마다 따로 실행」 링크만 둘 수 있습니다.`);
   }
   if (graph.cleanup !== undefined && (!graph.cleanup || typeof graph.cleanup !== 'object'
     || (['coordinator', 'worktrees', 'sessions'] as const).some((key) => typeof graph.cleanup![key] !== 'boolean'))) {
@@ -199,20 +229,16 @@ export function validateWorkflow(value: unknown): Workflow {
         || !validInputs(execution.inputs)
         || (execution.loops !== undefined && (!execution.loops || typeof execution.loops !== 'object' || Array.isArray(execution.loops)
           || Object.entries(execution.loops).some(([edgeId, count]) => !validId(edgeId) || !Number.isInteger(count) || count < 0 || count > maxLoopRounds)))
-        || (execution.history !== undefined && (!Array.isArray(execution.history) || execution.history.length > 200
+        || (execution.history !== undefined && (!Array.isArray(execution.history) || execution.history.length > maxHistoryPasses
           || execution.history.some((pass) => !pass || !validId(pass.edge) || !Number.isInteger(pass.pass) || !Array.isArray(pass.nodes)
             || pass.nodes.some((id) => typeof id !== 'string' || !validId(id)) || !pass.bindings || typeof pass.bindings !== 'object'
             || Object.entries(pass.bindings).some(([nodeId, taskId]) => !validId(nodeId) || typeof taskId !== 'string' || !validId(taskId))
             || (pass.decisions !== undefined && (!pass.decisions || typeof pass.decisions !== 'object'
-              || Object.entries(pass.decisions).some(([path, outputs]) => !/^[a-zA-Z0-9_.-]{1,400}$/.test(path) || !Array.isArray(outputs) || outputs.some((output) => typeof output !== 'string' || !validId(output))))))))
+              || Object.entries(pass.decisions).some(([path, outputs]) => !/^[a-zA-Z0-9_.-]{1,400}$/.test(path) || !Array.isArray(outputs) || outputs.some((output) => typeof output !== 'string' || !validId(output)))))
+            || (pass.spawned !== undefined && !validSpawned(pass.spawned, ids)))))
         || (execution.values !== undefined && (!execution.values || typeof execution.values !== 'object' || Array.isArray(execution.values)
           || Object.entries(execution.values).some(([key, value]) => !variableKeyPattern.test(key) || !validVariableValue(value))))
-        || (execution.spawned !== undefined && (!execution.spawned || typeof execution.spawned !== 'object' || Array.isArray(execution.spawned)
-          || Object.entries(execution.spawned).some(([nodeId, results]) => !ids.has(nodeId) || !Array.isArray(results) || results.length > maxSpawnItems * 10
-            || results.some((result) => !result || typeof result.item !== 'string' || !worktreeNamePattern.test(result.item) || typeof result.at !== 'string'
-              || result.at.length > 40 || typeof result.workflowId !== 'string' || !validId(result.workflowId)
-              || (result.launch !== undefined && (typeof result.launch !== 'string' || !/^[a-zA-Z0-9_-]{1,200}$/.test(result.launch)))
-              || (result.error !== undefined && (typeof result.error !== 'string' || result.error.length > 500))))))) {
+        || (execution.spawned !== undefined && !validSpawned(execution.spawned, ids))) {
         throw new Error('실행 ID·이름·Task 연결이 올바르지 않습니다.');
       }
       executionIds.add(execution.id);
@@ -230,12 +256,12 @@ export function createStorage(directory: string) {
         try {
           const path = join(directory, file);
           const graph = validateWorkflow(JSON.parse(await readFile(path, 'utf8')));
-          return { id: graph.id, name: graph.name, modified: (await stat(path)).mtimeMs };
+          return { id: graph.id, name: graph.name, ...(graph.tags?.length ? { tags: graph.tags } : {}), modified: (await stat(path)).mtimeMs };
         } catch { return null; }
       }));
       // Most recently saved first, so the canvas opens the document the user worked on last.
       return items.filter((item) => item !== null).sort((a, b) => b.modified - a.modified)
-        .map(({ id, name }) => ({ id, name }));
+        .map(({ modified: _modified, ...item }) => item);
     },
     async load(id: string) {
       if (!validId(id)) throw new Error('올바르지 않은 워크플로 ID입니다.');

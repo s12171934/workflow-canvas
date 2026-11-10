@@ -1,30 +1,32 @@
 import { createContext, type CSSProperties, type RefObject, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ReactFlow, ReactFlowProvider, Background, Controls, MiniMap, Handle, Position, NodeResizer,
-  addEdge, useNodesState, useEdgesState, useReactFlow, useStore, MarkerType,
-  type Connection, type NodeChange, type MiniMapNodeProps, type NodeProps, type Edge,
+  addEdge, useNodesState, useEdgesState, useReactFlow, useStore, MarkerType, BaseEdge,
+  type Connection, type EdgeProps, type ReactFlowState, type NodeChange, type MiniMapNodeProps, type NodeProps, type Edge,
 } from '@xyflow/react';
 import {
   Activity, ArrowDownToLine, History, ArrowUpFromLine, Bot, Check, ChevronRight, Circle,
-  CircleHelp, Clock3, ExternalLink, FileJson2, FolderGit2, GitBranch, Group, Hand, Layers3, LayoutDashboard, Link2,
+  CircleHelp, ChevronDown, Clock3, Tag, ExternalLink, FileJson2, FolderGit2, GitBranch, Group, Hand, Layers3, LayoutDashboard, Link2,
   Eye, Gauge, LoaderCircle, LocateFixed, Lock, Menu, Move, PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen, MousePointer2, Network, Play, Plus, Save, Settings2, SkipForward, Sparkles, Split, SquareDashed, StickyNote,
-  Trash2, Unplug, Workflow as WorkflowIcon, X, XCircle, Zap,
+  SquareTerminal, Trash2, Undo2, Unplug, Waypoints, Workflow as WorkflowIcon, X, XCircle, Zap,
 } from 'lucide-react';
 import {
   aggregateStatus, executionFinished, executionRun, executionStatuses as computeExecutionStatuses, mergeSnapshots, workflowRuns, openableStatuses, fromSnapshot, newWorkflow, projectNodes, serializableWorkflow, statusLabels,
-  asksAtRun, defaultWorkerModel, effortLevels, frameContents, isFrame, launchesWorker, workerModels, type Effort, type Rect, joinNames, pendingDecisions, gateAskerNames, type GateAsker, linkModeNames, maxSpawnItems, type LinkMode, variableKeyPattern, variableRefs, maxVariables, maxVariableValue, type WorkflowVariable, loopBody, maxLoopRounds, type WorkflowEdge, type FlowStage, type PendingDecision, branchJudgeNames, branchModeNames, isBranch, maxBranchOutputs, type BranchJudge, type BranchMode, type BranchOutput, defaultCleanup, triggerNames, worktreeNamePattern, type AutomationConfig, type AutomationState, type Cleanup, canNest, maxGroupDepth, nameSourceNames, safeWorktreeName, type NameSource, createsWorktree, groupOf, membershipOf, orderNodes, worktreeRepo, isExecutable, isGroup, kindNames, normalizeNodes, scopeNames,
+  asksAtRun, scriptParseNames, maxScriptTimeout, type ScriptParse, defaultWorkerModel, effortLevels, frameContents, isFrame, launchesWorker, workerModels, type Effort, type Rect, joinNames, pendingDecisions, gateAskerNames, type GateAsker, linkModeNames, maxSpawnItems, type LinkMode, spawnAsNames, type SpawnAs, variableKeyPattern, variableRefs, maxVariables, maxVariableValue, type WorkflowVariable, loopBody, maxLoopRounds, type WorkflowEdge, type FlowStage, type PendingDecision, branchJudgeNames, branchModeNames, isBranch, maxBranchOutputs, type BranchJudge, type BranchMode, type BranchOutput, defaultCleanup, triggerNames, worktreeNamePattern, type AutomationConfig, type AutomationState, type Cleanup, canNest, maxGroupDepth, nameSourceNames, safeWorktreeName, type NameSource, createsWorktree, groupOf, membershipOf, orderNodes, worktreeRepo, isExecutable, isGroup, kindNames, normalizeNodes, scopeNames, cleanTag, groupByTag, maxTags, maxTagLength,
   neighbors, relationTo, type Relation, tallyStatuses, summarizeExecution,
   type Workflow, type Execution, type StageNode, type StageKind, type NodeKind, type GroupScope, type StageStatus, type RunSummary, type RunSnapshot, type Locations,
 } from './model';
 import { InstructionDialog, InstructionPreview } from './InstructionEditor';
 
 function descriptionLabel(kind: NodeKind): string {
-  return kind === 'note' ? '메모 내용' : kind === 'gate' ? '사용자에게 물을 내용' : kind === 'branch' ? '판정 지침' : kind === 'workflow' ? '추가 지침' : '작업 지침';
+  return kind === 'script' ? '메모 (코디네이터 참고)' : kind === 'note' ? '메모 내용' : kind === 'gate' ? '사용자에게 물을 내용' : kind === 'branch' ? '판정 지침' : kind === 'workflow' ? '추가 지침' : '작업 지침';
 }
 function descriptionPlaceholder(kind: NodeKind): string {
   return kind === 'note' ? '실행에 쓰이지 않는 설명입니다.' : kind === 'branch' ? '무엇을 근거로 어느 출력을 고를지 적으세요.' : kind === 'gate' ? '무엇을 확인하고 통과·거절을 정할지 적으세요.' : '목표, 작업 범위, 완료 조건을 적으세요.';
 }
 import { RunLogDialog } from './RunLog';
+import { autoLayout, estimatedSize } from './layout';
+import { midpoint, roundedPath, routeEdge } from './routing';
 
 /** Background tabs skip Orca polls: each one costs the server CLI processes. */
 const hidden = () => typeof document !== 'undefined' && document.visibilityState === 'hidden';
@@ -39,9 +41,9 @@ const statusIcons = { unbound: Unplug, pending: Clock3, running: LoaderCircle, c
 // Lets node cards open a worker's terminal and name linked workflows without threading callbacks through node data.
 const CanvasContext = createContext<{ openTask: (taskId: string) => void; workflowName: (id?: string) => string | undefined; viewOnly: boolean; summary: boolean }>({
   openTask: () => {}, workflowName: () => undefined, viewOnly: false, summary: false });
-const kindIcons: Record<NodeKind, typeof Bot> = { worker: Bot, gate: Hand, branch: Split, note: StickyNote, workflow: WorkflowIcon, group: SquareDashed, frame: Group };
+const kindIcons: Record<NodeKind, typeof Bot> = { worker: Bot, gate: Hand, branch: Split, script: SquareTerminal, note: StickyNote, workflow: WorkflowIcon, group: SquareDashed, frame: Group };
 /** Minimap marks a node by kind with the card's accent colour and icon; a corner dot carries run status. */
-const accentColors: Record<StageKind, string> = { worker: '#7fb0f5', gate: '#e3b45f', branch: '#e3b45f', workflow: '#62d0c0', note: '#b4b67e' };
+const accentColors: Record<StageKind, string> = { worker: '#7fb0f5', gate: '#e3b45f', branch: '#e3b45f', script: '#c3a0f0', workflow: '#62d0c0', note: '#b4b67e' };
 const scopeColors: Record<GroupScope, string> = { project: '#8cc97a', worktree: '#b996f2' };
 const statusDotColors: Partial<Record<StageStatus, string>> = { running: '#76d8bc', completed: '#478473', blocked: '#f5c46b', failed: '#ef6b6b' };
 function MiniMapNode({ id, x, y, width, height, borderRadius, selected, onClick }: MiniMapNodeProps) {
@@ -61,14 +63,16 @@ function MiniMapNode({ id, x, y, width, height, borderRadius, selected, onClick 
     {dot && <circle cx={x + width - height * 0.18} cy={y + height * 0.18} r={height * 0.12} fill={dot} />}
   </g>;
 }
-function StageCard({ data, selected }: NodeProps<StageNode>) {
+function StageCard({ data, selected, width }: NodeProps<StageNode>) {
   const status = data.status ?? 'unbound';
   const StatusIcon = statusIcons[status];
-  const { openTask, workflowName, summary } = useContext(CanvasContext);
+  const { openTask, workflowName, summary, viewOnly } = useContext(CanvasContext);
   const openable = !!data.activeTaskId && openableStatuses.includes(status);
   const KindIcon = kindIcons[data.kind] ?? Bot;
   const relation = data.relation ? `rel-${data.relation}` : '';
-  if (data.kind === 'note') return <article className={`stage-card note ${summary ? 'summary-note' : ''} ${relation} ${selected ? 'selected' : ''}`} aria-label={`메모, ${data.label}`}>
+  // A note can be resized; once it has a size of its own the card fills it and shows as much of the text as fits.
+  if (data.kind === 'note') return <article className={`stage-card note ${width ? 'sized' : ''} ${summary ? 'summary-note' : ''} ${relation} ${selected ? 'selected' : ''}`} aria-label={`메모, ${data.label}`}>
+    <NodeResizer isVisible={selected && !viewOnly} minWidth={200} minHeight={110} color={accentColors.note} handleClassName="group-resize-handle" />
     <Handle type="target" position={Position.Left} />
     <div className="stage-kind"><KindIcon size={14} /><span>{kindNames.note}</span><RelationBadge relation={data.relation} /><span className="note-badge">실행 안 함</span></div>
     <h3>{data.label || '메모'}</h3>
@@ -86,6 +90,7 @@ function StageCard({ data, selected }: NodeProps<StageNode>) {
       {data.kind === 'gate' && data.asker === 'previous' && <span className="branch-meta">{gateAskerNames.previous}이 물음</span>}
       {data.kind === 'gate' && data.asker === 'auto' && <span className="branch-meta">{gateAskerNames.auto}</span>}
       {data.kind === 'branch' && <span className="branch-meta">{branchModeNames[data.mode ?? 'exclusive']} · {branchJudgeNames[data.judge ?? 'previous']}</span>}
+      {data.kind === 'script' && <span className="branch-meta">{scriptParseNames[data.parse ?? 'none']}{data.detach ? ' · 따로 터미널' : ''}</span>}
       {data.round && <span className="round-badge" title="되돌아가기로 다시 도는 회차">{data.round}회차</span>}
       <span className={`status-dot ${status}`} /></div>
     <h3>{data.label || '이름 없는 단계'}</h3>
@@ -97,6 +102,7 @@ function StageCard({ data, selected }: NodeProps<StageNode>) {
         {(index > 0 || data.membership!.project) && <ChevronRight size={11} className="member-sep" />}<span className="member-chip worktree"><GitBranch size={11} />{name}</span></span>)}</div>}
     {data.kind === 'workflow' && <div className={`link-target ${linked ? '' : 'missing'}`}><Link2 size={12} />{linked ?? (data.workflowId ? '찾을 수 없는 워크플로' : '연결할 워크플로를 고르세요')}
       {data.linkMode && data.linkMode !== 'wait' && <span className="link-mode">{linkModeNames[data.linkMode]}</span>}</div>}
+    {data.kind === 'script' && <pre className={`script-command ${data.command?.trim() ? '' : 'missing'}`} title={data.command}>{data.command?.trim() || '실행할 명령을 적으세요'}</pre>}
     {data.spawned && <div className="spawn-chips" aria-label="따로 실행한 항목">{data.spawned.map((result, index) =>
       <span key={index} className={`spawn-chip ${result.error ? 'failed' : ''}`} title={result.error ?? `${result.at} 요청`}>{result.item}</span>)}</div>}
     <p>{data.description || (data.kind === 'branch' ? '무엇을 근거로 어느 출력을 고를지 적으세요.' : '단계를 선택해 내용을 작성하세요.')}</p>
@@ -184,6 +190,28 @@ function FrameCard({ data, selected }: NodeProps<StageNode>) {
   </section>;
 }
 const nodeTypes = { stage: StageCard, group: GroupCard, frame: FrameCard };
+
+/** The cards an edge must stay off: every shown stage and note (groups and memo groups are containers, not obstacles). */
+function cardRects(state: ReactFlowState): Rect[] {
+  const rects: Rect[] = [];
+  for (const node of state.nodeLookup.values()) {
+    if (node.type !== 'stage' || node.hidden) continue;
+    const width = node.measured?.width ?? node.width, height = node.measured?.height ?? node.height;
+    if (!width || !height) continue;
+    rects.push({ x: node.internals.positionAbsolute.x, y: node.internals.positionAbsolute.y, width, height });
+  }
+  return rects;
+}
+const sameRects = (a: Rect[], b: Rect[]) => a.length === b.length && a.every((rect, index) => rect.x === b[index].x && rect.y === b[index].y && rect.width === b[index].width && rect.height === b[index].height);
+/** An orthogonal edge that steers around the cards between its ends. */
+function RoutedEdge({ sourceX, sourceY, targetX, targetY, markerStart, markerEnd, style, label, labelStyle, labelShowBg, labelBgStyle, labelBgPadding, labelBgBorderRadius, interactionWidth }: EdgeProps) {
+  const cards = useStore(cardRects, sameRects);
+  const points = useMemo(() => routeEdge({ x: sourceX, y: sourceY }, { x: targetX, y: targetY }, cards), [sourceX, sourceY, targetX, targetY, cards]);
+  const middle = midpoint(points);
+  return <BaseEdge path={roundedPath(points)} markerStart={markerStart} markerEnd={markerEnd} style={style} interactionWidth={interactionWidth}
+    label={label} labelX={middle.x} labelY={middle.y} labelStyle={labelStyle} labelShowBg={labelShowBg} labelBgStyle={labelBgStyle} labelBgPadding={labelBgPadding} labelBgBorderRadius={labelBgBorderRadius} />;
+}
+const edgeTypes = { routed: RoutedEdge };
 /** Last two path segments, enough to tell sibling projects and worktrees apart. */
 function shortPath(path: string) { const parts = path.split('/').filter(Boolean); return parts.length > 2 ? `…/${parts.slice(-2).join('/')}` : path; }
 
@@ -208,10 +236,35 @@ function storedPanels(): Panels {
 const viewOnlyKey = 'workflow-canvas:view-only';
 /** 요약 보기: cards show only title, status and per-status execution counts, with an execution overview panel. Remembered per browser. */
 const summaryKey = 'workflow-canvas:summary';
+type SavedItem = { id: string; name: string; tags?: string[] };
+const collapsedTagsKey = 'workflow-canvas:collapsed-tags';
+function storedCollapsedTags(): string[] { try { const value = JSON.parse(localStorage.getItem(collapsedTagsKey) ?? '[]'); return Array.isArray(value) ? value.filter((item) => typeof item === 'string') : []; } catch { return []; } }
 function storedSummary(): boolean { try { return localStorage.getItem(summaryKey) === '1'; } catch { return false; } }
 function storedViewOnly(): boolean { try { return localStorage.getItem(viewOnlyKey) === '1'; } catch { return false; } }
 function lastProject(): string | null { try { return localStorage.getItem(lastProjectKey); } catch { return null; } }
 /** The workflow's settings (like environment variables): asked in the run dialog, fixed per automation, used as {{key}}. */
+/** The workflow's tags as removable chips plus an input; Enter or a comma adds what was typed, Backspace on an empty input drops the last. */
+function TagsEditor({ tags, suggestions, onChange }: { tags: string[]; suggestions: string[]; onChange: (tags: string[]) => void }) {
+  const [draft, setDraft] = useState('');
+  const add = (value: string) => {
+    const tag = cleanTag(value);
+    if (tag && !tags.includes(tag) && tags.length < maxTags) onChange([...tags, tag]);
+    setDraft('');
+  };
+  const options = suggestions.filter((item) => !tags.includes(item));
+  return <><label className="field-label" htmlFor="workflow-tags">태그</label>
+    <div className="tag-editor">{tags.map((tag) => <span key={tag} className="tag-chip"><Tag size={11} />{tag}
+      <button type="button" aria-label={`태그 ${tag} 빼기`} title="태그 빼기" onClick={() => onChange(tags.filter((item) => item !== tag))}><X size={11} /></button></span>)}
+      {tags.length < maxTags && <input id="workflow-tags" list="workflow-tag-options" value={draft} maxLength={maxTagLength} placeholder={tags.length ? '' : '예: QA, 티켓'}
+        onChange={(event) => { const value = event.target.value; if (value.endsWith(',')) add(value.slice(0, -1)); else setDraft(value); }}
+        onKeyDown={(event) => {
+          if (event.key === 'Enter' && !event.nativeEvent.isComposing) { event.preventDefault(); add(draft); }
+          else if (event.key === 'Backspace' && !draft && tags.length) onChange(tags.slice(0, -1));
+        }} onBlur={() => { if (draft.trim()) add(draft); }} />}
+      <datalist id="workflow-tag-options">{options.map((item) => <option key={item} value={item} />)}</datalist></div>
+    <p className="field-help">사이드바 워크플로 목록을 태그별로 묶습니다. 저장해야 반영되며, 태그가 여러 개면 각 묶음에 모두 보입니다.</p></>;
+}
+
 function VariablesEditor({ variables, nodes, onChange }: { variables: WorkflowVariable[]; nodes: StageNode[]; onChange: (variables: WorkflowVariable[]) => void }) {
   const used = new Set([...nodes.filter(isExecutable).flatMap((node) => variableRefs(node.data.description)),
     ...nodes.filter(isGroup).flatMap((node) => variableRefs(node.data.parentPath ?? ''))]);
@@ -312,8 +365,16 @@ function Workspace() {
   const selection = useRef<string[]>([]);
   selection.current = multiIds.length ? multiIds : selectedId ? [selectedId] : [];
   const [runs, setRuns] = useState<RunSummary[]>([]);
-  const [saved, setSaved] = useState<{ id: string; name: string }[]>([]);
+  const [saved, setSaved] = useState<SavedItem[]>([]);
   const [locations, setLocations] = useState<Locations>({ projects: [], worktrees: [] });
+  // Newest model of each family, fetched by the server from the Anthropic Models API; the built-in list until it answers.
+  const [models, setModels] = useState<readonly string[]>(workerModels);
+  useEffect(() => {
+    const controller = new AbortController();
+    api<{ models: string[] }>('/api/models', { signal: controller.signal })
+      .then((list) => { if (list.models.length) setModels(list.models); }).catch(() => {});
+    return () => controller.abort();
+  }, []);
   const [snapshot, setSnapshot] = useState<RunSnapshot | null>(null);
   // Runs of executions started by other 실행 requests (one per ticket, say); the selected Run is `snapshot`.
   const [otherSnapshots, setOtherSnapshots] = useState<Record<string, RunSnapshot>>({});
@@ -365,6 +426,11 @@ function Workspace() {
   // User decisions (gates, user-judged branches) open now: answered here so the coordinator never has to stop and ask.
   const [flow, setFlow] = useState<FlowStage[]>([]);
   const isSaved = saved.some((item) => item.id === workflow.id);
+  // The open workflow shows its unsaved name and tags; the others show what is on disk.
+  const sidebarSections = useMemo(() => groupByTag(saved.map((item) => item.id === workflow.id ? { ...item, name: workflow.name, tags: workflow.tags } : item)), [saved, workflow.id, workflow.name, workflow.tags]);
+  const tagNames = useMemo(() => [...new Set(saved.flatMap((item) => item.tags ?? []))].sort((a, b) => a.localeCompare(b, 'ko')), [saved]);
+  const [collapsedTags, setCollapsedTags] = useState<string[]>(storedCollapsedTags);
+  useEffect(() => { try { localStorage.setItem(collapsedTagsKey, JSON.stringify(collapsedTags)); } catch { /* per-browser convenience only */ } }, [collapsedTags]);
   useEffect(() => {
     if (!isSaved || !executions.length) { setFlow([]); return; }
     let cancelled = false;
@@ -427,13 +493,13 @@ function Workspace() {
     if (edge.loop) {
       // A loop goes back: violet, dashed, labelled with its output and limit.
       const loopStroke = dead ? '#4a4258' : '#b996f2';
-      return { ...edge, selected: edge.id === selectedEdgeId, type: 'smoothstep', label: `↺ ${edge.label || output?.label || edge.sourceHandle} · 최대 ${edge.loop.max}회`,
+      return { ...edge, selected: edge.id === selectedEdgeId, type: 'routed', label: `↺ ${edge.label || output?.label || edge.sourceHandle} · 최대 ${edge.loop.max}회`,
         labelStyle: { fill: dead ? '#6b7680' : '#d9c7fb', fontSize: 10 }, labelBgStyle: { fill: '#1b2128' },
         markerEnd: { type: MarkerType.ArrowClosed, color: loopStroke }, style: focus({ stroke: loopStroke, strokeWidth: taken ? 2 : 1.4, strokeDasharray: '4 3', ...(dead ? { opacity: 0.5 } : {}) }), ...zIndex,
       ...(focusStage && !touches ? { labelStyle: { fill: '#6b7680', fontSize: 10, opacity: 0.3 }, labelBgStyle: { fill: '#1b2128', opacity: 0.3 } } : {}) };
     }
     const stroke = dead ? '#3a434b' : active ? '#76d8bc' : output ? '#e3b45f' : touches ? '#93d8c0' : '#414b54';
-    return { ...edge, selected: edge.id === selectedEdgeId, animated: active, type: 'smoothstep',
+    return { ...edge, selected: edge.id === selectedEdgeId, animated: active, type: 'routed',
       label: edge.label || output?.label, ...(output ? { labelStyle: { fill: dead ? '#6b7680' : '#f0d49b', fontSize: 10 }, labelBgStyle: { fill: '#1b2128' } } : {}),
       markerEnd: { type: MarkerType.ArrowClosed, color: stroke === '#414b54' ? '#49545c' : stroke },
       style: focus({ stroke, strokeWidth: active || taken ? 2 : 1.4, ...(output && !taken ? { strokeDasharray: '6 4' } : {}), ...(dead ? { opacity: 0.5, strokeDasharray: '3 5' } : {}) }), ...zIndex,
@@ -447,6 +513,32 @@ function Workspace() {
   const liveCount = liveNodes.filter((node) => node.data.live).length;
   const liveCursor = useRef(0);
   const canvasRef = useRef<HTMLElement>(null);
+  /** Fit every node into the part of the canvas the open floating panels leave uncovered. */
+  const fitAll = useCallback((duration = 300) => {
+    const pane = document.querySelector('.react-flow')?.getBoundingClientRect();
+    const inset = { top: 0, right: 0, bottom: 0, left: 0 };
+    if (pane) {
+      const box = (selector: string) => { const el = document.querySelector<HTMLElement>(selector); return el && !el.hidden && el.offsetParent ? el.getBoundingClientRect() : null; };
+      const tools = box('.canvas-tools');
+      if (tools) inset.top = Math.max(0, tools.bottom - pane.top);
+      // On narrow screens the sidebar is a drawer over a scrim, not a panel beside the canvas.
+      const left = narrow(900) ? null : box('.sidebar');
+      if (left) inset.left = Math.max(0, left.right - pane.left);
+      const right = box('.inspector');
+      if (right) {
+        // Phone widths dock the inspector at the bottom instead of the right edge.
+        if (right.left - pane.left < pane.width * 0.2) inset.bottom = Math.max(0, pane.bottom - right.top);
+        else inset.right = Math.max(0, pane.right - right.left);
+      }
+      // Breathing room around the nodes on every side.
+      const margin = Math.round(Math.min(pane.width, pane.height) * 0.06) + 16;
+      (Object.keys(inset) as (keyof typeof inset)[]).forEach((side) => { inset[side] = Math.round(inset[side] + margin); });
+      // Never let the panels squeeze the visible area below a usable size.
+      if (inset.left + inset.right > pane.width * 0.8) { inset.left = margin; inset.right = margin; }
+      if (inset.top + inset.bottom > pane.height * 0.8) { inset.top = margin; inset.bottom = margin; }
+    }
+    void fitView({ padding: pane ? { top: `${inset.top}px`, right: `${inset.right}px`, bottom: `${inset.bottom}px`, left: `${inset.left}px` } : 0.25, duration });
+  }, [fitView]);
   /** Select a node and bring it into view without opening its terminal. */
   const focusNode = useCallback((id: string) => {
     setSelectedId(id); setSelectedEdgeId(null); setMultiIds([]);
@@ -496,7 +588,7 @@ function Workspace() {
       const results = await Promise.allSettled([
         api<{ connected: boolean; version: string }>('/api/status', { signal: controller.signal }),
         api<RunSummary[]>('/api/runs', { signal: controller.signal }),
-        api<{ id: string; name: string }[]>('/api/workflows', { signal: controller.signal }),
+        api<SavedItem[]>('/api/workflows', { signal: controller.signal }),
         api<Locations>('/api/locations', { signal: controller.signal }),
       ]);
       if (cancelled) return;
@@ -694,7 +786,7 @@ function Workspace() {
       appliedGenerations.current.add(item.id);
       if (item.status === 'failed') { setNotice(`생성 실패: ${item.error ?? '알 수 없는 오류'}`); continue; }
       if (item.kind === 'workflow' && item.workflowId) {
-        void api<{ id: string; name: string }[]>('/api/workflows').then(setSaved).catch(() => {});
+        void api<SavedItem[]>('/api/workflows').then(setSaved).catch(() => {});
         if (!dirty) void load(item.workflowId);
         else setNotice('워크플로를 만들어 저장했습니다. 지금 캔버스에 저장하지 않은 변경이 있어 열지 않았습니다. 사이드바에서 여세요.');
         continue;
@@ -715,7 +807,7 @@ function Workspace() {
     setWorkflow(graph); setNodes(graph.nodes); setEdges(graph.edges); setView('all');
     setSelectedId(graph.nodes[0]?.id ?? null); setSelectedEdgeId(null); setMultiIds([]);
     setSavedFingerprint(persisted ? JSON.stringify(serializableWorkflow(graph)) : '');
-    setTimeout(() => { void fitView({ padding: 0.25, duration: 300 }); }, 80);
+    setTimeout(() => fitAll(), 80);
   }
   function confirmReplace() { return !dirty || window.confirm('저장하지 않은 변경 내용이 있습니다. 캔버스를 바꿀까요?'); }
   async function save(doc: Workflow = current): Promise<boolean> {
@@ -760,6 +852,25 @@ function Workspace() {
     setSelectedId(id); setSelectedEdgeId(null);
   }
   // Dragging memo groups carries what lay inside them when the drag started (except nodes already moving with the selection).
+  // Auto-arrange: compact left-to-right layout from the cards' measured sizes; the previous positions stay undoable
+  // until a node moves again. Summary cards are smaller than full ones, so that view lays out for the full size.
+  const [arranged, setArranged] = useState<{ before: StageNode[]; after: Map<string, string> } | null>(null);
+  const positionKey = (node: StageNode) => `${node.position.x},${node.position.y},${node.width ?? ''},${node.height ?? ''}`;
+  function arrange() {
+    const next = autoLayout(nodes, edges, (node) => summary ? estimatedSize({ ...node, measured: undefined }) : estimatedSize(node));
+    setArranged({ before: nodes, after: new Map(next.map((node) => [node.id, positionKey(node)])) });
+    setNodes(next);
+    // Group·memo-group boxes change size: fit once React Flow has measured them again.
+    setTimeout(() => fitAll(), 250);
+  }
+  const canUndoArrange = !!arranged && nodes.length === arranged.after.size && nodes.every((node) => arranged.after.get(node.id) === positionKey(node));
+  function undoArrange() {
+    if (!arranged) return;
+    const before = new Map(arranged.before.map((node) => [node.id, node]));
+    setNodes((items) => items.map((node) => { const old = before.get(node.id); return old ? { ...node, position: old.position, width: old.width, height: old.height } : node; }));
+    setArranged(null);
+    setTimeout(() => fitAll(), 80);
+  }
   const frameDrag = useRef<{ id: string; start: { x: number; y: number }; items: Map<string, { x: number; y: number }> } | null>(null);
   function startDrag(grabbed: StageNode, dragged: StageNode[]) {
     frameDrag.current = null;
@@ -899,7 +1010,7 @@ function Workspace() {
     setBusy(true);
     try {
       await api(`/api/workflows/${id}`, { method: 'DELETE' });
-      const files = await api<{ id: string; name: string }[]>('/api/workflows');
+      const files = await api<SavedItem[]>('/api/workflows');
       setSaved(files);
       if (id === workflow.id) {
         const next = files[0];
@@ -1075,6 +1186,7 @@ function Workspace() {
             {!viewOnly && <><span className="tool-divider" /><span className="tool-group-label">노드</span>
             {([['worker', Bot, '워커', '에이전트 하나가 지침을 수행'], ['gate', Hand, '사용자 개입 게이트', '사용자가 통과·거절을 결정'],
               ['branch', Split, '분기', '판정 결과에 따라 출력 하나(또는 여럿)로만 진행. 일반 연결은 모두 병렬'],
+              ['script', SquareTerminal, '스크립트 드라이버', '에이전트 없이 명령을 실행하고, 출력(JSON 줄·정규식)으로 고른 항목·판정을 다음 단계에 넘김'],
               ['workflow', WorkflowIcon, '워크플로 링크', '저장된 다른 워크플로를 펼쳐 실행'], ['note', StickyNote, '메모', '실행과 무관한 설명']] as const).map(([kind, Icon, name, tip]) =>
               <button key={kind} className={`tool-button kind-${kind}`} aria-label={`${name} 추가`} onClick={() => addNode(kind)}>
                 <Icon size={17} /><span className="tool-tip" role="tooltip"><strong>{name}</strong>{tip}</span></button>)}
@@ -1086,7 +1198,9 @@ function Workspace() {
             <button className="tool-button kind-frame" aria-label="메모 그룹 추가" onClick={addFrame}>
               <Group size={17} /><span className="tool-tip" role="tooltip"><strong>메모 그룹</strong>노드를 묶어 보여 주기만 함. 옮기면 안의 노드가 함께 움직이고, 실행·작업 위치와는 무관</span></button></>}
             <span className="tool-divider" />
-            <button className="tool-button" aria-label="전체 보기" onClick={() => void fitView({ padding: 0.25, duration: 300 })}><LayoutDashboard size={17} /><span className="tool-tip" role="tooltip"><strong>전체 보기</strong>모든 노드가 보이게 맞춤</span></button></div>
+            <button className="tool-button" aria-label="전체 보기" onClick={() => fitAll()}><LayoutDashboard size={17} /><span className="tool-tip" role="tooltip"><strong>전체 보기</strong>모든 노드가 보이게 맞춤</span></button>
+            {!viewOnly && nodes.length > 1 && <button className="tool-button" aria-label="자동 정렬" onClick={arrange}><Waypoints size={17} /><span className="tool-tip" role="tooltip"><strong>자동 정렬</strong>연결 순서대로 왼쪽→오른쪽, 겹침 없이 촘촘하게 다시 배치. 그룹·메모 그룹은 안의 노드에 맞춰 크기를 줄임. 저장 전까지 되돌릴 수 있음</span></button>}
+            {!viewOnly && canUndoArrange && <button className="tool-button" aria-label="정렬 되돌리기" onClick={undoArrange}><Undo2 size={17} /><span className="tool-tip" role="tooltip"><strong>정렬 되돌리기</strong>자동 정렬 전 위치로 돌아감 (노드를 옮기면 사라짐)</span></button>}</div>
           {executions.length > 0 && <div className="execution-bar" role="toolbar" aria-label="실행 보기">
             <div className="segmented"><button className={executionView === 'all' ? 'active' : ''} onClick={() => setView('all')}>모아 보기</button>
               <button className={executionView !== 'all' ? 'active' : ''} disabled={!visibleExecutions.length} onClick={() => setView(activeExecution?.id ?? visibleExecutions[0]?.id ?? 'all')}>실행 선택</button></div>
@@ -1140,7 +1254,7 @@ function Workspace() {
               title={`${node.data.label || '이름 없는 단계'} · ${node.data.live ? `실행 중${node.data.live > 1 ? ` ×${node.data.live}` : ''}` : statusLabels.blocked} · 클릭해 이 단계로 이동`}
               onClick={() => focusNode(node.id)}><span className="status-dot" />{node.data.label || '이름 없는 단계'}{node.data.live && node.data.live > 1 ? ` ×${node.data.live}` : ''}</button>)}</div>
           </nav>}
-          <ReactFlow<StageNode> nodes={displayNodes} edges={displayEdges} nodeTypes={nodeTypes} onNodesChange={handleNodesChange} onEdgesChange={onEdgesChange} onConnect={onConnect}
+          <ReactFlow<StageNode> nodes={displayNodes} edges={displayEdges} nodeTypes={nodeTypes} edgeTypes={edgeTypes} onNodesChange={handleNodesChange} onEdgesChange={onEdgesChange} onConnect={onConnect}
             onNodeDragStart={(_event, node, dragged) => startDrag(node, dragged)} onNodeDrag={(_event, _node, dragged) => dragFrame(dragged)} onNodeDragStop={(_event, _node, dragged) => stopDrag(dragged)}
             onSelectionDragStart={(_event, dragged) => dragged[0] && startDrag(dragged[0], dragged)} onSelectionDrag={(_event, dragged) => dragFrame(dragged)} onSelectionDragStop={(_event, dragged) => stopDrag(dragged)}
             nodesDraggable={!viewOnly} nodesConnectable={!viewOnly} edgesReconnectable={!viewOnly}
@@ -1160,10 +1274,25 @@ function Workspace() {
           <div className="sidebar-head"><a className="brand" href="/" onClick={(event) => event.preventDefault()}><span className="brand-mark"><Network size={23} /></span><span>workflow<span className="brand-sub">canvas</span></span><span className="version">0.1</span></a><button className="icon-button panel-collapse" title="사이드바 접기 ([)" aria-label="사이드바 접기" onClick={() => setPanels((value) => ({ ...value, left: false }))}><PanelLeftClose size={16} /></button></div>
           <div className="workspace-label"><span className="workspace-avatar">W</span><div>로컬 워크스페이스<small>Orca orchestration</small></div><ChevronRight size={14} /></div>
           <div className="sidebar-section-title">워크플로<span>{saved.length}</span></div>
-          <button className="sidebar-item active" onClick={closeDrawer}><GitBranch size={17} /><span title={workflow.name}>{workflow.name}</span>
-            {liveCount > 0 ? <span className="sidebar-live" title={`단계 ${liveCount}개 실행 중`}><LoaderCircle size={11} className="spin" />{liveCount}</span> : <span className="tiny-dot" />}</button>
-          {saved.filter((item) => item.id !== workflow.id).map((item) => <div className="sidebar-row" key={item.id}><button className="sidebar-item" onClick={() => void load(item.id)}><FileJson2 size={16} /><span>{item.name}</span></button>
-            <button className="icon-button row-delete" title="워크플로 삭제" aria-label={`${item.name} 삭제`} onClick={() => void removeWorkflow(item.id, item.name)}><Trash2 size={14} /></button></div>)}
+          {(() => {
+            const activeRow = (key: string) => <button key={key} className="sidebar-item active" onClick={closeDrawer}><GitBranch size={17} /><span title={workflow.name}>{workflow.name}</span>
+              {liveCount > 0 ? <span className="sidebar-live" title={`단계 ${liveCount}개 실행 중`}><LoaderCircle size={11} className="spin" />{liveCount}</span> : <span className="tiny-dot" />}</button>;
+            const row = (item: SavedItem, key: string) => item.id === workflow.id ? activeRow(key) : <div className="sidebar-row" key={key}><button className="sidebar-item" onClick={() => void load(item.id)}><FileJson2 size={16} /><span title={item.name}>{item.name}</span></button>
+              <button className="icon-button row-delete" title="워크플로 삭제" aria-label={`${item.name} 삭제`} onClick={() => void removeWorkflow(item.id, item.name)}><Trash2 size={14} /></button></div>;
+            const grouped = sidebarSections.some((section) => section.tag);
+            return <>{!isSaved && activeRow('unsaved')}
+              {sidebarSections.map((section) => {
+                if (!grouped) return section.items.map((item) => row(item, item.id));
+                const collapsed = collapsedTags.includes(section.tag);
+                const hasActive = section.items.some((item) => item.id === workflow.id);
+                return <div className="tag-section" key={section.tag || '\u0000untagged'}>
+                  <button className={`tag-section-head${hasActive ? ' current' : ''}`} aria-expanded={!collapsed}
+                    onClick={() => setCollapsedTags((list) => collapsed ? list.filter((item) => item !== section.tag) : [...list, section.tag])}>
+                    {collapsed ? <ChevronRight size={13} /> : <ChevronDown size={13} />}{section.tag ? <Tag size={12} /> : null}
+                    <span>{section.tag || '태그 없음'}</span><small>{section.items.length}</small></button>
+                  {!collapsed && <div className="tag-section-body">{section.items.map((item) => row(item, `${section.tag}:${item.id}`))}</div>}</div>;
+              })}</>;
+          })()}
           <button className="sidebar-item subtle" onClick={() => { if (confirmReplace()) applyWorkflow(blankWorkflow(), false); }}><Plus size={16} /><span>새 워크플로</span></button>
           <button className="sidebar-item subtle" onClick={() => { setGenerateForm((form) => ({ ...form, project: form.project || defaultProject() })); setGenerateDialog(true); closeDrawer(); }}>
             <Sparkles size={16} /><span>자연어로 만들기</span>{generations.some((item) => item.kind === 'workflow' && item.status === 'pending') && <LoaderCircle size={13} className="spin" />}</button>
@@ -1285,7 +1414,7 @@ function Workspace() {
             {membership()}
             {related()}
             <label className="field-label" htmlFor="stage-name">단계 이름</label><input id="stage-name" value={selected.data.label} maxLength={500} onChange={(event) => updateNode({ label: event.target.value })} />
-            <label className="field-label" htmlFor="stage-kind">단계 유형</label><select id="stage-kind" value={selected.data.kind} onChange={(event) => changeKind(event.target.value as StageKind)}><option value="worker">워커</option><option value="gate">사용자 개입 게이트</option><option value="branch">분기</option><option value="workflow">워크플로 링크</option><option value="note">메모 (실행 안 함)</option></select>
+            <label className="field-label" htmlFor="stage-kind">단계 유형</label><select id="stage-kind" value={selected.data.kind} onChange={(event) => changeKind(event.target.value as StageKind)}><option value="worker">워커</option><option value="gate">사용자 개입 게이트</option><option value="branch">분기</option><option value="script">스크립트 드라이버</option><option value="workflow">워크플로 링크</option><option value="note">메모 (실행 안 함)</option></select>
             {selected.data.kind === 'workflow' && <><label className="field-label" htmlFor="stage-link">연결할 워크플로</label>
               <div className="link-row"><select id="stage-link" value={selected.data.workflowId ?? ''} onChange={(event) => updateNode({ workflowId: event.target.value || undefined, ...(event.target.value && (!selected.data.label || selected.data.label === kindNames.workflow) ? { label: workflowName(event.target.value) ?? selected.data.label } : {}) })}>
                 <option value="">선택</option>
@@ -1305,10 +1434,17 @@ function Workspace() {
                 : selected.data.linkMode === 'spawn'
                   ? `앞에 연결한 워커 하나가 worker_done 에 "items: 항목, 항목" 으로 목록을 보고하면, 항목마다 연결한 워크플로를 따로 실행합니다(한 번에 ${maxSpawnItems}개까지). 항목은 그 워크플로의 「실행 시 입력」 워크트리 이름이 되므로, 대상에는 그런 그룹이 하나 있어야 합니다. 요청이 끝나면 이 링크는 완료이고, 따로 띄운 실행은 기다리지 않습니다 — 진행 상황은 대상 워크플로에서 봅니다.`
                   : '링크 뒤 단계는 펼친 워크플로의 마지막 단계들이 끝난 뒤 시작합니다.'}</p>
-              {selected.data.linkMode === 'spawn' && <><label className="field-label">요청한 실행</label>
+              {selected.data.linkMode === 'spawn' && <><label className="field-label" htmlFor="spawn-as">항목 실행 감독</label>
+                <select id="spawn-as" value={selected.data.spawnAs ?? 'coordinator'} onChange={(event) => updateNode({ spawnAs: event.target.value === 'coordinator' ? undefined : event.target.value as SpawnAs })}>
+                  <option value="coordinator">{spawnAsNames.coordinator} — 캔버스가 따로 띄우고 기다리지 않음</option>
+                  <option value="subcoordinator">{spawnAsNames.subcoordinator} — 이 코디네이터의 워커로 띄우고 하나라도 끝나면 진행</option></select>
+                <p className="field-help">{selected.data.spawnAs === 'subcoordinator'
+                  ? '캔버스는 항목마다 실행 등록·브리프·워크트리만 준비합니다. 이 실행의 코디네이터가 링크 Task 아래 자식 Task 를 만들어 하위 코디네이터를 워커로 띄우고, 띄운 하위 중 하나가 worker_done 을 보내면 링크를 닫고 진행합니다. 분기 출력에서 바로 오면(빈 항목) 열린 하위 중 하나가 끝나기를 기다립니다.'
+                  : '항목마다 독립 코디네이터를 띄웁니다. 이 실행과 Orca 관계가 없어, 끝났는지는 대상 워크플로의 실행 로그로 봅니다.'}</p>
+                <label className="field-label">요청한 실행</label>
                 {selectedProjected?.data.spawned?.length ? <ul className="run-list">{selectedProjected.data.spawned.map((result, index) => <li key={index}>
                   <button className={`run-chip ${result.error ? 'failed' : 'completed'}`} onClick={() => void load(result.workflowId)} title="대상 워크플로 열기"><span className="status-dot" />{result.item}</button>
-                  <span>{result.error ?? '실행 요청됨'}</span></li>)}</ul>
+                  <span>{result.error ?? (result.worktree ? '하위 코디네이터 준비됨' : '실행 요청됨')}</span></li>)}</ul>
                   : <p className="field-help">실행이 항목을 요청하면 항목별 결과가 여기에 보입니다. 항목을 누르면 대상 워크플로를 엽니다.</p>}</>}</>}
             {selected.data.kind === 'gate' && <>
               <label className="field-label" htmlFor="gate-asker">묻는 곳</label>
@@ -1344,6 +1480,29 @@ function Workspace() {
                 <option value="all">{joinNames.all} — 앞 경로가 하나라도 건너뛰어지면 이 단계도 건너뜀</option>
                 <option value="any">{joinNames.any} — 분기에서 갈라진 경로가 다시 모이는 곳</option></select>
               <p className="field-help">어느 쪽이든 실제로 진행 중인 앞 단계가 모두 끝난 뒤에 시작합니다.</p></>}
+            {selected.data.kind === 'script' && <>
+              <label className="field-label" htmlFor="script-command">실행할 명령</label>
+              <textarea id="script-command" className="mono" rows={4} value={selected.data.command ?? ''} maxLength={20000} spellCheck={false}
+                placeholder={'예: ~/Obsidian/obsidian/40_Tools/checkbox-driver/bin/cbd {{project}} select --json'} onChange={(event) => updateNode({ command: event.target.value })} />
+              <p className="field-help">코디네이터가 이 단계의 작업 위치에서 그대로 실행합니다(셸 스크립트, 설정값 {'{{키}}'} 사용 가능). 종료 코드가 0 이 아니면 단계가 실패합니다.</p>
+              <label className="field-label" htmlFor="script-parse">출력 해석 (선별)</label>
+              <select id="script-parse" value={selected.data.parse ?? 'none'} onChange={(event) => updateNode({ parse: event.target.value === 'none' ? undefined : event.target.value as ScriptParse,
+                ...(event.target.value !== 'regex' ? { itemPattern: undefined } : {}) })}>
+                {(['none', 'jsonl', 'regex'] as const).map((value) => <option key={value} value={value}>{scriptParseNames[value]}</option>)}</select>
+              <p className="field-help">{selected.data.parse === 'jsonl'
+                ? '표준 출력의 줄마다 JSON 객체. {"item": "S1", "selected": true, "reason": "선행 충족"} 줄 중 selected 가 false 가 아닌 item 이 항목이 되고, 빠진 줄은 사유와 함께 실행 로그에 남습니다. {"decision": "<출력 id>"} 줄은 바로 뒤 분기·게이트의 판정입니다.'
+                : selected.data.parse === 'regex' ? '줄마다 정규식을 찾아 첫 캡처 그룹(없으면 맞은 부분)을 항목으로 씁니다.'
+                  : '항목·판정 없이 종료 코드만 봅니다. 뒤에 「항목마다 따로 실행」 링크나 직전 판정 분기를 두려면 출력 해석을 고르세요.'}</p>
+              {selected.data.parse === 'regex' && <><label className="field-label" htmlFor="script-pattern">항목 정규식</label>
+                <input id="script-pattern" className="mono" value={selected.data.itemPattern ?? ''} maxLength={500} placeholder="^기동 예정: (\S+)"
+                  onChange={(event) => updateNode({ itemPattern: event.target.value || undefined })} />
+                {(() => { try { if (selected.data.itemPattern) new RegExp(selected.data.itemPattern); return null; } catch { return <p className="field-help warning">정규식이 올바르지 않습니다.</p>; } })()}</>}
+              <label className="check-row"><input type="checkbox" checked={!!selected.data.detach} onChange={(event) => updateNode({ detach: event.target.checked || undefined })} />
+                <span>따로 터미널에서 실행<small>오래 도는 드라이버(예: 티켓 하나를 끝까지 모는 명령)는 코디네이터를 막지 않게 따로 띄우고 종료만 기다립니다.</small></span></label>
+              <label className="field-label" htmlFor="script-timeout">제한 시간 (초)</label>
+              <input id="script-timeout" type="number" min={1} max={maxScriptTimeout} value={selected.data.timeoutSec ?? ''} placeholder={selected.data.detach ? '86400' : '600'}
+                onChange={(event) => { const value = Number(event.target.value); updateNode({ timeoutSec: Number.isInteger(value) && value > 0 && value <= maxScriptTimeout ? value : undefined }); }} />
+            </>}
             <InstructionPreview label={descriptionLabel(selected.data.kind)} value={selected.data.description} placeholder={descriptionPlaceholder(selected.data.kind)} readOnly={viewOnly}
               onOpen={() => setInstructionNodeId(selected.id)} />
             {selected.data.kind !== 'note' && (() => {
@@ -1373,8 +1532,8 @@ function Workspace() {
               <label className="field-label" htmlFor="stage-model">모델</label>
               <select id="stage-model" value={selected.data.workerModel ?? ''} onChange={(event) => updateNode({ workerModel: event.target.value || undefined })}>
                 <option value="">기본값 ({defaultWorkerModel})</option>
-                {selected.data.workerModel && !(workerModels as readonly string[]).includes(selected.data.workerModel) && <option value={selected.data.workerModel}>{selected.data.workerModel}</option>}
-                {workerModels.map((model) => <option key={model} value={model}>{model}</option>)}</select>
+                {selected.data.workerModel && !models.includes(selected.data.workerModel) && <option value={selected.data.workerModel}>{selected.data.workerModel}</option>}
+                {models.map((model) => <option key={model} value={model}>{model}</option>)}</select>
               <label className="field-label" htmlFor="stage-effort">추론 수준 (effort)</label>
               <select id="stage-effort" value={selected.data.effort ?? ''} onChange={(event) => updateNode({ effort: (event.target.value || undefined) as Effort | undefined })}>
                 <option value="">기본값 (모델 기본)</option>
@@ -1426,13 +1585,14 @@ function Workspace() {
                 : <p className="field-help">일반 연결은 병렬입니다. 앞 단계가 끝나면 바로 이어지고, 한 단계에 여러 연결이 들어오면 건너뛰지 않은 앞 단계가 모두 끝날 때까지 기다립니다. 연결 설명은 참고용이며 진행 여부를 바꾸지 않습니다. 골라서 진행하려면 분기 노드를 쓰세요.</p>;
             })()}<button className="button danger" onClick={removeSelected}><Trash2 size={14} />연결 삭제</button></div>
             : <div className="inspector-content"><div className="inspector-empty compact"><Settings2 size={22} /><p>단계나 연결을 선택해 속성을 편집하세요.</p></div>
+              <TagsEditor tags={workflow.tags ?? []} suggestions={tagNames} onChange={(tags) => setWorkflow((value) => ({ ...value, tags: tags.length ? tags : undefined }))} />
               <VariablesEditor variables={workflow.variables ?? []} nodes={nodes} onChange={(variables) => setWorkflow((value) => ({ ...value, variables: variables.length ? variables : undefined }))} />
               <label className="field-label" htmlFor="coordinator-group">코디네이터 위치</label>
               <select id="coordinator-group" value={workflow.coordinatorGroup ?? ''} onChange={(event) => setWorkflow((value) => ({ ...value, coordinatorGroup: event.target.value || undefined }))}>
                 <option value="">실행 프로젝트</option>
-                {nodes.filter((node) => isGroup(node) && node.data.scope === 'worktree').map((node) => <option key={node.id} value={node.id}>워크트리 그룹 「{node.data.label}」</option>)}
+                {nodes.filter((node) => isGroup(node) && (node.data.scope === 'worktree' || node.data.scope === 'project')).map((node) => <option key={node.id} value={node.id}>{node.data.scope === 'project' ? '프로젝트' : '워크트리'} 그룹 「{node.data.label}」</option>)}
               </select>
-              <p className="field-help">워크트리 그룹을 고르면 캔버스 서버가 실행 전에 그 워크트리를 찾거나 만들고, 코디네이터를 그 안에서 띄웁니다. 이름은 직접 지정이나 실행 시 입력이어야 합니다. 자동화가 띄운 코디네이터는 실행 프로젝트에서 시작합니다.</p></div>}
+              <p className="field-help">프로젝트 그룹을 고르면 코디네이터를 그 경로에서 띄웁니다. 워크트리 그룹을 고르면 캔버스 서버가 실행 전에 그 워크트리를 찾거나 만들고, 코디네이터를 그 안에서 띄웁니다. 이름은 직접 지정이나 실행 시 입력이어야 합니다. 자동화가 띄운 코디네이터는 실행 프로젝트에서 시작합니다.</p></div>}
           </fieldset>
         </aside>
       </div>
