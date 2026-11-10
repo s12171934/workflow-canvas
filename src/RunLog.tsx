@@ -70,13 +70,14 @@ export function RunLogDialog({ workflowId, workflowName, onClose }: { workflowId
           {list === null ? <p className="field-help">불러오는 중…</p> : !list.length ? <p className="field-help">아직 실행 기록이 없습니다. 실행 버튼이나 자동화로 실행하면 여기에 남습니다.</p>
             : list.map((item) => <button key={item.id} type="button" className={`log-entry ${item.id === selected ? 'active' : ''}`} onClick={() => setSelected(item.id)}>
               <strong>{dateTime(item.startedAt)}<span className={`outcome ${item.outcome}`}>{outcomeNames[item.outcome]}</span>{item.automation && <span className="automation-tag"><Zap size={10} />{item.automation.name}</span>}</strong>
-              <small>{item.count ? `×${item.count}` : '설정 미기록'}{item.project ? ` · ${shortPath(item.project)}` : ''}</small>
+              <small>{item.title ? `${item.title} · ` : ''}{item.count ? `×${item.count}` : '설정 미기록'}{item.project ? ` · ${shortPath(item.project)}` : ''}</small>
               <small className={`log-last ${item.last ? tone(item.last) : ''}`}>{item.last ? `${runEventNames[item.last.type] ?? item.last.type} · ${item.last.type === 'task' ? `${item.last.message} ${statusLabels[item.last.status ?? 'unknown']}` : item.last.message}` : '이벤트 없음'}</small>
             </button>)}
         </nav>
         <section className="log-detail" aria-label="실행 상세">
           {!meta ? <p className="field-help">왼쪽에서 실행을 고르세요.</p> : <>
             <dl className="log-meta">
+              {meta.title && <div><dt>실행 이름</dt><dd>{meta.title}</dd></div>}
               <div><dt>시작</dt><dd>{new Date(meta.startedAt).toLocaleString('ko-KR')}</dd></div>
               <div><dt>프로젝트</dt><dd title={meta.project}>{meta.project ?? '—'}</dd></div>
               <div><dt>횟수</dt><dd>{meta.count ?? '—'}</dd></div>

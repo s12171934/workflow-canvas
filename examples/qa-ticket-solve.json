@@ -217,7 +217,7 @@
         "label": "구현",
         "description": "공통 — 먼저 같은 산출물 폴더의 준비 산출물 `<실행 번호>-prepare.txt` 를 읽어 parent·key·round·reopen·state_dir(아래 STATE)·record_file·설정 값을 확인한다. 상태 디렉터리 규칙은 `~/.claude/skills/qa-ticket-driver/exports/state-contract.md` 가, 단계별 세부 절차는 `~/.claude/skills/qa-ticket-driver/references/brief-coordinator.md` 가 정본이다(@@KEY@@ 등 자리는 준비 산출물 값, @@STATE_DIR@@ 은 STATE, @@RECORD_DIR@@ 은 record_file 의 폴더). 다른 티켓의 신호·기록은 건드리지 않는다. 임시 파일은 STATE/scratch/<KEY>/ 에 둔다.\n\n기록 파일의 「수정 계획」대로 구현한다(brief-coordinator.md 3단계를 이 워커가 직접 한다).\n2회차 이상(검토 「보완 필요」나 실측 「실패」로 되돌아온 경우)이면 새로 구현하지 않는다: 각 STATE/handoffs/<KEY>-<이름>.md 의 마지막 `## 보완` 절과 STATE/done/<KEY>-screen.md 의 실패 시나리오만 고치고, push 전이므로 인계 브리프가 정한 커밋을 amend 한 뒤 done/<KEY>-<이름>.md 를 갱신한다. 브랜치는 이어 쓴다.\n1. 고칠 서브모듈마다 베이스(기능 맥락 우선, 없으면 하네스)에서 `<KEY>-<영문-슬러그>` 브랜치를 만든다. 재회차면 기존 브랜치를 이어 쓴다.\n2. 서브모듈마다 STATE/handoffs/<KEY>-<이름>.md 인계 브리프를 남긴다(3단계 2의 항목) — 대시보드가 구현 단계를 이걸로 판정한다.\n3. 의존 저장소부터 한 서브모듈씩 `~/.claude/skills/qa-ticket-driver/references/worker-duties.md` 의 의무대로 수정·검증(red 확인)·로컬 커밋하고 STATE/done/<KEY>-<이름>.md 를 쓴다. 소비처의 핀은 의존 저장소 커밋을 가리킨다.\n4. Jira 착수 전이는 첫 커밋 전에 ticket_skills 규칙대로 한다. push·PR·그 밖의 Jira 쓰기는 하지 않는다.\n막혀 커밋하지 못한 서브모듈은 done 대신 STATE/blocked/<KEY>-<이름>.md 를 쓰고 산출물에 사유를 남긴다.",
         "kind": "worker",
-        "effort": "high",
+        "effort": "xhigh",
         "join": "any"
       }
     },
@@ -233,7 +233,7 @@
         "label": "검토",
         "description": "공통 — 먼저 같은 산출물 폴더의 준비 산출물 `<실행 번호>-prepare.txt` 를 읽어 parent·key·round·reopen·state_dir(아래 STATE)·record_file·설정 값을 확인한다. 상태 디렉터리 규칙은 `~/.claude/skills/qa-ticket-driver/exports/state-contract.md` 가, 단계별 세부 절차는 `~/.claude/skills/qa-ticket-driver/references/brief-coordinator.md` 가 정본이다(@@KEY@@ 등 자리는 준비 산출물 값, @@STATE_DIR@@ 은 STATE, @@RECORD_DIR@@ 은 record_file 의 폴더). 다른 티켓의 신호·기록은 건드리지 않는다. 임시 파일은 STATE/scratch/<KEY>/ 에 둔다.\n\n구현 결과를 검토한다. 코드를 고치지 않는다(읽기·검증 실행만).\n1. 브랜치 diff 를 기록의 수정 계획과 대조한다 — 계획 밖 변경, 빠진 사이드이펙트 처리, blocked 된 서브모듈.\n2. 검증 명령을 직접 다시 돌린다. red 확인 기록(수정 전 실패 메시지)이 없으면 통과가 아니다.\n3. 화면 판정: 수정이 사용자 화면의 동작·표시를 바꾸면, 실측 인계 브리프 STATE/handoffs/<KEY>-screen.md 를 brief-coordinator.md 4단계 4 의 항목(대상 화면과 경로, 브랜치·핀, 계정, 시나리오 — 재현 경로 먼저·경계 사례, 단계별 입력값·기대값·입력 방식, 누르면 안 되는 버튼, 녹화별 시작 URL)으로 쓴다. 해당 없으면 이유를 산출물에 한 줄로 쓴다.\n4. 부족하면 고칠 것을 해당 handoffs/<KEY>-<이름>.md 끝에 `## 보완 (<회차>회차 검토)` 절로 적는다 — 구현 단계가 다음 회차에 그것만 고친다. 2회차 이상이면 앞 회차 보완이 반영됐는지부터 확인한다.\n\n판정 — screen: 통과, 화면 실측 필요 / no-screen: 통과, 실측 해당 없음 / fix: 보완하면 통과할 수 있다(구현으로 되돌아간다, 최대 3회) / stop: 보완으로 해결할 수 없다 — 사유를 STATE/blocked/<KEY>.md 에 쓴다",
         "kind": "worker",
-        "effort": "high"
+        "effort": "xhigh"
       }
     },
     {
@@ -282,7 +282,7 @@
         "label": "화면 실측",
         "description": "공통 — 먼저 같은 산출물 폴더의 준비 산출물 `<실행 번호>-prepare.txt` 를 읽어 parent·key·round·reopen·state_dir(아래 STATE)·record_file·설정 값을 확인한다. 상태 디렉터리 규칙은 `~/.claude/skills/qa-ticket-driver/exports/state-contract.md` 가, 단계별 세부 절차는 `~/.claude/skills/qa-ticket-driver/references/brief-coordinator.md` 가 정본이다(@@KEY@@ 등 자리는 준비 산출물 값, @@STATE_DIR@@ 은 STATE, @@RECORD_DIR@@ 은 record_file 의 폴더). 다른 티켓의 신호·기록은 건드리지 않는다. 임시 파일은 STATE/scratch/<KEY>/ 에 둔다.\n\n검토를 통과한 브랜치를 실제 화면에서 잰다. 코드·브랜치·커밋은 건드리지 않는다. 인계 브리프 STATE/handoffs/<KEY>-screen.md 를 읽고 `~/.claude/skills/qa-ticket-driver/references/screen-duties.md` 의 의무와 screen_skills 의 방법을 따른다(값을 재고, 녹화마다 탭을 따로 쓰고, 저장·제출하지 않는다). 결과는 STATE/done/<KEY>-screen.md, 재지 못했으면 STATE/blocked/<KEY>-screen.md. 띄운 서버·탭은 닫고, 못 닫은 것은 「남은 것」에 적는다.\n\n판정 — pass: 모든 시나리오가 기대값과 일치 / fail: 실패 시나리오가 있다 — 코드 보완이 필요하다(구현으로 되돌아간다, 최대 3회) / stop: 환경을 띄우지 못하거나 대상 화면에 닿지 못해 재지 못했다",
         "kind": "worker",
-        "effort": "medium",
+        "effort": "high",
         "join": "any"
       }
     },

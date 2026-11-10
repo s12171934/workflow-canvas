@@ -71,6 +71,30 @@ export type Effort = typeof effortLevels[number];
 export const workerModelPattern = /^[A-Za-z0-9][A-Za-z0-9._:\[\]-]{0,99}$/;
 /** Nodes for which the coordinator starts a worker: workers, and branches judged by a worker of their own. */
 export const launchesWorker = (node: Pick<StageNode, 'data'>) => node.data.kind === 'worker' || (node.data.kind === 'branch' && node.data.judge === 'worker');
+/**
+ * A worker node that fans out: one worker per model, all at once on the same instructions (a review round by N reviewers).
+ * `models` is the list kept on the canvas; `variable` names a run setting whose comma-separated value, when given, replaces it.
+ */
+export type ModelFanout = { models: string[]; variable?: string };
+export const fansOut = (node: Pick<StageNode, 'data'>) => node.data.kind === 'worker' && !!node.data.fanout;
+/** The Orca agent (`worker-start --agent`) that runs a model: GPT·Codex models run in Codex, the rest in Claude Code. */
+export function agentOf(model: string): 'claude' | 'codex' { return /^(gpt|codex|o\d)/i.test(model) ? 'codex' : 'claude'; }
+/** Models in a setting value: separated by commas or whitespace, empty entries dropped. */
+export const parseModelList = (value: string) => value.split(/[\s,]+/).map((item) => item.trim()).filter(Boolean);
+/** The models a fanout stage runs with these setting values: the setting's list when it is given, else the node's own list. */
+export function fanoutModels(fanout: ModelFanout, values: Record<string, string> = {}): string[] {
+  const fromSetting = fanout.variable ? parseModelList(values[fanout.variable] ?? '') : [];
+  return fromSetting.length ? fromSetting : fanout.models;
+}
+/** One worker per listed model, named after it; the same model listed again becomes `<model>-2`, `<model>-3`, … */
+export function fanoutWorkers(models: string[]): { name: string; model: string; agent: 'claude' | 'codex' }[] {
+  const seen = new Map<string, number>();
+  return models.map((model) => {
+    const count = (seen.get(model) ?? 0) + 1;
+    seen.set(model, count);
+    return { name: count === 1 ? model : `${model}-${count}`, model, agent: agentOf(model) };
+  });
+}
 export type WorktreeMode = 'existing' | 'create';
 export type NameSource = 'fixed' | 'agent' | 'input';
 export const nameSourceNames: Record<NameSource, string> = { fixed: '직접 지정', agent: '이전 단계 에이전트가 정함', input: '실행 시 입력' };
@@ -157,6 +181,8 @@ export type StageData = {
   /** Launching nodes (see `launchesWorker`): the worker's model and reasoning effort; unset uses the defaults. */
   workerModel?: string;
   effort?: Effort;
+  /** kind 'worker': run one worker per model in parallel instead of one worker (see `ModelFanout`); `workerModel` is then unset. */
+  fanout?: ModelFanout;
   /** kind 'script': the command (a shell script, {{settings}} allowed), how its output is read, and how it runs. */
   command?: string;
   parse?: ScriptParse;
@@ -577,7 +603,8 @@ export function serializableWorkflow(workflow: Workflow): Workflow {
         ...(node.data.detach ? { detach: true } : {}), ...(node.data.timeoutSec ? { timeoutSec: node.data.timeoutSec } : {}),
         ...(node.data.taskId ? { taskId: node.data.taskId } : {}) });
     } else if (node.data.taskId) data.taskId = node.data.taskId;
-    if (launchesWorker(node)) Object.assign(data, { ...(node.data.workerModel ? { workerModel: node.data.workerModel } : {}), ...(node.data.effort ? { effort: node.data.effort } : {}) });
+    if (launchesWorker(node)) Object.assign(data, { ...(node.data.workerModel && !fansOut(node) ? { workerModel: node.data.workerModel } : {}), ...(node.data.effort ? { effort: node.data.effort } : {}),
+      ...(fansOut(node) ? { fanout: { models: [...node.data.fanout!.models], ...(node.data.fanout!.variable ? { variable: node.data.fanout!.variable } : {}) } } : {}) });
     if (!group && isExecutable(node) && node.data.join === 'any') data.join = 'any';
     if (node.data.kind === 'gate' && (node.data.asker === 'previous' || node.data.asker === 'auto')) data.asker = node.data.asker;
     const width = node.width ?? node.measured?.width;
@@ -715,11 +742,19 @@ export type RunEvent = {
   from?: StageStatus;
 };
 /** meta.json of a launch directory (`.executions/<stamp>-<workflow id>/`). */
+/** Longest run name (실행 이름) the run dialog accepts. */
+export const maxRunTitle = 60;
+/** Label of execution `n` of a request named `title`: the name alone when the request runs once, else `<name> #<n>`. */
+export const executionLabel = (title: string, n: number, count: number) => count > 1 ? `${title} #${n}` : title;
+/** A workflow's open Runs at a glance (sidebar): Tasks running and Tasks waiting on a person. */
+export type WorkflowLive = { running: number; blocked: number };
 export type RunLogMeta = {
   workflowId: string;
   workflowName: string;
   startedAt: string;
   count?: number;
+  /** The name this request's executions go by (Task titles, tabs, canvas chips): typed in the run dialog, else derived. */
+  title?: string;
   project?: string;
   automation?: { id: string; name: string };
   /** Run-time worktree names this request was started with (group id → name). */

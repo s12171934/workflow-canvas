@@ -1,6 +1,6 @@
 import { appendFile, open, readFile, readdir, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { executionResults, statusLabels, taskStatus, type LoggedExecution, type RunEvent, type RunLogMeta, type RunLogOutcome, type RunLogSummary, type RunSnapshot, type StageStatus } from '../src/model.ts';
+import { executionResults, statusLabels, taskStatus, type LoggedExecution, type RunEvent, type RunLogMeta, type RunLogOutcome, type RunLogSummary, type RunSnapshot, type StageStatus, type WorkflowLive } from '../src/model.ts';
 import { validId } from './storage.ts';
 export { coordinatorEventTypes } from '../src/model.ts';
 
@@ -234,6 +234,25 @@ export function createRunLog(root: string) {
       return due;
     },
     /** meta.json of the launch that owns a Run, if any. */
+    /**
+     * What each workflow's open Runs are doing, as last observed (the background watcher refreshes it): Tasks running and
+     * Tasks waiting on a person. Lets the canvas mark workflows that are not open on screen. Workflows with nothing open are left out.
+     */
+    async liveByWorkflow(): Promise<Record<string, WorkflowLive>> {
+      await index();
+      const live: Record<string, WorkflowLive> = {};
+      for (const id of [...active]) {
+        const meta = await readMeta(id);
+        if (!meta?.runId || !meta.workflowId || !recent(id)) continue;
+        const state = await remembered(meta.runId, id);
+        if (state.done) continue;
+        const statuses = [...state.tasks.values()];
+        const entry = live[meta.workflowId] ??= { running: 0, blocked: 0 };
+        entry.running += statuses.filter((status) => status === 'running').length;
+        entry.blocked += statuses.filter((status) => status === 'blocked').length;
+      }
+      return live;
+    },
     async metaOfRun(runId: string) {
       await index();
       const id = runId ? runLaunch.get(runId) : undefined;

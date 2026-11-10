@@ -10,8 +10,8 @@ import { autoLayout } from '../src/layout.ts';
 import { briefPrompt, generatedWorkflow, generationTimeoutMs, maxPromptLength, workflowPrompt, type Generation } from './generate.ts';
 import { createModelCatalog } from './models.ts';
 import { coordinatorEventTypes, createRunLog, launchDirName } from './runlog.ts';
-import { applyDecision, decisionError, executionResults, executionRun, maxSpawnItems, requestKey, resolveVariables, validVariableValue, spawnsRuns, spawnsSubcoordinators, type SpawnResult, type RunLogMeta, executionTasks, inputsKey, loggedExecutions, skippedStages, type Execution, type RunLogDetail } from '../src/model.ts';
-import { defaultCleanup, type AutomationConfig, type AutomationState, type Cleanup, asksAtRun, createsWorktree, parentWorktree, resolvedParentPath, worktreeRepo, executionFinished, executionStatuses, isExecutable, worktreeNamePattern, type RunSnapshot, type Workflow } from '../src/model.ts';
+import { applyDecision, decisionError, executionResults, executionRun, pendingDecisions, type PendingDecision, maxSpawnItems, requestKey, resolveVariables, validVariableValue, spawnsRuns, spawnsSubcoordinators, type SpawnResult, type RunLogMeta, executionTasks, inputsKey, loggedExecutions, skippedStages, type Execution, type RunLogDetail } from '../src/model.ts';
+import { defaultCleanup, executionLabel, maxRunTitle, type AutomationConfig, type AutomationState, type Cleanup, asksAtRun, createsWorktree, parentWorktree, resolvedParentPath, worktreeRepo, executionFinished, executionStatuses, isExecutable, worktreeNamePattern, type RunSnapshot, type Workflow, type WorkflowLive } from '../src/model.ts';
 
 /** Minimum gap between two 실행 requests for the same workflow, so a double click cannot start two coordinators. */
 const launchCooldownMs = 60_000;
@@ -95,7 +95,10 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
     const result = await bridge.openTask(req.params.id, req.params.taskId);
     res.status(result.opened ? 200 : 409).json(result.opened ? result : { error: result.reason });
   });
-  app.get('/api/workflows', async (_req, res) => { res.json(await storage.list()); });
+  app.get('/api/workflows', async (_req, res) => {
+    const [items, live] = await Promise.all([storage.list(), runlog.liveByWorkflow().catch(() => ({} as Record<string, WorkflowLive>))]);
+    res.json(items.map((item) => live[item.id] ? { ...item, live: live[item.id] } : item));
+  });
   app.post('/api/validate', (req, res) => {
     try { res.json(validateWorkflow(req.body)); }
     catch (error) { res.status(400).json({ error: (error as Error).message }); }
@@ -131,7 +134,9 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
     const launchMeta = launch ? await runlog.meta(launch).catch(() => undefined) : undefined;
     const inputs = launchMeta?.inputs;
     const launchValues = launchMeta?.values;
-    const prefix = Object.values(inputs ?? {}).filter(Boolean).join('·');
+    // Launches named at request time (실행 이름) label by that name; older ones by their inputs.
+    const title = launchMeta?.title;
+    const prefix = title ?? Object.values(inputs ?? {}).filter(Boolean).join('·');
     const result = await serial(id, async () => {
       const graph = await storage.load(id);
       // Executions of other Runs stay: one workflow may be running for several inputs at once. Each keeps its Run.
@@ -151,7 +156,8 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
           ...(before?.inputs ? { inputs: before.inputs } : inputs && Object.keys(inputs).length ? { inputs } : {}),
           ...(before?.values ? { values: before.values } : launchValues && Object.keys(launchValues).length ? { values: launchValues } : {}),
           // Several requests show side by side on the canvas: the inputs (a ticket key, say) tell their chips apart.
-          ...(prefix && typeof execution.label === 'string' && !execution.label.startsWith(prefix) ? { label: `${prefix} ${execution.label}`.slice(0, 200) } : {}) };
+          ...(prefix && typeof execution.label === 'string' && !execution.label.startsWith(prefix)
+            ? { label: (title && (launchMeta?.count ?? 1) === 1 ? title : `${prefix} ${execution.label}`).slice(0, 200) } : {}) };
       }) as Execution[];
       // The document keeps at most 100 executions: the oldest of other Runs go first.
       const executions = [...others.slice(Math.max(0, others.length + registered.length - 100)), ...registered];
@@ -177,6 +183,33 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
     const graph = await storage.load(req.params.id);
     try { res.json(flowOf(graph, await linkedWorkflows(graph, (linkId) => storage.load(linkId)))); }
     catch (error) { res.status(400).json({ error: (error as Error).message }); }
+  });
+  // Every user decision open now, across the workflows with open Runs: the same cards the canvas shows, for the agent
+  // dashboard (it answers through the POST below with via '대시보드'). A Run whose snapshot cannot be read is left out,
+  // as the canvas shows no card while its snapshot is stale.
+  app.get('/api/decisions', async (_req, res) => {
+    const live = await runlog.liveByWorkflow().catch(() => ({} as Record<string, WorkflowLive>));
+    const decisions: (PendingDecision & { workflowId: string; workflowName: string; runId: string })[] = [];
+    for (const id of Object.keys(live)) {
+      if (!validId(id)) continue;
+      const graph = await storage.load(id).catch(() => undefined);
+      const executions = graph?.executions ?? [];
+      if (!graph || !executions.length) continue;
+      let flow;
+      try { flow = flowOf(graph, await linkedWorkflows(graph, (linkId) => storage.load(linkId))); }
+      catch { continue; }
+      const snapshots = new Map<string, RunSnapshot>();
+      for (const runId of new Set(executions.map((execution) => executionRun(graph, execution)).filter(Boolean))) {
+        try { snapshots.set(runId, await bridge.snapshot(runId)); } catch { /* stale: no cards for this Run */ }
+      }
+      for (const execution of executions) {
+        const runId = executionRun(graph, execution);
+        const snapshot = snapshots.get(runId);
+        if (!snapshot || executionFinished(executionStatuses(graph.nodes, execution, snapshot, false))) continue;
+        for (const item of pendingDecisions(flow, execution, snapshot)) decisions.push({ ...item, workflowId: graph.id, workflowName: graph.name, runId });
+      }
+    }
+    res.json({ decisions });
   });
   // Read-only: the checks 실행 would run, all of them, without starting a coordinator (used by the 워크플로 검증 workflow).
   app.get('/api/workflows/:id/check', async (req, res) => {
@@ -261,7 +294,9 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
     if (run) await runlog.register(stored.id, run, loggedExecutions((stored.executions ?? []).filter((item) => executionRun(stored, item) === run))).catch(() => {});
     res.json(stored.executions!.find((item) => item.id === executionId));
   });
-  type RunSettings = { count: number; project: string; inputs: Record<string, string>; cleanup: Cleanup; automation?: { id: string; name: string };
+  type RunSettings = { count: number; project: string;
+    /** 실행 이름 typed in the run dialog (absent: derived when the run starts, see `runTitle`). */
+    title?: string; inputs: Record<string, string>; cleanup: Cleanup; automation?: { id: string; name: string };
     /** Setting values as given (declared keys, non-empty): what an automation keeps. */
     given: Record<string, string>;
     /** Setting values the run uses: given, else the declared default. */
@@ -297,6 +332,9 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
     if (!rawCleanup || typeof rawCleanup !== 'object' || (['coordinator', 'worktrees', 'sessions'] as const).some((key) => typeof rawCleanup[key] !== 'boolean')) {
       throw new RunError(400, '완료 시 정리 설정이 올바르지 않습니다.');
     }
+    const rawTitle = body.title ?? '';
+    if (typeof rawTitle !== 'string' || rawTitle.length > maxRunTitle || /[\r\n]/.test(rawTitle)) throw new RunError(400, `실행 이름은 한 줄, ${maxRunTitle}자 이하여야 합니다.`);
+    const title = rawTitle.replace(/["`'\\]/g, '').replace(/\s+/g, ' ').trim();
     const rawValues = body.values ?? {};
     const declared = new Map((graph.variables ?? []).map((item) => [item.key, item]));
     if (!rawValues || typeof rawValues !== 'object' || Array.isArray(rawValues)) throw new RunError(400, '설정값은 {"<키>":"<값>"} 형식이어야 합니다.');
@@ -307,12 +345,25 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
     const given = Object.fromEntries(Object.entries(rawValues as Record<string, string>).map(([key, value]) => [key, value.trim()]).filter(([, value]) => value));
     const { values, missing } = resolveVariables(graph.variables, given);
     if (missing.length) throw new RunError(400, `필수 설정값을 입력하세요: ${missing.map((item) => `「${item.label}」`).join(', ')}`);
-    return { count, project, inputs: rawInputs as Record<string, string>, given, values,
+    return { count, project, ...(title ? { title } : {}), inputs: rawInputs as Record<string, string>, given, values,
       cleanup: { coordinator: !!rawCleanup.coordinator, worktrees: !!rawCleanup.worktrees, sessions: !!rawCleanup.sessions } };
   }
 
+  /**
+   * The name a request's executions go by (Tasks, tabs, canvas chips): the one typed, else its run-time inputs (a ticket key),
+   * else the automation's name, with the start time so repeated requests still tell apart.
+   */
+  function runTitle(settings: RunSettings, startedAt: Date) {
+    if (settings.title) return settings.title;
+    const given = Object.values(settings.inputs).filter(Boolean).join('·');
+    if (given) return given.slice(0, maxRunTitle);
+    const pad = (value: number) => String(value).padStart(2, '0');
+    const time = `${pad(startedAt.getMonth() + 1)}-${pad(startedAt.getDate())} ${pad(startedAt.getHours())}:${pad(startedAt.getMinutes())}`;
+    return settings.automation ? `${settings.automation.name.replace(/["`'\\]/g, '').slice(0, maxRunTitle - 12)} ${time}` : time;
+  }
+
   /** Validates the graph, refuses overlapping runs, and writes the coordinator brief. */
-  async function prepareRun(id: string, graph: Workflow, settings: RunSettings, apiBase: string): Promise<{ briefPath: string; logId: string; launchKey: string }> {
+  async function prepareRun(id: string, graph: Workflow, settings: RunSettings, apiBase: string): Promise<{ briefPath: string; logId: string; launchKey: string; title: string }> {
     if (!graph.nodes.some(isExecutable)) throw new RunError(400, '실행할 단계가 없습니다.');
     let linked: Map<string, Workflow>;
     try { linked = await linkedWorkflows(graph, (linkId) => storage.load(linkId)); checkGroups([graph, ...linked.values()]); checkBranches([graph, ...linked.values()]); checkSpawns([graph, ...linked.values()], linked); checkScripts([graph, ...linked.values()]); checkVariables([graph, ...linked.values()]); checkLoops([graph, ...linked.values()], linked); checkCoordinatorGroup(graph); }
@@ -343,18 +394,19 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
         catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; startedAt = new Date(startedAt.getTime() + 1); }
       }
       const logId = launchDirName(startedAt, id);
+      const title = runTitle(settings, startedAt);
       const artifactDir = join(runlog.root, logId);
-      await runlog.start(logId, { workflowId: id, workflowName: graph.name, startedAt: startedAt.toISOString(), count: settings.count,
+      await runlog.start(logId, { workflowId: id, workflowName: graph.name, startedAt: startedAt.toISOString(), count: settings.count, title,
         project: settings.project, ...(settings.automation ? { automation: settings.automation } : {}),
         ...(inputs !== '[]' ? { inputs: Object.fromEntries(Object.entries(settings.inputs).filter(([, value]) => value)) } : {}),
         ...(Object.keys(settings.values).length ? { values: settings.values } : {}),
         ...(settings.cleanup.coordinator && !settings.automation && !settings.parent ? { closeCoordinator: true } : {}),
         ...(settings.parent ? { parent: settings.parent } : {}) });
-      await runlog.append(logId, { type: 'requested', message: `${settings.origin ?? (settings.automation ? `자동화 「${settings.automation.name}」` : '실행 버튼')} · ${settings.count}회 · ${settings.project}`
+      await runlog.append(logId, { type: 'requested', message: `「${title}」 · ${settings.origin ?? (settings.automation ? `자동화 「${settings.automation.name}」` : '실행 버튼')} · ${settings.count}회 · ${settings.project}`
         + (Object.values(settings.inputs).some(Boolean) ? ` · 입력 ${Object.values(settings.inputs).filter(Boolean).join('·')}` : '') });
       const briefPath = join(artifactDir, 'brief.md');
       const preparedGroup = settings.preparedGroup ?? (settings.coordinatorInGroup && graph.coordinatorGroup ? graph.coordinatorGroup : undefined);
-      const composed = composeBrief({ graph, ...(preparedGroup ? { preparedGroup } : {}), linked, count: settings.count, apiBase, workspace: settings.project, artifactDir,
+      const composed = composeBrief({ graph, ...(preparedGroup ? { preparedGroup } : {}), linked, count: settings.count, title, apiBase, workspace: settings.project, artifactDir,
         logUrl: `${apiBase}/api/workflows/${id}/logs/${logId}/events`, launchId: logId, values: settings.values,
         inputs: settings.inputs, cleanup: settings.cleanup, automation: settings.automation,
         ...(settings.parent ? { subcoordinator: { parentName: settings.origin ?? settings.parent.workflowId } } : {}) });
@@ -365,7 +417,7 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
       }
       await writeFile(briefPath, composed.brief, { mode: 0o600 });
       await runlog.append(logId, { type: 'brief', message: '코디네이터 브리프 작성' });
-      return { briefPath, logId, launchKey };
+      return { briefPath, logId, launchKey, title };
     } catch (error) { launches.delete(launchKey); throw error; }
   }
   function sendRunError(res: express.Response, error: unknown) {
@@ -396,7 +448,7 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
    */
   async function startRun(id: string, graph: Workflow, settings: RunSettings, apiBase: string): Promise<string> {
     const target = coordinatorTarget(graph, settings);
-    const { briefPath, logId, launchKey } = await prepareRun(id, graph, { ...settings, coordinatorInGroup: !!target.group }, apiBase);
+    const { briefPath, logId, launchKey, title } = await prepareRun(id, graph, { ...settings, coordinatorInGroup: !!target.group }, apiBase);
     const launch = async () => {
       let workspace = 'path' in target ? target.path : '';
       if ('prepare' in target) {
@@ -408,8 +460,7 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
       const { terminal } = await bridge.launchCoordinator(workspace, `${briefPath} 파일의 브리프를 읽고 그대로 수행해줘. 워크플로 "${graph.name}"을(를) ${settings.count}회 실행하는 코디네이터 역할이다.${where}`);
       await runlog.append(logId, { type: 'coordinator', message: `코디네이터 기동${target.group ? ` (${workspace})` : ''}${terminal ? ` · ${terminal}` : ''}` }).catch(() => {});
       if (terminal) await runlog.patchMeta(logId, { coordinatorTerminal: terminal }).catch(() => {});
-      const given = Object.values(settings.inputs).filter(Boolean).join('·');
-      if (terminal) await bridge.renameTerminal(terminal, `${graph.name}${given ? ` ${given}` : ''} ×${settings.count} · 코디네이터`).catch(() => {});
+      if (terminal) await bridge.renameTerminal(terminal, `${graph.name} · ${title}${settings.count > 1 ? ` ×${settings.count}` : ''} · 코디네이터`).catch(() => {});
     };
     const failed = async (error: unknown) => {
       launches.delete(launchKey);

@@ -202,3 +202,19 @@ test('stores tags and lists them for the sidebar groups', async () => {
     assert.deepEqual(await storage.list(), [{ id: graph.id, name: graph.name, tags: ['QA', '티켓'] }]);
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
+test('validates model fanout workers: models or a declared setting, worker nodes only, never a single judge', () => {
+  const graph = { ...newWorkflow(), variables: [{ key: 'reviewer_models', label: '리뷰어 모델' }] };
+  const withFanout = (id: string, data: Record<string, unknown>) => ({ ...graph, nodes: graph.nodes.map((node) => node.id === id ? { ...node, data: { ...node.data, ...data } } : node) }) as never as typeof graph;
+  const ok = validateWorkflow(withFanout('review', { fanout: { models: ['claude-opus-5-5', 'gpt-5-codex', 'claude-opus-5-5'], variable: 'reviewer_models' }, effort: 'high' }));
+  assert.deepEqual(ok.nodes.find((node) => node.id === 'review')!.data.fanout, { models: ['claude-opus-5-5', 'gpt-5-codex', 'claude-opus-5-5'], variable: 'reviewer_models' });
+  assert.ok(validateWorkflow(withFanout('review', { fanout: { models: [], variable: 'reviewer_models' } })));
+  assert.throws(() => validateWorkflow(withFanout('review', { fanout: { models: [] } })), /모델이 1개 이상/);
+  assert.throws(() => validateWorkflow(withFanout('review', { fanout: { models: ['-rm'] } })), /모델별 병렬 워커/);
+  assert.throws(() => validateWorkflow(withFanout('review', { fanout: { models: ['a'], variable: 'nope' } })), /모델별 병렬 워커/);
+  assert.throws(() => validateWorkflow(withFanout('approve', { fanout: { models: ['a'] } })), /워커 노드에만/);
+  assert.throws(() => validateWorkflow(withFanout('review', { fanout: { models: ['a'] }, workerModel: 'b' })), /단일 모델/);
+  // The worker before a gate it asks (judge 'previous') must report one decision.
+  const asks = withFanout('review', { fanout: { models: ['a', 'b'] } });
+  asks.nodes = asks.nodes.map((node) => node.id === 'approve' ? { ...node, data: { ...node.data, asker: 'previous' as const } } : node);
+  assert.throws(() => validateWorkflow(asks), /판정 주체/);
+});

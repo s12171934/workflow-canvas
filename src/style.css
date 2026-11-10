@@ -422,6 +422,21 @@ button.run-chip:hover { border-color:#76d8bc; color:#e3f6ef; }
 .frame-body { margin:0 14px; color:#9a9c7e; font-size:11px; line-height:1.5; white-space:pre-wrap; overflow:hidden; display:-webkit-box; -webkit-line-clamp:3; -webkit-box-orient:vertical; }
 .tool-button.kind-frame { color:var(--c-note); }
 .launch-chip { display:inline-flex; align-items:center; gap:4px; margin:-2px 0 6px; padding:2px 7px; border:1px solid #33404b; border-radius:999px; color:#9fb6c6; font-size:9.5px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
+.fanout-chips { display:flex; flex-wrap:wrap; align-items:center; gap:4px; margin:-2px 0 6px; }
+.fanout-chips .launch-chip { margin:0; }
+.launch-chip.claude { border-color:#4da3ff; color:#0b1a2b; background:#4da3ff; font-weight:600; }
+.launch-chip.claude svg { color:#0b1a2b; }
+.launch-chip.codex { border-color:#3ddc84; color:#06200f; background:#3ddc84; font-weight:600; }
+.launch-chip.codex svg { color:#06200f; }
+.launch-chip .agent-icon { flex-shrink:0; }
+.launch-chip.effort { --e:#ff8a3d; border-color:var(--e); color:#1a0d00; background:var(--e); font-weight:700; text-transform:uppercase; letter-spacing:.03em; }
+.launch-chip.effort.low { --e:#9fe870; }
+.launch-chip.effort.medium { --e:#ffd23f; }
+.launch-chip.effort.high { --e:#ff8a3d; }
+.launch-chip.effort.xhigh { --e:#ff4d6d; color:#fff; }
+.launch-chip.effort.max { --e:#d63cff; color:#fff; box-shadow:0 0 6px #d63cff99; }
+.launch-chip.setting { border-style:dashed; color:#c8b27a; border-color:#5a4e33; }
+.fanout-count { color:#7d8b96; font-size:9.5px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
 
 /* Open user decisions, answered on the canvas so the coordinator keeps going. */
 .decision-panel { position:absolute; top:62px; right:calc(var(--inset-right) + var(--gap)); z-index:6; width:300px; max-width:calc(100% - var(--inset-right) - var(--gap) * 2); max-height:calc(100% - 140px); overflow:auto; display:grid; gap:8px; padding:10px; background:#1b2128f2; border:1px solid #e3b45f55; border-radius:11px; box-shadow:0 8px 25px #0004; }
@@ -592,3 +607,5 @@ textarea.mono, input.mono { font-family:ui-monospace, SFMono-Regular, Menlo, mon
 @media (max-width:620px) { .instruction-modal { height:calc(100vh - 32px); padding:14px; } .instruction-hint { display:none; } }
 .instruction-preview.readonly { cursor:default; overflow:auto; max-height:420px; }
 .instruction-preview.readonly::after { display:none; }
+.sidebar-live.blocked { color:#2a1f05; background:#f5c46b; }
+.tag-section-head .status-dot { flex:none; }
