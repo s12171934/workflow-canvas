@@ -547,3 +547,27 @@ button.summary-status { cursor:pointer; } button.summary-status:hover { text-dec
 .canvas[data-far].has-live .stage-card:not(.live):not(.blocked):not(.failed):not(.selected) { opacity:.4; filter:saturate(.4); }
 .canvas[data-far] .stage-card.live h3 { color:#e3f6ef; }
 .sidebar-live { margin-left:auto; display:inline-flex; align-items:center; gap:3px; padding:1px 6px; border-radius:999px; font-size:10px; font-weight:600; color:#0f1a17; background:#8de0c7; }
+/* Stage instructions: inspector preview + full editor dialog */
+.instruction-head { display:flex; align-items:flex-end; justify-content:space-between; gap:8px; margin:18px 0 8px; }
+.instruction-head .field-label { margin:0; }
+.instruction-head .button.small { padding:3px 8px; gap:5px; font-size:10px; color:#9ae5cf; }
+.instruction-preview { display:block; width:100%; text-align:left; cursor:pointer; position:relative; padding:11px 12px; min-height:84px; max-height:260px; overflow:hidden; border:1px solid #343c46; border-radius:7px; background:#11181f; color:#d7dfe6; font-size:11.5px; line-height:1.75; }
+.instruction-preview:hover, .instruction-preview:focus-visible { border-color:#86d8bf; outline:none; }
+.instruction-preview:not(.empty)::after { content:''; position:absolute; left:0; right:0; bottom:0; height:36px; background:linear-gradient(transparent, #11181f); pointer-events:none; }
+.instruction-text { white-space:pre-wrap; word-break:break-word; display:block; }
+.instruction-placeholder { color:#6f8291; font-style:italic; }
+.field-help.instruction-meta { margin-top:6px; }
+.instruction-modal { width:min(980px,100%); height:min(84vh,1000px); display:flex; flex-direction:column; }
+.instruction-modal header { flex:0 0 auto; }
+.instruction-target { color:#8fa3b0; font-weight:400; font-size:13px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:520px; }
+.instruction-vars { display:flex; flex-wrap:wrap; align-items:center; gap:6px; margin-bottom:10px; font-size:10px; color:#8fa3b0; }
+.instruction-vars>span { display:inline-flex; align-items:center; gap:5px; margin-right:4px; }
+.variable-chip { padding:3px 8px; border:1px solid #2f5a54; border-radius:999px; background:#16302c; color:#8fd8cb; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; cursor:pointer; }
+.variable-chip:hover { background:#1d3d38; }
+.instruction-area { flex:1 1 auto; min-height:240px; resize:none; font-size:13px; line-height:1.75; padding:14px 16px; background:#11181f; }
+.instruction-modal footer { flex:0 0 auto; align-items:center; }
+.instruction-count { font-size:10px; color:#7c8e9d; margin-right:auto; }
+.instruction-hint { font-size:10px; color:#5f7281; margin-right:8px; }
+@media (max-width:620px) { .instruction-modal { height:calc(100vh - 32px); padding:14px; } .instruction-hint { display:none; } }
+.instruction-preview.readonly { cursor:default; overflow:auto; max-height:420px; }
+.instruction-preview.readonly::after { display:none; }
