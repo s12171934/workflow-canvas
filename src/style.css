@@ -375,6 +375,7 @@ button.run-chip:hover { border-color:#76d8bc; color:#e3f6ef; }
 .outcome.completed { background:#85bf9f26; color:#85bf9f; } .outcome.failed { background:#d97b8d26; color:#d97b8d; }
 .outcome.running { background:#8de0c726; color:#8de0c7; } .outcome.blocked { background:#dcc17e26; color:#dcc17e; }
 .outcome.unknown { background:#b4a0d01f; color:#b4a0d0; }
+.outcome.stalled { background:#d9a07b26; color:#d9a07b; }
 .log-section-label { display:flex; align-items:center; gap:8px; font-size:10px; color:#8fa3b0; margin:4px 0 6px; }
 .log-results { width:100%; border-collapse:collapse; margin-bottom:12px; font-size:11px; }
 .log-results th, .log-results td { border-bottom:1px solid #222b33; padding:6px 4px; text-align:left; vertical-align:top; }

@@ -3,7 +3,7 @@ import type { ErrorRequestHandler, Request } from 'express';
 import { createOrcaBridge } from './orca.ts';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { createStorage, validId, validateWorkflow } from './storage.ts';
 import { composeBrief, checkBranches, checkScripts, checkCoordinatorGroup, checkGroups, checkLoops, checkSpawns, checkVariables, flowOf, linkedWorkflows, preflight } from './execute.ts';
 import { autoLayout } from '../src/layout.ts';
@@ -11,7 +11,7 @@ import { briefPrompt, generatedWorkflow, generationTimeoutMs, maxPromptLength, w
 import { createModelCatalog } from './models.ts';
 import { coordinatorEventTypes, createRunLog, launchDirName } from './runlog.ts';
 import { applyDecision, decisionError, executionResults, executionRun, pendingDecisions, type PendingDecision, maxSpawnItems, requestKey, resolveVariables, validVariableValue, spawnsRuns, spawnsSubcoordinators, type SpawnResult, type RunLogMeta, executionTasks, inputsKey, loggedExecutions, skippedStages, type Execution, type RunLogDetail } from '../src/model.ts';
-import { defaultCleanup, executionLabel, maxRunTitle, type AutomationConfig, type AutomationState, type Cleanup, asksAtRun, createsWorktree, parentWorktree, resolvedParentPath, worktreeRepo, executionFinished, executionStatuses, isExecutable, worktreeNamePattern, type RunSnapshot, type Workflow, type WorkflowLive } from '../src/model.ts';
+import { defaultCleanup, executionLabel, maxRunTitle, type AutomationConfig, type AutomationState, type Cleanup, asksAtRun, createsWorktree, parentWorktree, resolvedParentPath, worktreeRepo, executionFinished, executionStatuses, isExecutable, worktreeNamePattern, type RunSnapshot, serializableWorkflow, userDecisions, userDecisionsSection, type Workflow, type WorkflowLive } from '../src/model.ts';
 
 /** Minimum gap between two 실행 requests for the same workflow, so a double click cannot start two coordinators. */
 const launchCooldownMs = 60_000;
@@ -27,12 +27,34 @@ export function allowedHost(host: string) {
   return /^(127\.0\.0\.1|localhost)(:\d+)?$/.test(host) || /^[a-z0-9-]+\.[a-z0-9-]+\.ts\.net(:\d+)?$/i.test(host);
 }
 
+/** Document version of a workflow: a hash of the graph without the runtime fields (runId, executions, automations). */
+export function documentVersion(graph: Workflow) {
+  const { runId: _runId, executions: _executions, automations: _automations, ...document } = graph;
+  return `"${createHash('sha256').update(JSON.stringify(document)).digest('hex').slice(0, 24)}"`;
+}
+
+/** An If-Match header against the stored document: `*` matches any stored version; weak tags compare by their value. */
+function versionMatches(header: string, current: Workflow | undefined) {
+  if (!current) return false;
+  const tags = header.split(',').map((tag) => tag.trim().replace(/^W\//, '')).filter(Boolean);
+  return tags.includes('*') || tags.includes(documentVersion(current));
+}
+
+/**
+ * Runtime fields a graph save keeps from the stored document. Executions that relied on the document's Run keep it when a
+ * save changes `runId` (picking another Run on the canvas no longer drops what earlier Runs registered).
+ */
+function preservedRuntime(current: Workflow, runId: string): Pick<Workflow, 'executions' | 'automations'> {
+  const executions = current.executions?.map((item) => item.runId || !current.runId || current.runId === runId ? item : { ...item, runId: current.runId });
+  return { executions, automations: current.automations };
+}
+
 /** The address coordinators and workers on this Mac call back, whichever host the request came through. */
 function localBase(req: Request) {
   return `http://127.0.0.1:${req.socket.localPort}`;
 }
 
-export function createApp(directory: string, bridge = createOrcaBridge(), options: { root?: string; watchMs?: number; models?: ReturnType<typeof createModelCatalog> } = {}) {
+export function createApp(directory: string, bridge = createOrcaBridge(), options: { root?: string; watchMs?: number; reapMs?: number; models?: ReturnType<typeof createModelCatalog> } = {}) {
   void options.root; // root is no longer used: every run names its project.
   const models = options.models ?? createModelCatalog();
   const launches = new Map<string, number>();
@@ -49,6 +71,19 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
   const runlog = createRunLog(join(directory, '.executions'));
   // Background observer: results of open Runs are logged even while no canvas is open.
   if (options.watchMs) runlog.watch((runId) => bridge.snapshot(runId), options.watchMs);
+  /**
+   * Dead coordinators: a run whose coordinator terminal is gone from Orca, with no 'finished' event, is `stalled` — nobody
+   * is left to finish it. The Run is observed first so a run that did settle is logged as finished, not stalled. When Orca
+   * does not answer, nothing is marked (unknown is not dead).
+   */
+  async function watchCoordinators() {
+    for (const { id, terminal, runId } of await runlog.coordinatorsToWatch().catch(() => [])) {
+      try {
+        if (runId) await runlog.observe(await bridge.snapshot(runId));
+        if (!await bridge.terminalOpen(terminal)) await runlog.markLost(id, terminal);
+      } catch { /* Orca unreachable: try again next time */ }
+    }
+  }
   // Safety net for 완료 시 정리 「코디네이터 종료」: a coordinator still open after its run ended is closed here, so
   // finished runs never leave an idle agent behind (it may be waiting on a dead worker or on a question nobody answers).
   if (options.watchMs) {
@@ -60,8 +95,9 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
           await runlog.append(id, { type: 'coordinator-closed', message: open ? `실행이 끝나 캔버스 서버가 코디네이터 터미널을 닫음 · ${terminal}` : `코디네이터 터미널이 이미 닫혀 있음 · ${terminal}` });
         } catch { /* Orca unreachable: try again next time */ }
       }
+      await watchCoordinators();
     };
-    const timer = setInterval(() => { void reap(); }, Math.max(options.watchMs, 30_000));
+    const timer = setInterval(() => { void reap(); }, options.reapMs ?? Math.max(options.watchMs, 30_000));
     timer.unref?.();
   }
   app.disable('x-powered-by');
@@ -103,17 +139,39 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
     try { res.json(validateWorkflow(req.body)); }
     catch (error) { res.status(400).json({ error: (error as Error).message }); }
   });
-  app.get('/api/workflows/:id', async (req, res) => { res.json(await storage.load(req.params.id)); });
+  // ETag = document version (the graph without its runtime fields), so a PUT can say which version it edited (If-Match).
+  app.get('/api/workflows/:id', async (req, res) => {
+    const graph = await storage.load(req.params.id);
+    res.setHeader('ETag', documentVersion(graph));
+    res.json(graph);
+  });
+  // Saves the graph. Runs in the same queue as the runtime writes, and keeps the runtime fields (executions, automations)
+  // as stored: only the runtime APIs change them, so a save never drops a decision registered since the client last read.
   app.put('/api/workflows/:id', async (req, res) => {
     if (req.params.id !== req.body?.id) { res.status(400).json({ error: '워크플로 ID가 일치하지 않습니다.' }); return; }
     // ?layout=auto: positions may be left out; the server lays the graph out compactly (same as the canvas's 자동 정렬).
     const layout = req.query.layout === 'auto';
     if (layout && Array.isArray(req.body.nodes)) for (const node of req.body.nodes) if (node && typeof node === 'object' && !node.position) node.position = { x: 0, y: 0 };
-    let graph;
-    try { graph = validateWorkflow(req.body); }
-    catch (error) { res.status(400).json({ error: (error as Error).message }); return; }
-    if (layout) graph = { ...graph, nodes: autoLayout(graph.nodes, graph.edges) };
-    res.json(await storage.save(graph));
+    const id = req.params.id;
+    const ifMatch = req.get('if-match');
+    const result = await serial(id, async () => {
+      const current = await storage.load(id).catch((error: NodeJS.ErrnoException) => { if (error.code === 'ENOENT') return undefined; throw error; });
+      if (ifMatch !== undefined && !versionMatches(ifMatch, current)) {
+        return { status: 409, error: current
+          ? '문서가 그 사이에 바뀌었습니다(If-Match 불일치). 최신본을 GET 으로 다시 읽어 변경을 합친 뒤 그 ETag 로 다시 보내세요.'
+          : '저장된 문서가 없어 If-Match 와 맞출 수 없습니다.', ...(current ? { version: documentVersion(current) } : {}) };
+      }
+      let graph: Workflow;
+      try {
+        graph = validateWorkflow(current ? { ...req.body, executions: undefined, automations: undefined } : req.body);
+        if (layout) graph = { ...graph, nodes: autoLayout(graph.nodes, graph.edges) };
+        if (current) graph = serializableWorkflow({ ...graph, ...preservedRuntime(current, graph.runId) });
+        return { status: 200, stored: await storage.save(graph) };
+      } catch (error) { return { status: 400, error: (error as Error).message }; }
+    });
+    if (!('stored' in result) || !result.stored) { res.status(result.status).json({ error: result.error, ...('version' in result ? { version: result.version } : {}) }); return; }
+    res.setHeader('ETag', documentVersion(result.stored));
+    res.json(result.stored);
   });
   app.delete('/api/workflows/:id', async (req, res) => {
     if (!validId(req.params.id)) { res.status(400).json({ error: '올바르지 않은 워크플로 ID입니다.' }); return; }
@@ -132,6 +190,12 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
     // The 실행 request this coordinator was started for: its run-time inputs go on every execution it registers.
     const launch = typeof req.body?.launch === 'string' && runlog.validLaunch(id, req.body.launch) ? req.body.launch as string : undefined;
     const launchMeta = launch ? await runlog.meta(launch).catch(() => undefined) : undefined;
+    // The coordinator names its own terminal (a sub-coordinator or an automation's agent was not started by this server):
+    // the server watches it to tell a dead run (stalled) from a running one.
+    const terminal = req.body?.coordinatorTerminal;
+    if (launch && launchMeta && !launchMeta.coordinatorTerminal && typeof terminal === 'string' && /^term_[a-zA-Z0-9-]{1,128}$/.test(terminal)) {
+      await runlog.patchMeta(launch, { coordinatorTerminal: terminal }).catch(() => {});
+    }
     const inputs = launchMeta?.inputs;
     const launchValues = launchMeta?.values;
     // Launches named at request time (실행 이름) label by that name; older ones by their inputs.
@@ -173,9 +237,14 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
   app.get('/api/workflows/:id/executions/:executionId/decisions', async (req, res) => {
     const { id, executionId } = req.params;
     if (!validId(id) || !validId(executionId)) { res.status(400).json({ error: '올바르지 않은 워크플로 또는 실행 ID입니다.' }); return; }
-    const execution = (await storage.load(id)).executions?.find((item) => item.id === executionId);
+    const graph = await storage.load(id);
+    const execution = graph.executions?.find((item) => item.id === executionId);
     if (!execution) { res.status(404).json({ error: '이 워크플로에 등록된 실행이 아닙니다.' }); return; }
-    res.json({ decisions: execution.decisions ?? {}, skipped: execution.skipped ?? [], skippedTasks: executionTasks(execution, execution.skipped ?? []) });
+    // The user-judged branch decisions so far, and the spec section the coordinator hands to the next workers (contract (a)).
+    let users: ReturnType<typeof userDecisions> = [];
+    try { users = userDecisions(flowOf(graph, await linkedWorkflows(graph, (linkId) => storage.load(linkId))), execution); } catch { /* a broken link: no section */ }
+    res.json({ decisions: execution.decisions ?? {}, skipped: execution.skipped ?? [], skippedTasks: executionTasks(execution, execution.skipped ?? []),
+      userDecisions: users, userSection: userDecisionsSection(users) });
   });
   // The saved graph as it runs (links expanded): the canvas uses it to find the user decisions that are open now.
   app.get('/api/workflows/:id/flow', async (req, res) => {

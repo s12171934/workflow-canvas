@@ -15,7 +15,7 @@ const shortPath = (path?: string) => path ? path.split('/').filter(Boolean).slic
 const tone = (event: RunEvent) => ['task', 'execution', 'finished'].includes(event.type) ? event.status ?? 'unknown'
   : ['error', 'coordinator-failed'].includes(event.type) ? 'failed' : event.type === 'gate' ? 'blocked' : event.type === 'report' ? 'completed' : 'info';
 
-const outcomeNames: Record<RunLogOutcome, string> = { pending: '등록 대기', running: '진행 중', completed: '완료', failed: '실패', blocked: '확인 필요', unknown: 'Run 미확인' };
+const outcomeNames: Record<RunLogOutcome, string> = { pending: '등록 대기', running: '진행 중', completed: '완료', failed: '실패', blocked: '확인 필요', unknown: 'Run 미확인', stalled: '중단됨' };
 
 /** Execution history of one workflow: one entry per 실행 request, its event timeline and the files it left. */
 export function RunLogDialog({ workflowId, workflowName, onClose }: { workflowId: string; workflowName: string; onClose: () => void }) {

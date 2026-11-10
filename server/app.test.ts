@@ -563,7 +563,7 @@ test('branches: brief carries order and judges, bad branches are refused, decisi
     assert.deepEqual(saved.executions[0].decisions, { check: ['pass'] });
     // The coordinator polls what was decided; the canvas reads the expanded graph to offer user decisions.
     assert.deepEqual(await (await fetch(`${base}/api/workflows/wf-branch/executions/exec-1/decisions`)).json(),
-      { decisions: { check: ['pass'] }, skipped: ['fix'], skippedTasks: ['task-fix'] });
+      { decisions: { check: ['pass'] }, skipped: ['fix'], skippedTasks: ['task-fix'], userDecisions: [], userSection: '' });
     const flow = await (await fetch(`${base}/api/workflows/wf-branch/flow`)).json();
     assert.deepEqual(flow.find((item: { id: string }) => item.id === 'check').outputLabels, { pass: '통과', fail: '실패' });
   } finally {
@@ -1011,7 +1011,7 @@ test('loops: a branch output goes back with a limit; the decision API starts a n
     assert.equal((await fetch(`${base}/api/workflows/looping/executions`, { method: 'PUT', headers: json, body: JSON.stringify({ runId: 'run-l', launch: log.id,
       executions: [{ id: 'run-l-1', label: '#1', bindings: { impl: 't1', review: 't2', result: 't3', done: 't4', blocked: 't5' } }] }) })).status, 200);
     const first = await (await decide(['fix'])).json();
-    assert.deepEqual(first.loop, { edge: 'back', to: 'impl', restart: ['impl', 'review', 'result'], pass: 2, max: 2, remaining: 1 });
+    assert.deepEqual(first.loop, { edge: 'back', to: 'impl', restart: ['impl', 'review', 'result'], pass: 2, rounds: { impl: 2, review: 2, result: 2 }, max: 2, remaining: 1 });
     assert.deepEqual(first.skippedTasks, []);
     assert.equal((await (await decide(['fix'])).json()).loop.pass, 2); // a retried request does not go round again
     const patch = (bindings: unknown) => fetch(`${base}/api/workflows/looping/executions/run-l-1/bindings`, { method: 'PATCH', headers: json, body: JSON.stringify({ bindings }) });
@@ -1287,7 +1287,8 @@ test('a sub-coordinator spawn link prepares each item without launching an agent
       body: JSON.stringify({ runId: 'run-c', launch: first.results[1].launch, executions: [{ id: 'run-c-1', label: '#1', bindings: { fix: 'tc1' } }] }) });
     const graph = await (await fetch(`${base}/api/workflows/picker`)).json();
     graph.executions[0].spawned = { fan: [graph.executions[0].spawned.fan[0]] }; // forget ABC-2 so it is asked again
-    assert.equal((await put(graph)).status, 200);
+    // A graph PUT keeps the stored executions (runtime records), so the test edits the stored file itself.
+    await writeFile(join(directory, 'picker.json'), JSON.stringify(graph, null, 2));
     await new Promise((resolve) => setTimeout(resolve, 0));
     const busy = await (await spawn(['ABC-2'])).json();
     assert.equal(busy.results[0].status, 'failed');

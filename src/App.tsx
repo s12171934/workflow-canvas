@@ -823,8 +823,11 @@ function Workspace() {
   async function save(doc: Workflow = current): Promise<boolean> {
     setBusy(true);
     try {
-      await api(`/api/workflows/${doc.id}`, { method: 'PUT', body: JSON.stringify(doc) });
-      setSavedFingerprint(JSON.stringify(doc));
+      // The server keeps its own runtime fields (executions, automations): take them from the reply, not from this screen.
+      const stored = await api<Workflow>(`/api/workflows/${doc.id}`, { method: 'PUT', body: JSON.stringify(doc) });
+      const runtime = { runId: stored.runId, executions: stored.executions, automations: stored.automations };
+      setWorkflow((value) => value.id === doc.id ? { ...value, ...runtime } : value);
+      setSavedFingerprint(JSON.stringify(serializableWorkflow({ ...doc, ...runtime })));
       rememberWorkflow(doc.id);
       setSaved(await api('/api/workflows'));
       setNotice('워크플로를 로컬에 저장했습니다.');
@@ -1101,9 +1104,10 @@ function Workspace() {
   }
   function changeRun(runId: string) {
     if (runId === workflow.runId) return;
-    if ((nodes.some((node) => node.data.taskId) || executions.length) && !window.confirm('Run을 바꾸면 기존 Task 연결이 해제됩니다. 계속할까요?')) return;
+    if (nodes.some((node) => node.data.taskId) && !window.confirm('Run을 바꾸면 노드의 Task 연결이 해제됩니다. 등록된 실행 기록은 각자의 Run 에 남습니다. 계속할까요?')) return;
     setSnapshot(null);
-    setWorkflow((value) => ({ ...value, runId, executions: undefined }));
+    // Executions are runtime records the server keeps on save: each stays on the Run it was registered with.
+    setWorkflow((value) => ({ ...value, runId, executions: value.executions?.map((item) => item.runId || !value.runId ? item : { ...item, runId: value.runId }) }));
     setNodes((items) => items.map((node) => ({ ...node, data: { ...node.data, taskId: undefined } })));
   }
   function importRun() {

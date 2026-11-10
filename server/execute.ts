@@ -1,4 +1,4 @@
-import { executionLabel, asksAtRun, reportsResults, forwardEdges, loopBody, spawnsRuns, spawnsSubcoordinators, maxSpawnItems, resolveVariables, substituteVariables, variableRefs, createsWorktree, gateOutputs, defaultWorkerModel, launchesWorker, agentOf, fanoutModels, fanoutWorkers, workerModelPattern, isBranch, isExecutable, isGroup, membershipOf, newWorktreeToken, orderNodes, parentWorktree, resolvedParentPath, topologicalOrder, waves, worktreeRepo, type FlowStage, type StageNode, type Workflow, type Cleanup, defaultCleanup } from '../src/model.ts';
+import { userDecisionsHeading, executionLabel, asksAtRun, reportsResults, forwardEdges, loopBody, spawnsRuns, spawnsSubcoordinators, maxSpawnItems, resolveVariables, substituteVariables, variableRefs, createsWorktree, gateOutputs, defaultWorkerModel, launchesWorker, agentOf, fanoutModels, fanoutWorkers, workerModelPattern, isBranch, isExecutable, isGroup, membershipOf, newWorktreeToken, orderNodes, parentWorktree, resolvedParentPath, topologicalOrder, waves, worktreeRepo, type FlowStage, type StageNode, type Workflow, type Cleanup, defaultCleanup } from '../src/model.ts';
 
 export type BriefInput = {
   graph: Workflow;
@@ -464,6 +464,8 @@ export function composeBrief({ graph, preparedGroup, linked = new Map(), count, 
 run_id·실행 id·자기 Task·dispatch id 처럼 다시 찾기 어려운 값은 처음 정해질 때 \`${artifactDir}/coordinator-state.txt\` 에 한 줄씩 덧붙여 두고(Write 대신 \`printf ... >>\`), 요약 뒤에는 이 파일부터 읽는다.
 `;
   const worktrees = ctx.worktrees;
+  const userBranch = (list: BriefStage[]): boolean => list.some((stage) => (stage.kind === 'branch' && stage.branch?.judge === 'user') || (stage.workflow ? userBranch(stage.workflow.stages) : false));
+  const handsUserDecisions = userBranch(stages);
   const spawnsSub = (list: BriefStage[]): boolean => list.some((stage) => stage.spawn?.as === 'subcoordinator' || (stage.workflow ? spawnsSub(stage.workflow.stages) : false));
   const subSpawnSection = spawnsSub(stages) ? `
    - **하위 코디네이터로 띄우기(\`spawn.as\` 가 \`subcoordinator\` 인 링크)**: 요청은 위와 같지만 캔버스는 에이전트를 띄우지 않는다. 항목마다 실행 등록·브리프·워크트리만 준비해 \`status: "prepared"\` 와 \`launch\`(하위 실행 로그 id)·\`brief\`(브리프 절대경로)·\`worktree\`(하위 코디네이터 위치 절대경로)를 돌려준다. 하위 코디네이터는 **너의 워커**로 띄운다. 위 "기다리지 않는다" 대신 아래를 따른다.
@@ -552,21 +554,24 @@ ${worktreeSection}
 3. Task 를 모두 만들면 **워커를 띄우기 전에** 캔버스에 실행 목록을 등록한다(한 번만):
    \`\`\`sh
    curl -s -X PUT -H 'Content-Type: application/json' ${apiBase}/api/workflows/${graph.id}/executions \\
-     --data '{"runId":"<run_id>",${launchId ? `"launch":"${launchId}",` : ''}"executions":[{"id":"<run_id>-1","label":"${labels[0]}","bindings":{"<nodeId>":"<task_id>", ...},"links":{"<링크 nodeId>":{"<하위 경로>":"<task_id>", ...}}${automationJson.replace(/'/g, '')}}, ...]}'
+     --data '{"runId":"<run_id>",${launchId ? `"launch":"${launchId}","coordinatorTerminal":"<네 터미널 핸들>",` : ''}"executions":[{"id":"<run_id>-1","label":"${labels[0]}","bindings":{"<nodeId>":"<task_id>", ...},"links":{"<링크 nodeId>":{"<하위 경로>":"<task_id>", ...}}${automationJson.replace(/'/g, '')}}, ...]}'
    \`\`\`
    - \`bindings\` 에는 최상위 \`worker\`·\`gate\`·\`branch\` 단계와 \`spawn\` 링크 단계만 넣는다. 링크 아래 펼친 단계는 \`links\` 에 **최상위 링크 nodeId** 를 키로, 그 아래 \`nodeId\` 에서 링크 접두사를 뗀 경로(예: \`sub\`, 중첩이면 \`sub.inner\`)를 키로 넣는다. 링크가 없으면 \`links\` 는 생략한다.
    - \`label\` 은 그 실행의 \`<실행 라벨>\`(절차 2) 그대로다.
    - 실행 id 는 \`<run_id>-<n>\` 이다(같은 워크플로의 다른 요청이 동시에 돌 수 있어 Run 마다 달라야 한다). 아래 \`<실행 id>\` 는 이 값이다.${launchId ? `
-   - \`launch\` 는 이 실행 요청의 실행 로그 ID 다. 그대로 보낸다.` : ''}
+   - \`launch\` 는 이 실행 요청의 실행 로그 ID 다. 그대로 보낸다.
+   - \`coordinatorTerminal\` 은 네 터미널 핸들(\`echo $ORCA_TERMINAL_HANDLE\` 의 값, \`term_\` 로 시작)이다. 캔버스는 이 터미널이 Orca 에서 사라졌는데 실행이 끝나지 않았으면 실행 로그를 \`stalled\`(중단됨)로 표시한다.` : ''}
    응답이 200 이 아니면 오류 메시지를 읽고 고쳐서 다시 보낸다.
 4. 각 실행에서 선행 단계가 없는 단계부터 \`worker-start --task <task_id> --worktree path:<그 단계의 location> --agent <그 단계의 agent> --model <그 단계의 model> [--effort <그 단계의 effort>]\` 로 띄운다(\`fanout\` 단계는 아래 "모델별 병렬 워커"). \`effort\` 가 없으면 \`--effort\` 를 빼고, 단계마다 정해진 값을 바꾸지 않는다. 모든 실행의 첫 물결을 먼저 띄운 뒤 기다린다. 띄우자마자 탭 이름을 "${graph.name.slice(0, 30)} · <실행 라벨> · <단계 이름>" 으로 바꾼다.
 5. 아래 "기다리기" 대로 \`check --wait\` 를 반복하며 각 \`worker_done\` 을 처리한다. 진행 규칙은 정해져 있다. 네가 조건을 해석해 바꾸지 않는다.
 ${waitRule}
    - **병렬·합류**: 분기가 아닌 연결은 모두 병렬이다. 한 단계는 \`after\` 의 선행 단계 Task 가 **모두 completed** 일 때 띄운다(건너뜀으로 닫힌 Task 도 completed 다). 선행이 여럿이면 마지막 것이 끝날 때까지 기다린다.
    - 단계를 띄울 때 \`location\`·\`agent\`·\`model\`·\`effort\` 가 모두 직전 단계와 같으면 같은 터미널을 재사용하고(\`--terminal\`), 하나라도 다르면 새로 띄운다(\`--worktree path:<location> --agent <agent> --model <model> [--effort <effort>]\`. \`--model\`·\`--effort\` 는 \`--terminal\` 과 함께 쓸 수 없다). 탭 이름을 바꾼다. 이어서 띄울 단계가 없는 워커는 release 한다. \`fanout\` 단계의 워커는 재사용하지도, 재사용되지도 않는다.
+${handsUserDecisions ? `   - **앞 사용자 분기 판정 전달**: 워커(판정 전용 워커·\`fanout\` 자식 포함)를 띄우기 **직전마다** 그 실행의 decisions 를 조회해(\`curl -s ${apiBase}/api/workflows/${graph.id}/executions/<실행 id>/decisions\`), 응답의 \`userSection\` 이 비어 있지 않으면 그 문자열을 그대로 \`${artifactDir}/<n>-<nodeId>-user-decisions.md\` 에 쓴다(회차마다 다시 쓴다. 비어 있으면 파일을 만들지 않는다). \`userSection\` 은 이 실행에서 지금까지 내려진 사용자(judge \`user\`) 분기 판정을 아래 "워커 spec 규칙" 의 절 형식으로 캔버스가 만든 것이다 — 고치거나 줄이지 않는다.
+` : ''}   - **코디네이터 정리 요청**: worker_done 본문에 \`코디네이터 정리 필요: <터미널 핸들>[, <터미널 핸들> ...]\` 줄이 있으면, 그 단계 Task 를 닫은 **직후**(다음 단계를 띄우기 전에) 적힌 터미널을 \`orca terminal close --terminal <핸들>\` 로 닫고 실행 로그 \`note\` 에 "<단계 이름> · <실행 라벨>: 코디네이터 정리 <핸들> 닫음" 을 남긴다. 너 자신의 터미널, 그리고 \`worker-list\` 에 진행 중(dispatched)인 이 Run 의 워커 터미널은 닫지 않고 \`note\` 에 "닫지 않음: <핸들> <사유>" 로 남긴다. 이미 닫혀 있으면 넘어간다. 닫기에 실패해도 실행은 계속한다.
    - **모델별 병렬 워커(\`fanout\` 이 있는 단계)**: 선행 단계가 모두 끝나면 단계 Task 를 \`dispatched\` 로 두고(워커를 붙이지 않는다), \`fanout\` 항목마다 단계 Task 의 자식 Task 를 \`task-create --run <run_id> --parent <단계 Task> --task-title "<단계 이름> · <실행 라벨> · <name>" --display-name "<단계 이름> · <실행 라벨> · <name>" --spec "$(cat <파일>)"\` 로 만든다. spec 은 아래 "워커 spec 규칙" 에 "모델별 병렬 워커" 줄을 더한 것이다. 자식 Task 를 모두 만든 뒤 **한꺼번에** \`worker-start --run <run_id> --task <자식 Task> --worktree path:<location> --agent <항목의 agent> --model <항목의 model> [--effort <단계의 effort>]\` 로 띄우고 탭 이름을 "${graph.name.slice(0, 30)} · <실행 라벨> · <단계 이름> · <name>" 으로 바꾼다. 모델을 다른 모델로 바꾸거나 항목을 빼지 않는다.
      - 자식 워커의 worker_done 마다 자식 Task 를 보고의 outcome 대로 닫고 그 워커를 release 한다. 기동에 실패한(또는 worker_done 없이 터미널이 닫힌) 자식은 **한 번만** 같은 agent·model 로 새 자식 Task 를 만들어 다시 띄운다(\`--retry-of\` 가 쓰이면 그것을 쓴다). 그래도 실패하면 \`failed\` 로 닫고 실행 로그 \`error\` 에 "<단계 이름> · <실행 라벨> · <name>: <사유>" 를 남긴다.
-     - 자식이 모두 닫히면 단계 Task 를 닫는다. 하나라도 completed 면 \`task-update --status completed --result "모델별 <완료 k>/<전체 m> · 실패 <name, ...> · 산출물 <경로, ...>"\` 이고, 모두 실패면 \`failed\` 로 닫고 그 단계에 의존하는 단계는 띄우지 않는다. 뒤 단계는 이 결과 줄과 산출물로 빠진 워커를 안다.
+     - 자식이 모두 닫히면 단계 Task 를 \`task-update --status completed --result "<결과 줄>"\` 로 닫고 다음 단계로 진행한다. 결과 줄은 \`모델별 <완료 k>/<전체 m> · 실패 <name>(<사유>), ... · 산출물 <경로, ...>\` 이다(실패가 없으면 \`실패 없음\`). **모든 자식이 실패해도(\`모델별 0/<m>\`) 단계와 실행을 실패로 만들지 않는다** — 같은 결과 줄로 completed 로 닫고 뒤 단계를 띄운다(실행 로그 \`error\` 에도 남긴다). 같은 결과 줄을 단계 산출물 \`${artifactDir}/<n>-<nodeId>.txt\`(2회차 이상이면 \`-r<회차>.txt\`)에 써서 뒤 단계 워커가 읽게 한다. 뒤 단계는 이 결과 줄과 산출물로 빠진 워커(전원 실패 포함)를 판단한다.
      - 실행 등록의 \`bindings\` 에는 단계 Task 만 넣는다(자식 Task 는 넣지 않는다). 되돌아가기로 단계 Task 를 새로 만들면 자식 Task 도 그 회차의 단계 Task 아래에 새로 만든다.
    - **죽은 워커**: \`check\` 가 시간이 다 될 때마다(마지막 확인 뒤 5분이 지나지 않았으면 건너뛴다) \`worker-list\` 로 진행 중(dispatched) Task 의 워커 터미널이 살아 있는지 본다. 터미널이 닫혔거나(exited·없음) 워크트리가 사라졌는데 worker_done 이 없으면 **더 기다리지 않는다.** 그 Task 를 \`task-update --status failed --result "<사유>"\` 로 닫고 실행 로그 \`error\` 에 남긴 뒤, 그 단계에 의존하는 단계는 띄우지 않는다(그 실행은 실패로 끝난다). 산출물 파일이 이미 있으면 사유에 경로를 적는다. 같은 단계를 다시 띄우지 않는다.
    - **워커 판정 분기(kind \`branch\`, judge \`previous\`·\`worker\`)**: 선행 단계가 끝나면 판정을 받는다.
@@ -606,11 +611,12 @@ ${waitRule}
      \`\`\`
      분기 출력으로 이 링크에 왔으면(그 분기의 \`after\` 연결로 도착하고 항목을 보고할 워커는 건너뜀) 항목은 빈 목록이다 — 요청을 보내지 않는다. \`spawn.as\` 가 없으면 캔버스가 항목마다 대상 워크플로의 코디네이터를 따로 띄우고(항목 = 대상의 실행 시 입력 워크트리 이름) \`results\` 를 돌려준다. 이 실행에서 이미 요청한 항목은 다시 띄우지 않는다(링크가 되돌아가기 구간 안에 있으면 회차마다 새로 요청할 수 있다. 같은 입력의 대상 실행이 아직 돌고 있으면 그 항목은 실패로 돌아온다). 응답 \`results\` 를 그대로 산출물 \`<n>-<링크 nodeId>.txt\` 에 쓰고, 링크 Task 를 \`task-update --status completed --result "요청 <성공 수>건 · 실패 <실패 수>건"\` 으로 닫은 뒤 다음 단계를 띄운다. 일부 항목이 실패해도 막지 않는다(뒤 단계가 산출물로 처리한다). 요청 자체가 400 이면 오류를 실행 로그 \`error\` 로 남기고 링크 Task 를 blocked 로 둔다. 따로 띄운 실행은 이 실행의 일부가 아니다 — 기다리지 않고, 정리하지도 않는다.${subSpawnSection}
    - **되돌아가기(\`branch.loops\` 의 출력)**: 판정은 다른 출력과 똑같이 "판정 등록" 으로 보낸다. 응답이 회차를 알려 준다.
-     - 응답에 \`loop\` 가 있으면 되돌아간 것이다: 분기 Task 를 \`task-update --status completed --result "decision: <출력 id> · <loop.pass - 1>회차 종료"\` 로 닫고, \`loop.restart\` 의 단계(순서대로)마다 **새 Task** 를 만든다 — title·display-name "<단계 이름> · <실행 라벨> · <loop.pass>회차", deps 는 같은 회차에 새로 만든 선행 단계 Task(첫 단계 \`loop.to\` 는 deps 없음). \`restart\` 에는 되돌아가기 구간 밖이지만 앞 회차에서 건너뜀으로 닫혀 이번 회차에 다시 닿을 수 있게 된 단계도 들어 있다 — 그 단계도 같은 방법으로 새 Task 를 만든다. 앞 회차 Task 는 그대로 둔다. 만든 Task 를 아래처럼 등록한 뒤 진행 규칙대로 \`loop.to\` 부터 띄운다. 이후 이 단계들의 완료·판정은 새 Task 기준이다.
+     - 응답에 \`loop\` 가 있으면 되돌아간 것이다: 분기 Task 를 \`task-update --status completed --result "decision: <출력 id> · <loop.rounds[분기 nodeId] - 1>회차 종료"\` 로 닫고, \`loop.restart\` 의 단계(순서대로)마다 **새 Task** 를 만든다 — title·display-name "<단계 이름> · <실행 라벨> · <loop.rounds[그 단계 nodeId]>회차", deps 는 같은 회차에 새로 만든 선행 단계 Task(첫 단계 \`loop.to\` 는 deps 없음). \`restart\` 에는 되돌아가기 구간 밖이지만 앞 회차에서 건너뜀으로 닫혀 이번 회차에 다시 닿을 수 있게 된 단계도 들어 있다 — 그 단계도 같은 방법으로 새 Task 를 만든다. 앞 회차 Task 는 그대로 둔다. 만든 Task 를 아래처럼 등록한 뒤 진행 규칙대로 \`loop.to\` 부터 띄운다. 이후 이 단계들의 완료·판정은 새 Task 기준이다.
        \`\`\`sh
        curl -s -X PATCH -H 'Content-Type: application/json' ${apiBase}/api/workflows/${graph.id}/executions/<실행 id>/bindings \\
          --data '{"bindings":{"<nodeId>":"<새 task_id>", ...}}'
        \`\`\`
+     - **회차 번호**: \`loop.rounds\` 는 다시 띄우는 단계마다 그 단계가 이 실행에서 몇 번째로 도는지다(단계 기준 누적, 2부터. 같은 단계로 돌아가는 루프가 여럿이어도 합쳐 센다). Task 제목·산출물 이름 \`-r<회차>\`·spec 의 회차는 모두 이 값을 쓴다. 최대 반복(\`loop.max\`·\`loop.remaining\`)은 그와 따로 되돌아가기 연결마다 센다.
      - 응답에 \`exhausted\` 가 있으면 최대 반복 횟수를 다 써서 판정이 \`exhausted.output\` 으로 바뀌어 기록된 것이다. 그 출력으로 판정 반영을 하고, 실행 로그 \`note\` 에 남긴다.
    - **판정 등록**: 응답의 \`skippedTasks\` 는 지금까지의 판정으로 더 이상 갈 수 없게 된 단계의 Task 다.
      \`\`\`sh
@@ -637,13 +643,18 @@ curl -s -X POST -H 'Content-Type: application/json' ${logUrl} \\
 
 ` : ''}## 워커 spec 규칙
 - 단계에 \`instructionsFile\` 이 있으면 지침을 spec 에 옮겨 쓰지 않는다. Change 는 "\`<instructionsFile>\` 의 지침을 읽고 그대로 수행한다" 한 줄이다(캔버스가 그 단계 지침을 이 파일에 이미 써 두었다. 파일을 고치거나 다시 읽어 요약하지 않는다). 없으면 단계 지침을 그대로 Change 로 쓴다. 어느 쪽이든 Target·Constraints·Ownership·Acceptance 를 채운다.
-- 작업 위치: 그 단계의 \`location\`. 그 밖의 파일은 수정하지 않는다. 워커는 자기 \`location\` 워크트리를 지우거나 그 안의 터미널을 닫지 않는다(자기 터미널이 함께 닫혀 worker_done 을 보낼 수 없다). 지침이 그런 정리를 요구하면 하지 말고 worker_done 에 "코디네이터 정리 필요" 로 보고한다.
+- 작업 위치: 그 단계의 \`location\`. 그 밖의 파일은 수정하지 않는다. 워커는 자기 \`location\` 워크트리를 지우거나 그 안의 터미널을 닫지 않는다(자기 터미널이 함께 닫혀 worker_done 을 보낼 수 없다). 지침이 그런 정리를 요구하면 하지 말고 worker_done 에 \`코디네이터 정리 필요: <터미널 핸들>[, <터미널 핸들> ...]\` 한 줄로 보고한다(코디네이터가 그 단계 직후 닫는다).
 - 단계에 \`namesWorktree\` 가 있으면 spec 에 "작업을 마치면 이후 단계가 쓸 워크트리 이름(영문·숫자·\`.\`·\`_\`·\`-\`)을 정하거나 직접 만들고, worker_done 첫 줄에 \`worktree: <이름 또는 절대 경로>\` 로 보고한다" 를 넣는다.
 - 산출물·로그는 \`${artifactDir}/<n>-<nodeId>.txt\` 에 쓴다.
-- 단계에 \`decides\` 가 있으면 spec 에 그 분기의 출력 목록(id·조건)과 "작업을 마치면 조건에 맞는 출력을 고르고(\`mode: exclusive\` 면 하나만) worker_done 첫 줄에 \`decision: <출력 id>\` 로 보고한다. 판정은 한 번만 내고 재실행해 결과를 고르지 않는다" 를 넣는다. \`namesWorktree\` 도 있으면 \`worktree:\` 줄을 그다음 줄에 쓴다.
+${handsUserDecisions ? `- spec 끝에 다음 절을 넣는다(Task 는 판정 전에 만들어지므로 내용은 파일로 전한다):
+  \`\`\`
+  ${userDecisionsHeading}
+  \`${artifactDir}/<n>-<nodeId>-user-decisions.md\` 가 있으면 그 내용이 이 절이다(형식: \`- <분기 nodeId> (<라벨>): <출력 id>\` 한 줄씩. 워커를 띄우기 직전에 코디네이터가 쓴다). 파일이 없으면 이 실행에서 앞서 내려진 사용자 분기 판정이 없다.
+  \`\`\`
+` : ''}- 단계에 \`decides\` 가 있으면 spec 에 그 분기의 출력 목록(id·조건)과 "작업을 마치면 조건에 맞는 출력을 고르고(\`mode: exclusive\` 면 하나만) worker_done 첫 줄에 \`decision: <출력 id>\` 로 보고한다. 판정은 한 번만 내고 재실행해 결과를 고르지 않는다" 를 넣는다. \`namesWorktree\` 도 있으면 \`worktree:\` 줄을 그다음 줄에 쓴다.
 - \`decides\` 항목에 \`ask\` 가 있으면(이 워커 뒤의 게이트를 이 워커가 묻는다) spec 에 다음을 넣는다: "작업을 마치면 worker_done 을 보내기 전에 이 터미널에서 사용자에게 \`ask\` 를 묻는다. 결과 요약과 산출물 경로를 함께 보여 주고, 통과(approve)·거절(reject) 중 하나를 고르게 한다. 사용자가 답할 때까지 기다리며, 그사이 사용자가 묻거나 고쳐 달라는 것은 작업 범위 안에서 반영한다. 답을 받으면 worker_done 첫 줄에 \`decision: approve\` 또는 \`decision: reject\` 로 보고한다. 코디네이터가 사용자가 이미 골랐다고 알려 오면 묻기를 멈추고 그 결정으로 보고한다."
 - 단계에 \`reportsItems\` 가 있으면 spec 에 "작업을 마치면 다음 단계가 따로 실행할 항목(각각 대상 워크플로의 워크트리 이름이 된다 — 영문·숫자·\`.\`·\`_\`·\`-\`)을 worker_done 에 \`items: <항목>, <항목>, ...\` 한 줄로 보고한다. 없으면 \`items:\` 만 쓴다" 를 넣는다. \`decision:\`·\`worktree:\` 줄이 있으면 그다음 줄에 쓴다.
-- 되돌아가기로 다시 띄우는 단계(2회차 이상)의 spec 에는 "<회차>회차다. 이 단계의 앞 회차 산출물과, 되돌아오게 한 분기를 판정한 단계의 산출물을 먼저 읽고 그 지적을 반영한다" 를 넣고, 산출물은 \`${artifactDir}/<n>-<nodeId>-r<회차>.txt\` 에 쓴다(1회차는 위 이름 그대로).
+- 되돌아가기로 다시 띄우는 단계(2회차 이상)의 spec 에는 "<회차>회차다. 이 단계의 앞 회차 산출물 \`<앞 회차 경로>\` 와, 되돌아오게 한 분기를 판정한 단계의 마지막 산출물 \`<판정 단계 경로>\` 를 먼저 읽고 그 지적을 반영한다" 를 넣고, 산출물은 \`${artifactDir}/<n>-<nodeId>-r<회차>.txt\` 에 쓴다(1회차는 위 이름 그대로). \`<회차>\` 는 판정 등록 응답의 \`loop.rounds[<nodeId>]\`(단계 기준 누적)다. 그래서 앞 회차 산출물은 언제나 \`-r<회차 - 1>\`(회차 - 1 이 1이면 \`-r\` 없는 이름)이고, 판정 단계의 마지막 산출물은 그 단계가 마지막으로 돈 회차의 이름이다 — 둘 다 정확한 경로를 spec 에 적는다. 워커가 「가장 최근 회차」를 골라야 하면 \`-r<k>\` 의 k 를 **숫자로** 비교해 가장 큰 것을 고르게 한다(이름 사전순이면 \`-r10\` 이 \`-r2\` 앞에 온다).
 - **모델별 병렬 워커**(\`fanout\` 단계의 자식 Task): spec 에 "이 단계는 모델마다 워커 하나씩 같은 지침으로 동시에 돈다. 너는 \`<name>\`(모델 \`<model>\`)이다. 다른 워커와 독립적으로 수행하고, 다른 워커의 산출물을 읽거나 기다리지 않는다. 지침의 \`<리뷰어>\`·\`<워커 이름>\` 자리에는 \`<name>\` 을 쓴다" 를 넣고, 산출물은 \`${artifactDir}/<n>-<nodeId>-<name>.txt\`(2회차 이상이면 \`-r<회차>-<name>.txt\`)에 쓰게 한다.
 - worker_done 본문은 3줄 이하: 결과, 산출물 경로, 결정이 필요한 것.
 

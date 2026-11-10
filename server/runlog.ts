@@ -29,6 +29,8 @@ export function outcomeOf(meta: RunLogMeta | undefined, events: RunEvent[]): Run
   const lastFinished = lastOf(events, 'finished');
   const lastTask = lastOf(events, 'task');
   if (lastFinished >= 0 && lastFinished > lastTask) return (events[lastFinished].status as RunLogOutcome) ?? 'completed';
+  // The coordinator's terminal disappeared from Orca and nothing finished the run since: no one will finish it.
+  if (lastOf(events, 'coordinator-lost') > lastFinished) return 'stalled';
   if (!meta?.runId) return meta ? 'pending' : 'unknown';
   const latest = new Map<string, StageStatus>();
   for (const event of events) if (event.type === 'execution' && event.taskId && event.status) latest.set(event.taskId, event.status);
@@ -77,7 +79,7 @@ export function createRunLog(root: string) {
         const meta = await readMeta(id);
         if (!meta?.runId || runLaunch.has(meta.runId)) continue;
         runLaunch.set(meta.runId, id);
-        if (recent(id) && outcomeOf(meta, await readEvents(id)) !== 'completed') active.add(id);
+        if (recent(id) && !['completed', 'stalled'].includes(outcomeOf(meta, await readEvents(id)))) active.add(id);
       }
     })();
     return indexed;
@@ -232,6 +234,34 @@ export function createRunLog(root: string) {
         if (report ? since(report) >= 60_000 : since(events[finished]) >= graceMs) due.push({ id, terminal: meta.coordinatorTerminal });
       }
       return due;
+    },
+    /**
+     * Recent launches still open whose coordinator terminal is known: the server checks that terminal is alive in Orca and
+     * marks the launch `stalled` (a `coordinator-lost` event) when it is gone before the run finished.
+     */
+    async coordinatorsToWatch(): Promise<{ id: string; terminal: string; runId?: string }[]> {
+      const due: { id: string; terminal: string; runId?: string }[] = [];
+      for (const id of await launches()) {
+        if (!recent(id)) continue;
+        const meta = await readMeta(id);
+        if (!meta?.coordinatorTerminal) continue;
+        const events = await readEvents(id);
+        // Finished (completed or failed), already stalled, or never started: nothing to watch.
+        const finished = lastOf(events, 'finished');
+        if ((finished >= 0 && finished > lastOf(events, 'task')) || lastOf(events, 'coordinator-lost') > finished
+          || events.some((event) => event.type === 'coordinator-failed')) continue;
+        due.push({ id, terminal: meta.coordinatorTerminal, ...(meta.runId ? { runId: meta.runId } : {}) });
+      }
+      return due;
+    },
+    /** Records that a launch's coordinator terminal is gone, unless the run finished meanwhile. Returns whether it was recorded. */
+    async markLost(id: string, terminal: string) {
+      const events = await readEvents(id);
+      const finished = lastOf(events, 'finished');
+      if ((finished >= 0 && finished > lastOf(events, 'task')) || lastOf(events, 'coordinator-lost') > finished) return false;
+      await append(id, { type: 'coordinator-lost', message: `코디네이터 터미널이 Orca 에서 사라졌는데 실행이 끝나지 않음 — 중단됨(stalled) · ${terminal}` });
+      active.delete(id);
+      return true;
     },
     /** meta.json of the launch that owns a Run, if any. */
     /**
