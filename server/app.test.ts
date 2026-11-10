@@ -502,6 +502,30 @@ test('brief gives each launching stage its model (default when unset) and effort
   assert.match(brief, /--model <그 단계의 model> \[--effort <그 단계의 effort>\]/);
   assert.match(brief, /`location`·`model`·`effort` 가 모두 직전 단계와 같으면/);
 });
+test('worker specs point at instruction files; waits are long by default and the brief says how to resume after compaction', async () => {
+  const { composeBrief } = await import('./execute.ts');
+  const stage = (id: string, kind = 'worker', extra = {}) => ({ id, type: 'stage' as const, position: { x: 0, y: 0 }, data: { label: id, description: `${id} 지침 {{who}}`, kind, ...extra } });
+  const graph = { ...newWorkflow(), id: 'wf-files', variables: [{ key: 'who', label: '누구', value: '' }],
+    nodes: [stage('one'), stage('pick', 'branch', { judge: 'previous', outputs: [{ id: 'a', label: 'A' }] }), stage('empty', 'worker', { description: '  ' })],
+    edges: [{ id: 'one-pick', source: 'one', target: 'pick' }, { id: 'pick-empty', source: 'pick', sourceHandle: 'a', target: 'empty' }] } as never;
+  const { brief, files } = composeBrief({ graph, count: 1, apiBase: 'http://127.0.0.1:1', workspace: '/example/repo', artifactDir: '/tmp/x', launchId: 'L1', values: { who: '나' } });
+  // Only workers with instructions get a file; the setting is already substituted in it.
+  assert.deepEqual(files, [{ path: '/tmp/x/instructions/one.md', content: '# one\n\none 지침 나\n' }]);
+  const stages = JSON.parse(brief.match(/```json\n(\[[\s\S]*?\])\n```/)![1]) as { nodeId: string; instructionsFile?: string }[];
+  assert.deepEqual(stages.map((item) => [item.nodeId, item.instructionsFile]), [['one', '/tmp/x/instructions/one.md'], ['pick', undefined], ['empty', undefined]]);
+  assert.match(brief, /지침을 spec 에 옮겨 쓰지 않는다/);
+  // Waiting: 5 minutes by default, 30 seconds only while something that does not wake by mail is open; keepalive lines dropped.
+  assert.match(brief, /check --wait --timeout-ms <ms> --json 2>\/dev\/null/);
+  assert.match(brief, /기본 `<ms>` 는 `300000`/);
+  assert.match(brief, /`30000`\(30초\)으로 짧게/);
+  assert.match(brief, /마지막 확인 뒤 5분이 지나지 않았으면 건너뛴다/);
+  assert.doesNotMatch(brief, /check --wait --timeout-ms 30000/);
+  // Resuming after compaction: re-read state from its sources, starting with the coordinator's own state file.
+  assert.match(brief, /## 컨텍스트가 요약된 뒤 이어가기/);
+  assert.match(brief, /\/tmp\/x\/coordinator-state\.txt/);
+  assert.match(brief, /curl -s http:\/\/127\.0\.0\.1:1\/api\/workflows\/wf-files\/logs\/L1/);
+  assert.match(brief, /task-list --run <run_id> --json/);
+});
 test('a gate can be asked in the terminal of the one worker before it', async () => {
   const { buildBrief, checkBranches } = await import('./execute.ts');
   const stage = (id: string, kind = 'worker', extra = {}) => ({ id, type: 'stage' as const, position: { x: 0, y: 0 }, data: { label: id, description: `${id} 지침`, kind, ...extra } });
@@ -1151,7 +1175,10 @@ test('a sub-coordinator spawn link prepares each item without launching an agent
     const childBrief = (await (await fetch(`${base}/api/workflows/per-ticket/logs/${first.results[0].launch}/files/brief.md`)).json()).text as string;
     assert.match(childBrief, /## 하위 코디네이터로 기동됨/);
     assert.match(childBrief, /--run <run_id>/);
-    assert.match(childBrief, /check --wait --run <run_id> --timeout-ms 30000/);
+    assert.match(childBrief, /check --wait --run <run_id>/);
+    assert.match(childBrief, /--timeout-ms <ms> --json 2>\/dev\/null/);
+    // Stage instructions of the child run are files next to its brief.
+    assert.match(childBrief, /"instructionsFile": "[^"]+\/instructions\/[^"]+\.md"/);
     assert.match(childBrief, /턴을 끝내서 기다리지 않는다/);
     assert.match(childBrief, /worker_done/);
     assert.match(childBrief, /run-use/);

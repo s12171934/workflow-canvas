@@ -250,6 +250,8 @@ export async function preflight(graph: Workflow, load: (id: string) => Promise<W
 
 type BriefStage = {
   nodeId: string; label: string; kind: string; instructions: string; location: string;
+  /** Worker stages: the canvas wrote `instructions` to this file; the coordinator's spec points at it instead of copying the text. */
+  instructionsFile?: string;
   /** Longest-path depth: stages with the same wave may run side by side. Stages are listed in topological order. */
   wave: number;
   /** `output`: the edge leaves this output of a branch, so it is taken only when the branch chooses it. */
@@ -282,6 +284,8 @@ type BriefStage = {
 };
 
 type BriefContext = { linked: Map<string, Workflow>; project: string; inputs: Record<string, string>; worktrees: WorktreeSpec[]; preparedGroup?: string;
+  /** Where stage instruction files go (`<dir>/<nodeId>.md`); absent: no files (flow view). */
+  instructionsDir?: string;
   /** Setting values for this level: the run's, with a linked workflow's own defaults filling keys the run does not set. */
   values: Record<string, string> };
 
@@ -329,6 +333,7 @@ function stagesOf(graph: Workflow, ctx: BriefContext, fallback: string, prefix =
     const feeds = stageEdges.filter((edge) => edge.source === node.id).map((edge) => byId.get(edge.target)!).filter(spawnsRuns);
     return {
       nodeId: `${prefix}${node.id}`, label: node.data.label, kind: node.data.kind, instructions: substituteVariables(node.data.description, textValues), location,
+      ...(ctx.instructionsDir && node.data.kind === 'worker' && node.data.description.trim() ? { instructionsFile: `${ctx.instructionsDir}/${prefix}${node.id}.md` } : {}),
       wave: wave.get(node.id) ?? 0,
       after: stageEdges.filter((edge) => edge.target === node.id).map((edge) => {
         const source = byId.get(edge.source)!;
@@ -405,11 +410,37 @@ export function flowOf(graph: Workflow, linked: Map<string, Workflow>): FlowStag
  * judges the natural-language conditions in node instructions, and reports bindings back
  * through the canvas API so the graph can observe the executions.
  */
-export function buildBrief({ graph, preparedGroup, linked = new Map(), count, apiBase, workspace, artifactDir, logUrl, launchId, inputs = {}, cleanup = defaultCleanup, automation, values, subcoordinator }: BriefInput): string {
+export function buildBrief(input: BriefInput): string { return composeBrief(input).brief; }
+
+/** A stage instruction file the canvas writes next to the brief (worker specs point at it instead of copying the text). */
+export type InstructionFile = { path: string; content: string };
+
+function instructionFiles(stages: BriefStage[]): InstructionFile[] {
+  return stages.flatMap((stage) => [
+    ...(stage.instructionsFile ? [{ path: stage.instructionsFile, content: `# ${stage.label}\n\n${stage.instructions}\n` }] : []),
+    ...(stage.workflow ? instructionFiles(stage.workflow.stages) : []),
+  ]);
+}
+
+/** The brief and the instruction files it refers to (written by the caller before the coordinator starts). */
+export function composeBrief({ graph, preparedGroup, linked = new Map(), count, apiBase, workspace, artifactDir, logUrl, launchId, inputs = {}, cleanup = defaultCleanup, automation, values, subcoordinator }: BriefInput): { brief: string; files: InstructionFile[] } {
   const automationJson = automation ? `,"automation":${JSON.stringify(automation)}` : '';
   const settings = values ?? resolveVariables(graph.variables).values;
-  const ctx: BriefContext = { linked, project: workspace, inputs, worktrees: [], values: settings, ...(preparedGroup ? { preparedGroup } : {}) };
+  const ctx: BriefContext = { linked, project: workspace, inputs, worktrees: [], values: settings, instructionsDir: `${artifactDir}/instructions`, ...(preparedGroup ? { preparedGroup } : {}) };
   const stages = stagesOf(graph, ctx, workspace);
+  const waitRule = `   - **기다리기**: \`check --wait\` 는 한 번에 \`orca orchestration check --wait --timeout-ms <ms> --json 2>/dev/null\` 로 부른다(표준 오류의 15초 keepalive 줄을 버린다. 오류는 \`--json\` 이면 표준 출력의 \`ok: false\` 로 온다). Bash 도구의 시간 제한은 \`<ms>\` 보다 1분 길게 준다(예: 360000). 결과는 자르지 않는다.
+     - 기본 \`<ms>\` 는 \`300000\`(5분)이다. 워커 보고(worker_done·ask·escalation)는 메일이라 오면 바로 깨므로, 길게 기다려도 진행이 늦어지지 않고 깰 때마다 쌓이는 출력만 줄어든다.
+     - 메일로 깨우지 않는 것을 기다리는 동안만 \`30000\`(30초)으로 짧게 기다린다: 캔버스 결정 카드로 받는 사용자 결정(게이트 judge \`user\`, judge \`user\` 분기, 워커가 묻는 게이트의 캔버스 선택)이 열려 있거나, \`script.detach\` 단계가 돌고 있을 때. 그런 것이 없어지면 다시 기본으로 돌아간다.
+     - 시간이 다 될 때 하는 확인(결정 조회·\`worker-list\`·\`.exit\`)은 아래 규칙에 적힌 것만 하고, 긴 JSON 은 필요한 필드만 jq 로 뽑아 본다.`;
+  const resumeSection = `
+## 컨텍스트가 요약된 뒤 이어가기
+실행이 길어 이 대화가 자동 요약(compaction)되면, 요약만 믿고 진행하지 않는다. 다음 단계를 띄우거나 판정을 보내기 전에 상태를 원본에서 다시 읽는다. 진행 상태의 정본은 아래이고, 기억과 다르면 원본을 따른다.
+- 실행 기록: \`curl -s ${apiBase}/api/workflows/${graph.id}/executions/<실행 id>/decisions\` 와 실행 로그(${launchId ? `\`curl -s ${apiBase}/api/workflows/${graph.id}/logs/${launchId}\`` : '캔버스 실행 로그'}) — 지금까지의 판정·회차(loop pass)·건너뛴 단계.
+- Orca: \`task-list --run <run_id> --json\`(단계 Task 상태), \`worker-list --run <run_id> --json\`(살아 있는 워커), \`gate-list --run <run_id> --json\`(열린 게이트).
+- 산출물 디렉터리 \`${artifactDir}\`: 단계 산출물과, 하위 코디네이터를 띄우는 링크가 있으면 \`<n>-<링크 nodeId>-children.txt\`(열린 하위 목록).
+- 이 브리프(\`${artifactDir}/brief.md\`)는 필요한 절만 grep 으로 다시 읽는다.
+run_id·실행 id·자기 Task·dispatch id 처럼 다시 찾기 어려운 값은 처음 정해질 때 \`${artifactDir}/coordinator-state.txt\` 에 한 줄씩 덧붙여 두고(Write 대신 \`printf ... >>\`), 요약 뒤에는 이 파일부터 읽는다.
+`;
   const worktrees = ctx.worktrees;
   const spawnsSub = (list: BriefStage[]): boolean => list.some((stage) => stage.spawn?.as === 'subcoordinator' || (stage.workflow ? spawnsSub(stage.workflow.stages) : false));
   const subSpawnSection = spawnsSub(stages) ? `
@@ -431,7 +462,7 @@ export function buildBrief({ graph, preparedGroup, linked = new Map(), count, ap
 이 실행은 「${subcoordinator.parentName.replace(/`/g, "'")}」 링크가 준비했고, 그 실행의 코디네이터(상위 코디네이터)가 너를 **워커로** 띄웠다. 너는 상위 Run 의 워커이면서 이 실행의 코디네이터다. 이 절은 아래 절차보다 우선한다.
 - 이 실행용 Run 은 아래 절차 1 대로 \`run-create\` 로 따로 만든다. 그 뒤 모든 \`task-*\`·\`gate-*\`·\`worker-*\`·\`check\` 명령에 \`--run <run_id>\`(자기 Run)를 붙인다. \`run-use\` 는 쓰지 않는다(다른 바인딩이 풀린다).
 - 메일은 두 갈래다. 자기 Run 의 워커 보고는 \`check --run <run_id>\`, 상위 코디네이터가 보낸 메일은 plain \`check\`(\`--run\` 없이)로 받는다.
-- 기다림은 \`check --wait --run <run_id> --timeout-ms 30000\` 반복이다(절차 5 의 \`check --wait\` 는 모두 이것이다). **턴을 끝내서 기다리지 않는다** — 워커가 보고 없이 턴을 끝내면 상위에 escalation 이 쌓이고 세 번이면 이 Task 가 실패 처리된다. 반복마다 plain \`check\`(대기 없이)로 상위 메일을 확인하고, 상위가 보낸 지시(예: 계약 정정)는 해당 단계 워커에게 전달하고 실행 로그 \`note\` 에 남긴다.
+- 기다림은 \`check --wait --run <run_id>\` 반복이다(절차 5 의 \`check --wait\` 는 모두 여기에 \`--run <run_id>\` 를 붙인 것이고, 시간 제한은 "기다리기" 그대로다). **턴을 끝내서 기다리지 않는다** — 워커가 보고 없이 턴을 끝내면 상위에 escalation 이 쌓이고 세 번이면 이 Task 가 실패 처리된다. 반복마다 plain \`check\`(대기 없이)로 상위 메일을 확인하고, 상위가 보낸 지시(예: 계약 정정)는 해당 단계 워커에게 전달하고 실행 로그 \`note\` 에 남긴다.
 - 사용자에게 직접 묻지 않는다(질문 도구도 쓰지 않는다). 사용자 결정은 아래 게이트 규칙 그대로 캔버스 결정 카드로 받는다.
 - 실행이 끝나면(완료·막힘·중단 어느 쪽이든. 사용자 결정이 열려 있으면 아직 끝나지 않은 것이다) 마무리 보고와 실행 로그 \`report\` 뒤 상위에 **worker_done** 을 한 번 보낸다. 명령은 너를 띄운 워커 프리앰블의 것(\`--task-id\`·\`--dispatch-id\`)을 그대로 쓴다. 본문 3줄: 결과 한 줄(완료/막힘/중단 + 배치 단위, 즉 실행 시 입력 값), 근거 경로(그래프가 남긴 \`_index\` 등 보고 파일), 판단할 것. 완료가 아니면 프리앰블이 정한 대로 실패 outcome(\`--outcome failed\`)으로 보낸다.
 - 자기 터미널을 닫지 않는다(상위가 release 한다). 정리 규칙의 워크트리 삭제가 네가 시작한 워크트리를 지우게 되면 그것은 하지 않고 보고에 남긴다.
@@ -459,7 +490,7 @@ ${JSON.stringify(worktrees, null, 2)}
    - 둘 다 없으면 \`--no-parent\`.
 4. 확정된 경로를 그 실행에서 해당 location 대신 쓴다. 진행하지 않을 단계만 있는 워크트리는 만들지 않는다. 만든 워크트리는 지우지 않고, 마무리 보고에 실행별 워크트리 경로와 재사용 여부를 남긴다.
 ` : '';
-  return `# 워크플로 실행 코디네이터 브리프
+  const brief = `# 워크플로 실행 코디네이터 브리프
 
 너는 ${automation ? `Orca 자동화 「${automation.name}」` : 'workflow-canvas 의 "실행" 버튼'}으로 기동된 **Orca 오케스트레이션 코디네이터**다.${automation ? `
 이 실행은 자동화로 시작되었다. 실행 목록을 등록할 때 모든 실행에 \`"automation":${JSON.stringify(automation).replace(/`/g, '')}\` 를 그대로 넣는다(캔버스가 적용된 자동화를 표시한다). 사용자가 자리에 없을 수 있으니, 사용자 입력이 필요한 곳(게이트·실행 중 입력)에서는 묻고 기다리되 다른 실행은 계속 진행한다.` : ''}
@@ -506,10 +537,11 @@ ${worktreeSection}
    - \`launch\` 는 이 실행 요청의 실행 로그 ID 다. 그대로 보낸다.` : ''}
    응답이 200 이 아니면 오류 메시지를 읽고 고쳐서 다시 보낸다.
 4. 각 실행에서 선행 단계가 없는 단계부터 \`worker-start --task <task_id> --worktree path:<그 단계의 location> --agent claude --model <그 단계의 model> [--effort <그 단계의 effort>]\` 로 띄운다. \`effort\` 가 없으면 \`--effort\` 를 빼고, 단계마다 정해진 값을 바꾸지 않는다. 모든 실행의 첫 물결을 먼저 띄운 뒤 기다린다. 띄우자마자 탭 이름을 "${graph.name.slice(0, 30)} #<n> · <단계 이름>" 으로 바꾼다.
-5. \`check --wait --timeout-ms 30000\` 을 반복하며 각 \`worker_done\` 을 처리한다. 진행 규칙은 정해져 있다. 네가 조건을 해석해 바꾸지 않는다.
+5. 아래 "기다리기" 대로 \`check --wait\` 를 반복하며 각 \`worker_done\` 을 처리한다. 진행 규칙은 정해져 있다. 네가 조건을 해석해 바꾸지 않는다.
+${waitRule}
    - **병렬·합류**: 분기가 아닌 연결은 모두 병렬이다. 한 단계는 \`after\` 의 선행 단계 Task 가 **모두 completed** 일 때 띄운다(건너뜀으로 닫힌 Task 도 completed 다). 선행이 여럿이면 마지막 것이 끝날 때까지 기다린다.
    - 단계를 띄울 때 \`location\`·\`model\`·\`effort\` 가 모두 직전 단계와 같으면 같은 터미널을 재사용하고(\`--terminal\`), 하나라도 다르면 새로 띄운다(\`--worktree path:<location> --model <model> [--effort <effort>]\`. \`--model\`·\`--effort\` 는 \`--terminal\` 과 함께 쓸 수 없다). 탭 이름을 바꾼다. 이어서 띄울 단계가 없는 워커는 release 한다.
-   - **죽은 워커**: \`check\` 가 시간이 다 될 때마다 \`worker-list\` 로 진행 중(dispatched) Task 의 워커 터미널이 살아 있는지 본다. 터미널이 닫혔거나(exited·없음) 워크트리가 사라졌는데 worker_done 이 없으면 **더 기다리지 않는다.** 그 Task 를 \`task-update --status failed --result "<사유>"\` 로 닫고 실행 로그 \`error\` 에 남긴 뒤, 그 단계에 의존하는 단계는 띄우지 않는다(그 실행은 실패로 끝난다). 산출물 파일이 이미 있으면 사유에 경로를 적는다. 같은 단계를 다시 띄우지 않는다.
+   - **죽은 워커**: \`check\` 가 시간이 다 될 때마다(마지막 확인 뒤 5분이 지나지 않았으면 건너뛴다) \`worker-list\` 로 진행 중(dispatched) Task 의 워커 터미널이 살아 있는지 본다. 터미널이 닫혔거나(exited·없음) 워크트리가 사라졌는데 worker_done 이 없으면 **더 기다리지 않는다.** 그 Task 를 \`task-update --status failed --result "<사유>"\` 로 닫고 실행 로그 \`error\` 에 남긴 뒤, 그 단계에 의존하는 단계는 띄우지 않는다(그 실행은 실패로 끝난다). 산출물 파일이 이미 있으면 사유에 경로를 적는다. 같은 단계를 다시 띄우지 않는다.
    - **워커 판정 분기(kind \`branch\`, judge \`previous\`·\`worker\`)**: 선행 단계가 끝나면 판정을 받는다.
      - \`previous\`: 직전 워커의 worker_done 첫 줄 \`decision: <출력 id>[,<출력 id>...]\` 를 쓴다. 분기 Task 에는 워커를 띄우지 않는다.
      - \`worker\`: 분기 Task 에 그 단계의 \`model\`·\`effort\` 로 워커를 띄운다. spec 은 분기 지침과 출력 목록(id·조건)이고, 근거로 선행 단계의 산출물을 읽게 한다. 그 워커의 worker_done 첫 줄 \`decision:\` 을 쓴다.
@@ -523,7 +555,7 @@ ${worktreeSection}
    - **사용자 결정(kind \`gate\` judge \`user\`, 그리고 judge \`user\` 인 \`branch\`)**: 자동으로 고르지 않는다. 그리고 **답을 기다리며 멈추지 않는다.** 결정은 여러 실행·여러 단계에서 서로 다른 시점에 생기므로, 하나를 묻고 기다리면 그동안 다른 워커 보고와 다른 결정이 모두 막힌다.
      - 선행 단계가 끝나면 먼저 아래 decisions 조회로 판정이 이미 등록됐는지 본다(대시보드 등 캔버스 밖에서 미리 고를 수 있다). 있으면 게이트를 걸지 않고 곧바로 "판정 반영" 을 한다.
      - 없으면 그 Task 에 \`gate-create\` 로 결정 게이트를 건다(질문은 단계 지침, 선택지는 \`branch.outputs\` 의 조건). 실행 로그에 \`gate\` 를 남기고, 이 터미널에 "결정 대기 · <단계 이름> #<n> · 캔버스에서 고르거나 여기에 답하세요" 한 줄을 출력한다.
-     - **질문 도구(AskUserQuestion 등)로 묻거나, 답을 받으려고 턴을 끝내지 않는다.** 곧바로 \`check --wait --timeout-ms 30000\` 반복으로 돌아간다.
+     - **질문 도구(AskUserQuestion 등)로 묻거나, 답을 받으려고 턴을 끝내지 않는다.** 곧바로 \`check --wait\` 반복(짧은 대기)으로 돌아간다.
      - 사용자는 캔버스의 결정 대기 카드에서 고른다. 캔버스가 판정을 등록한다. \`check\` 가 깨거나 시간이 다 될 때마다, 결정 대기 중인 실행마다 등록된 판정을 확인한다:
        \`\`\`sh
        curl -s ${apiBase}/api/workflows/${graph.id}/executions/<실행 id>/decisions
@@ -561,6 +593,7 @@ ${worktreeSection}
    - **판정 반영**: \`skippedTasks\` 의 Task 를 모두 \`task-update --status completed --result skipped\` 로 닫고(합류 단계의 deps 를 풀기 위해서다. 캔버스는 이 Task 들을 건너뜀으로 표시한다. 이미 닫은 것은 넘어간다), 분기·게이트 Task 를 \`task-update --status completed --result "decision: <출력 id>"\` 로 닫은 뒤 진행 규칙대로 다음 단계를 띄운다. 게이트를 거절(\`reject\`)하면 뒤 단계가 모두 건너뜀이 된다.
 6. 모든 실행이 끝나면(모든 단계가 completed(건너뜀 포함)이거나, 실패한 Task 때문에 더 띄울 단계가 없으면) 아래 "완료 시 정리" 를 따른 뒤 마무리 보고를 한다. 사용자 결정이 남아 있으면 끝내지 않고 5의 반복을 계속한다. 마무리 보고 뒤에는 사용자에게 후속 작업을 묻거나 제안하지 않는다 — 남은 확인은 보고에만 적는다.
 
+${resumeSection}
 ${logUrl ? `## 실행 로그
 캔버스가 실행 로그를 남긴다. Task 상태 변화는 캔버스가 직접 기록하므로, 너는 **판단과 사람 개입**만 기록한다. 아래 때마다 한 번씩 보낸다:
 - \`worker\`: worker_done 을 처리할 때. 메시지는 "<단계 이름> #<n>: <결과 한 줄> → <진행/중단 판단과 근거>".
@@ -576,7 +609,7 @@ curl -s -X POST -H 'Content-Type: application/json' ${logUrl} \\
 \`taskId\` 는 해당하면 넣고, 아니면 뺀다. message 는 2000자 이하. 실패해도 실행은 계속한다.
 
 ` : ''}## 워커 spec 규칙
-- 단계 지침을 그대로 Change 로 쓰고, Target·Constraints·Ownership·Acceptance 를 채운다.
+- 단계에 \`instructionsFile\` 이 있으면 지침을 spec 에 옮겨 쓰지 않는다. Change 는 "\`<instructionsFile>\` 의 지침을 읽고 그대로 수행한다" 한 줄이다(캔버스가 그 단계 지침을 이 파일에 이미 써 두었다. 파일을 고치거나 다시 읽어 요약하지 않는다). 없으면 단계 지침을 그대로 Change 로 쓴다. 어느 쪽이든 Target·Constraints·Ownership·Acceptance 를 채운다.
 - 작업 위치: 그 단계의 \`location\`. 그 밖의 파일은 수정하지 않는다. 워커는 자기 \`location\` 워크트리를 지우거나 그 안의 터미널을 닫지 않는다(자기 터미널이 함께 닫혀 worker_done 을 보낼 수 없다). 지침이 그런 정리를 요구하면 하지 말고 worker_done 에 "코디네이터 정리 필요" 로 보고한다.
 - 단계에 \`namesWorktree\` 가 있으면 spec 에 "작업을 마치면 이후 단계가 쓸 워크트리 이름(영문·숫자·\`.\`·\`_\`·\`-\`)을 정하거나 직접 만들고, worker_done 첫 줄에 \`worktree: <이름 또는 절대 경로>\` 로 보고한다" 를 넣는다.
 - 산출물·로그는 \`${artifactDir}/<n>-<nodeId>.txt\` 에 쓴다.
@@ -594,4 +627,5 @@ curl -s -X POST -H 'Content-Type: application/json' ${logUrl} \\
 ## 마무리 보고 (이 터미널에)
 실행별 한 줄 표(실행 · 단계별 결과 · 근거 파일). 해결되지 않은 것이 있으면 따로 적는다.
 `;
+  return { brief, files: instructionFiles(stages) };
 }

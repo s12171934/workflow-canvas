@@ -2,10 +2,10 @@ import express from 'express';
 import type { ErrorRequestHandler, Request } from 'express';
 import { createOrcaBridge } from './orca.ts';
 import { mkdir, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { createStorage, validId, validateWorkflow } from './storage.ts';
-import { buildBrief, checkBranches, checkScripts, checkCoordinatorGroup, checkGroups, checkLoops, checkSpawns, checkVariables, flowOf, linkedWorkflows, preflight } from './execute.ts';
+import { composeBrief, checkBranches, checkScripts, checkCoordinatorGroup, checkGroups, checkLoops, checkSpawns, checkVariables, flowOf, linkedWorkflows, preflight } from './execute.ts';
 import { autoLayout } from '../src/layout.ts';
 import { briefPrompt, generatedWorkflow, generationTimeoutMs, maxPromptLength, workflowPrompt, type Generation } from './generate.ts';
 import { createModelCatalog } from './models.ts';
@@ -354,10 +354,16 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
         + (Object.values(settings.inputs).some(Boolean) ? ` · 입력 ${Object.values(settings.inputs).filter(Boolean).join('·')}` : '') });
       const briefPath = join(artifactDir, 'brief.md');
       const preparedGroup = settings.preparedGroup ?? (settings.coordinatorInGroup && graph.coordinatorGroup ? graph.coordinatorGroup : undefined);
-      await writeFile(briefPath, buildBrief({ graph, ...(preparedGroup ? { preparedGroup } : {}), linked, count: settings.count, apiBase, workspace: settings.project, artifactDir,
+      const composed = composeBrief({ graph, ...(preparedGroup ? { preparedGroup } : {}), linked, count: settings.count, apiBase, workspace: settings.project, artifactDir,
         logUrl: `${apiBase}/api/workflows/${id}/logs/${logId}/events`, launchId: logId, values: settings.values,
         inputs: settings.inputs, cleanup: settings.cleanup, automation: settings.automation,
-        ...(settings.parent ? { subcoordinator: { parentName: settings.origin ?? settings.parent.workflowId } } : {}) }), { mode: 0o600 });
+        ...(settings.parent ? { subcoordinator: { parentName: settings.origin ?? settings.parent.workflowId } } : {}) });
+      // Stage instructions go to files first: worker specs point at them instead of the coordinator copying the text into its context.
+      for (const file of composed.files) {
+        await mkdir(dirname(file.path), { recursive: true });
+        await writeFile(file.path, file.content, { mode: 0o600 });
+      }
+      await writeFile(briefPath, composed.brief, { mode: 0o600 });
       await runlog.append(logId, { type: 'brief', message: '코디네이터 브리프 작성' });
       return { briefPath, logId, launchKey };
     } catch (error) { launches.delete(launchKey); throw error; }
