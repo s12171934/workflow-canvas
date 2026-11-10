@@ -6,6 +6,7 @@ import type { AddressInfo } from 'node:net';
 import { get } from 'node:http';
 import { createApp } from './app.ts';
 import { createOrcaBridge } from './orca.ts';
+import { launchDirName } from './runlog.ts';
 import { newWorkflow } from '../src/model.ts';
 
 /** Orca answers for the run dialog's project check. */
@@ -331,7 +332,8 @@ test('execution log keeps finished executions: results, completion events, legac
   });
   const graph = newWorkflow();
   // A launch from before execution logs: only a brief and a report, and the workflow still points at its Run.
-  const legacy = `2026-10-31T17-48-45-819Z-${graph.id}`;
+  // Dated an hour ago: the background watcher only follows launches from the last 7 days.
+  const legacy = launchDirName(new Date(Date.now() - 60 * 60 * 1000), graph.id);
   await mkdir(join(directory, '.executions', legacy), { recursive: true });
   await writeFile(join(directory, '.executions', legacy, 'report.md'), '# 보고');
   const app = createApp(directory, bridge, { watchMs: 20 });

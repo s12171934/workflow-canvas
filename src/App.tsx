@@ -16,6 +16,14 @@ import {
   neighbors, relationTo, type Relation, tallyStatuses, summarizeExecution,
   type Workflow, type Execution, type StageNode, type StageKind, type NodeKind, type GroupScope, type StageStatus, type RunSummary, type RunSnapshot, type Locations,
 } from './model';
+import { InstructionDialog, InstructionPreview } from './InstructionEditor';
+
+function descriptionLabel(kind: NodeKind): string {
+  return kind === 'note' ? '메모 내용' : kind === 'gate' ? '사용자에게 물을 내용' : kind === 'branch' ? '판정 지침' : kind === 'workflow' ? '추가 지침' : '작업 지침';
+}
+function descriptionPlaceholder(kind: NodeKind): string {
+  return kind === 'note' ? '실행에 쓰이지 않는 설명입니다.' : kind === 'branch' ? '무엇을 근거로 어느 출력을 고를지 적으세요.' : kind === 'gate' ? '무엇을 확인하고 통과·거절을 정할지 적으세요.' : '목표, 작업 범위, 완료 조건을 적으세요.';
+}
 import { RunLogDialog } from './RunLog';
 
 /** Background tabs skip Orca polls: each one costs the server CLI processes. */
@@ -319,6 +327,7 @@ function Workspace() {
   const [view, setView] = useState<string>('all');
   const [runDialog, setRunDialog] = useState(false);
   const [logOpen, setLogOpen] = useState(false);
+  const [instructionNodeId, setInstructionNodeId] = useState<string | null>(null);
   const [runForm, setRunForm] = useState<RunForm>({ mode: 'now', project: '', count: 1, inputs: {}, cleanup: defaultCleanup, values: {},
     name: '', trigger: 'daily', cron: '0 9 * * 1-5', time: '09:00', day: 1 });
   const [watchUntil, setWatchUntil] = useState(0);
@@ -329,6 +338,7 @@ function Workspace() {
   const fingerprint = JSON.stringify(current);
   const dirty = fingerprint !== savedFingerprint;
   const selected = nodes.find((node) => node.id === selectedId);
+  const instructionNode = instructionNodeId ? nodes.find((node) => node.id === instructionNodeId && !isGroup(node) && !isFrame(node)) : undefined;
   const selectedEdge = edges.find((edge) => edge.id === selectedEdgeId);
   const multiSet = useMemo(() => new Set(multiIds.filter((id) => nodes.some((node) => node.id === id))), [multiIds, nodes]);
   const stale = !!snapshotError || (!!workflow.runId && !snapshot);
@@ -1334,7 +1344,8 @@ function Workspace() {
                 <option value="all">{joinNames.all} — 앞 경로가 하나라도 건너뛰어지면 이 단계도 건너뜀</option>
                 <option value="any">{joinNames.any} — 분기에서 갈라진 경로가 다시 모이는 곳</option></select>
               <p className="field-help">어느 쪽이든 실제로 진행 중인 앞 단계가 모두 끝난 뒤에 시작합니다.</p></>}
-            <label className="field-label" htmlFor="stage-description">{selected.data.kind === 'note' ? '메모 내용' : selected.data.kind === 'gate' ? '사용자에게 물을 내용' : selected.data.kind === 'branch' ? '판정 지침' : selected.data.kind === 'workflow' ? '추가 지침' : '작업 지침'}</label><textarea id="stage-description" rows={5} value={selected.data.description} maxLength={20000} placeholder={selected.data.kind === 'note' ? '실행에 쓰이지 않는 설명입니다.' : selected.data.kind === 'branch' ? '무엇을 근거로 어느 출력을 고를지 적으세요.' : selected.data.kind === 'gate' ? '무엇을 확인하고 통과·거절을 정할지 적으세요.' : '목표, 작업 범위, 완료 조건을 적으세요.'} onChange={(event) => updateNode({ description: event.target.value })} />
+            <InstructionPreview label={descriptionLabel(selected.data.kind)} value={selected.data.description} placeholder={descriptionPlaceholder(selected.data.kind)} readOnly={viewOnly}
+              onOpen={() => setInstructionNodeId(selected.id)} />
             {selected.data.kind !== 'note' && (() => {
               const declared = new Set((workflow.variables ?? []).map((item) => item.key));
               const unknown = variableRefs(selected.data.description).filter((key) => !declared.has(key));
@@ -1427,6 +1438,10 @@ function Workspace() {
       </div>
       <footer className="statusbar"><span><Circle size={10} />{dirty ? '저장하지 않은 변경 사항' : '로컬 저장 완료'}</span><span>{workflow.runId ? `3초 간격 조회 · ${snapshot && !stale ? new Date(snapshot.observedAt).toLocaleTimeString('ko-KR') : '상태 확인 중'}` : 'Orca Run을 연결하면 실제 실행 상태가 표시됩니다.'}</span><span>JSON v1</span></footer>
     </main>
+    {instructionNode && <InstructionDialog key={instructionNode.id} title={instructionNode.data.label} label={descriptionLabel(instructionNode.data.kind)}
+      value={instructionNode.data.description} placeholder={descriptionPlaceholder(instructionNode.data.kind)} variables={workflow.variables ?? []}
+      checkVariables={instructionNode.data.kind !== 'note'} onClose={() => setInstructionNodeId(null)}
+      onApply={(description) => setNodes((items) => items.map((node) => node.id === instructionNode.id ? { ...node, data: { ...node.data, description } } : node))} />}
     {logOpen && <RunLogDialog workflowId={workflow.id} workflowName={workflow.name} onClose={() => setLogOpen(false)} />}
     {runDialog && <div className="modal-scrim" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setRunDialog(false); }}>
       <form className="modal" role="dialog" aria-modal="true" aria-labelledby="run-title" onSubmit={(event) => { event.preventDefault(); void submitRun(); }}
