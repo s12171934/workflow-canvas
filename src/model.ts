@@ -76,6 +76,13 @@ export const launchesWorker = (node: Pick<StageNode, 'data'>) => node.data.kind 
  * `models` is the list kept on the canvas; `variable` names a run setting whose comma-separated value, when given, replaces it.
  */
 export type ModelFanout = { models: string[]; variable?: string };
+/**
+ * Worker stages that share a `session` key run in one agent session (one terminal) within an execution: the first one the
+ * coordinator reaches launches it with its model·effort and keeps it open, the rest are dispatched into that terminal
+ * (`worker-start --terminal`), so the agent keeps its context across stages (e.g. the implementer that also judges and commits).
+ */
+export const sessionKeyPattern = /^[a-z][a-z0-9-]{0,31}$/;
+export const sessionOf = (node: Pick<StageNode, 'data'>) => (node.data.kind === 'worker' && !node.data.fanout && node.data.session) || undefined;
 export const fansOut = (node: Pick<StageNode, 'data'>) => node.data.kind === 'worker' && !!node.data.fanout;
 /** The Orca agent (`worker-start --agent`) that runs a model: GPT·Codex models run in Codex, the rest in Claude Code. */
 export function agentOf(model: string): 'claude' | 'codex' { return /^(gpt|codex|o\d)/i.test(model) ? 'codex' : 'claude'; }
@@ -183,6 +190,8 @@ export type StageData = {
   effort?: Effort;
   /** kind 'worker': run one worker per model in parallel instead of one worker (see `ModelFanout`); `workerModel` is then unset. */
   fanout?: ModelFanout;
+  /** kind 'worker' (not fanout): stages with the same key run in one agent session within an execution (see `sessionOf`). */
+  session?: string;
   /** kind 'script': the command (a shell script, {{settings}} allowed), how its output is read, and how it runs. */
   command?: string;
   parse?: ScriptParse;
@@ -604,7 +613,8 @@ export function serializableWorkflow(workflow: Workflow): Workflow {
         ...(node.data.taskId ? { taskId: node.data.taskId } : {}) });
     } else if (node.data.taskId) data.taskId = node.data.taskId;
     if (launchesWorker(node)) Object.assign(data, { ...(node.data.workerModel && !fansOut(node) ? { workerModel: node.data.workerModel } : {}), ...(node.data.effort ? { effort: node.data.effort } : {}),
-      ...(fansOut(node) ? { fanout: { models: [...node.data.fanout!.models], ...(node.data.fanout!.variable ? { variable: node.data.fanout!.variable } : {}) } } : {}) });
+      ...(fansOut(node) ? { fanout: { models: [...node.data.fanout!.models], ...(node.data.fanout!.variable ? { variable: node.data.fanout!.variable } : {}) } } : {}),
+      ...(sessionOf(node) ? { session: sessionOf(node) } : {}) });
     if (!group && isExecutable(node) && node.data.join === 'any') data.join = 'any';
     if (node.data.kind === 'gate' && (node.data.asker === 'previous' || node.data.asker === 'auto')) data.asker = node.data.asker;
     const width = node.width ?? node.measured?.width;

@@ -57,6 +57,7 @@ ${input.request}
   - \`note\`: 실행과 무관한 메모.
 - 분기에서 갈라진 경로가 다시 모이는 단계는 \`join: "any"\` 로 둔다(하나라도 오면 진행).
 - 워커·판정 워커 단계는 필요할 때만 \`workerModel\`(${(input.models ?? workerModels).join(', ')}; 없으면 ${defaultWorkerModel})과 \`effort\`(${effortLevels.join(', ')}; 없으면 모델 기본)를 지정한다. 단순 작업은 가벼운 모델, 설계·검토처럼 깊은 판단은 높은 effort.
+- 여러 단계를 같은 에이전트가 맥락을 이어 맡아야 하면(예: 구현한 에이전트가 리뷰 뒤 판정·커밋까지) 그 워커 단계들에 같은 \`session\`(영문 소문자·숫자·-)을 준다. 한 실행 안에서 한 터미널이 이어 맡고, 처음 띄우는 단계의 모델·effort 로 돈다. 같은 세션의 단계는 같은 워크트리 그룹에 둔다.
 - 프로젝트·워크트리 그룹은 만들지 않는다(사용자가 캔버스에서 묶는다). 위치(position)도 쓰지 않는다(캔버스가 배치한다).
 - 단계는 요청을 이루는 데 필요한 만큼만. 한 워커가 할 수 있는 일을 쪼개지 않는다.
 
@@ -141,6 +142,7 @@ export function generatedWorkflow(raw: unknown, id: string): Workflow {
     const pick = (keys: string[]) => Object.fromEntries(keys.filter((key) => item[key] !== undefined).map((key) => [key, item[key]]));
     const data = { label: str(item.label) ?? '', description: str(item.description) ?? '', kind,
       ...pick(['workerModel', 'effort', 'join']),
+      ...(kind === 'worker' ? pick(['session']) : {}),
       ...(kind === 'branch' ? pick(['mode', 'judge', 'outputs']) : {}),
       ...(kind === 'gate' ? pick(['asker']) : {}),
       ...(kind === 'workflow' ? pick(['workflowId', 'linkMode']) : {}) } as StageNode['data'];

@@ -12,7 +12,7 @@ import {
 } from 'lucide-react';
 import {
   aggregateStatus, executionFinished, executionRun, executionStatuses as computeExecutionStatuses, mergeSnapshots, workflowRuns, openableStatuses, fromSnapshot, newWorkflow, projectNodes, serializableWorkflow, statusLabels,
-  asksAtRun, scriptParseNames, maxScriptTimeout, type ScriptParse, defaultWorkerModel, effortLevels, frameContents, isFrame, launchesWorker, workerModels, fansOut, parseModelList, agentOf, type Effort, type Rect, joinNames, pendingDecisions, gateAskerNames, type GateAsker, linkModeNames, maxSpawnItems, type LinkMode, spawnAsNames, type SpawnAs, variableKeyPattern, variableRefs, maxVariables, maxVariableValue, type WorkflowVariable, loopBody, maxLoopRounds, type WorkflowEdge, type FlowStage, type PendingDecision, branchJudgeNames, branchModeNames, isBranch, maxBranchOutputs, type BranchJudge, type BranchMode, type BranchOutput, defaultCleanup, triggerNames, worktreeNamePattern, type AutomationConfig, type AutomationState, type Cleanup, canNest, maxGroupDepth, nameSourceNames, safeWorktreeName, type NameSource, createsWorktree, groupOf, membershipOf, orderNodes, worktreeRepo, isExecutable, isGroup, kindNames, normalizeNodes, scopeNames, cleanTag, groupByTag, maxTags, maxTagLength,
+  asksAtRun, scriptParseNames, maxScriptTimeout, type ScriptParse, defaultWorkerModel, effortLevels, sessionKeyPattern, sessionOf, frameContents, isFrame, launchesWorker, workerModels, fansOut, parseModelList, agentOf, type Effort, type Rect, joinNames, pendingDecisions, gateAskerNames, type GateAsker, linkModeNames, maxSpawnItems, type LinkMode, spawnAsNames, type SpawnAs, variableKeyPattern, variableRefs, maxVariables, maxVariableValue, type WorkflowVariable, loopBody, maxLoopRounds, type WorkflowEdge, type FlowStage, type PendingDecision, branchJudgeNames, branchModeNames, isBranch, maxBranchOutputs, type BranchJudge, type BranchMode, type BranchOutput, defaultCleanup, triggerNames, worktreeNamePattern, type AutomationConfig, type AutomationState, type Cleanup, canNest, maxGroupDepth, nameSourceNames, safeWorktreeName, type NameSource, createsWorktree, groupOf, membershipOf, orderNodes, worktreeRepo, isExecutable, isGroup, kindNames, normalizeNodes, scopeNames, cleanTag, groupByTag, maxTags, maxTagLength,
   neighbors, relationTo, type Relation, tallyStatuses, summarizeExecution,
   type Workflow, type Execution, type StageNode, type StageKind, type NodeKind, type GroupScope, type StageStatus, type RunSummary, type RunSnapshot, type Locations,
   type WorkflowLive,
@@ -105,6 +105,7 @@ function StageCard({ data, selected, width }: NodeProps<StageNode>) {
     : launchesWorker({ data }) && (data.workerModel || data.effort) && <div className="fanout-chips" title="이 단계 워커의 모델·추론 수준(effort)">
       <span className={`launch-chip ${agentOf(data.workerModel || defaultWorkerModel)}`}><AgentIcon agent={agentOf(data.workerModel || defaultWorkerModel)} />{(data.workerModel || defaultWorkerModel).replace(/^claude-/, '')}</span>
       {data.effort && <span className={`launch-chip effort ${data.effort}`}>{data.effort}</span>}</div>}
+    {sessionOf({ data }) && <div className="fanout-chips" title="같은 세션의 단계는 한 에이전트 세션이 이어서 맡습니다"><span className="launch-chip setting">세션 {sessionOf({ data })}</span></div>}
     {data.membership && <div className="membership-chips" aria-label="소속">
       {data.membership.project && <span className="member-chip project"><FolderGit2 size={11} />{data.membership.project}</span>}
       {data.membership.worktrees.map((name, index) => <span key={index} className="member-link">
@@ -1579,7 +1580,12 @@ function Workspace() {
               <select id="stage-effort" value={selected.data.effort ?? ''} onChange={(event) => updateNode({ effort: (event.target.value || undefined) as Effort | undefined })}>
                 <option value="">기본값 (모델 기본)</option>
                 {effortLevels.map((level) => <option key={level} value={level}>{level}</option>)}</select>
-              <p className="field-help">{selected.data.kind === 'branch' ? '판정 전용 워커를 이 설정으로 띄웁니다. ' : ''}비워 두면 기본값을 씁니다. 직전 단계와 위치·모델·effort 가 모두 같을 때만 터미널을 이어 씁니다.</p></>}
+              <p className="field-help">{selected.data.kind === 'branch' ? '판정 전용 워커를 이 설정으로 띄웁니다. ' : ''}비워 두면 기본값을 씁니다. 직전 단계와 위치·모델·effort 가 모두 같을 때만 터미널을 이어 씁니다.</p>
+              {selected.data.kind === 'worker' && !fansOut(selected) && <>
+                <label className="field-label" htmlFor="stage-session">세션</label>
+                <input id="stage-session" key={`${selected.id}:session`} defaultValue={selected.data.session ?? ''} placeholder="예: impl"
+                  onBlur={(event) => { const value = event.target.value.trim(); updateNode({ session: sessionKeyPattern.test(value) ? value : undefined }); }} />
+                <p className="field-help">같은 세션 이름을 가진 단계들은 한 실행 안에서 한 에이전트 세션(한 터미널)이 이어서 맡습니다. 처음 띄우는 단계의 모델·effort 로 돌고, 뒤 단계는 같은 터미널에 Task 로 들어갑니다. 영문 소문자·숫자·- 로 적습니다.</p></>}</>}
             {isExecutable(selected) && <p className="field-help">작업 위치 · {(() => {
               const { project, worktrees } = membershipOf({ nodes }, selected);
               const group = worktrees[worktrees.length - 1] ?? project;

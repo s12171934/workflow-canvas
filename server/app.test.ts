@@ -618,6 +618,38 @@ test('worker specs point at instruction files; waits are long by default and the
   assert.match(brief, /curl -s http:\/\/127\.0\.0\.1:1\/api\/workflows\/wf-files\/logs\/L1/);
   assert.match(brief, /task-list --run <run_id> --json/);
 });
+test('worker stages that share a session run in one agent session the coordinator dispatches into', async () => {
+  const { buildBrief, checkSessions, preflight } = await import('./execute.ts');
+  const { validateWorkflow } = await import('./storage.ts');
+  const stage = (id: string, kind = 'worker', extra = {}) => ({ id, type: 'stage' as const, position: { x: 0, y: 0 }, data: { label: id, description: `${id} 지침`, kind, ...extra } });
+  const edge = (source: string, target: string) => ({ id: `${source}-${target}`, source, target });
+  const graph = { ...newWorkflow(), id: 'wf-session',
+    nodes: [stage('implement', 'worker', { session: 'impl', effort: 'xhigh' }), stage('review', 'worker', { fanout: { models: ['claude-opus-5-5'] } }),
+      stage('judge', 'worker', { session: 'impl', effort: 'high' }), stage('commit', 'worker', { session: 'impl' })],
+    edges: [edge('implement', 'review'), edge('review', 'judge'), edge('judge', 'commit')] } as never as Parameters<typeof buildBrief>[0]['graph'];
+  validateWorkflow(graph);
+  checkSessions([graph]);
+  const brief = buildBrief({ graph, count: 1, apiBase: 'http://127.0.0.1:1', workspace: '/example/repo', artifactDir: '/tmp/x' });
+  const stages = JSON.parse(brief.match(/```json\n(\[[\s\S]*?\])\n```/)![1]) as { nodeId: string; session?: string }[];
+  assert.deepEqual(stages.map((item) => [item.nodeId, item.session]), [['implement', 'impl'], ['review', undefined], ['judge', 'impl'], ['commit', 'impl']]);
+  assert.match(brief, /\*\*세션 단계\(`session` 이 있는 단계\)\*\*/);
+  assert.match(brief, /--keep-open/);
+  assert.match(brief, /worker-start --task <task_id> --terminal <세션 터미널>/);
+  assert.match(brief, /세션 <session>: <터미널 핸들>/);
+  assert.match(brief, /세션 소실: <session> <핸들>/);
+  assert.match(brief, /너는 이 실행의 세션 `<session>` 이다/);
+  // Later stages of a session keep the first stage's model·effort: preflight says so.
+  const report = await preflight(graph, async () => { throw new Error('no links'); });
+  assert.ok(report.checks.find((item) => item.name === 'sessions')?.ok);
+  assert.ok(report.warnings.some((item) => /세션 'impl' 의 단계마다 모델·effort 가 다릅니다\(implement: claude-opus-5-5 · xhigh \/ judge: claude-opus-5-5 · high\)/.test(item)));
+  // Stages that set nothing inherit the session's values and are not mentioned.
+  assert.ok(!report.warnings.some((item) => /commit/.test(item)));
+  // A session is one terminal: its stages cannot sit in different worktree groups; fanout and non-worker stages have none.
+  const split = { ...graph, nodes: graph.nodes.map((node) => node.id === 'commit' ? { ...node, parentId: 'other' } : node) } as never as typeof graph;
+  assert.throws(() => checkSessions([split]), /서로 다른 워크트리 그룹/);
+  assert.throws(() => validateWorkflow({ ...graph, nodes: [...graph.nodes, stage('bad', 'worker', { session: 'Impl!' })] } as never), /.+/);
+  assert.throws(() => validateWorkflow({ ...graph, nodes: [...graph.nodes, stage('fan', 'worker', { session: 'impl', fanout: { models: ['claude-opus-5-5'] } })] } as never), /.+/);
+});
 test('a gate can be asked in the terminal of the one worker before it', async () => {
   const { buildBrief, checkBranches } = await import('./execute.ts');
   const stage = (id: string, kind = 'worker', extra = {}) => ({ id, type: 'stage' as const, position: { x: 0, y: 0 }, data: { label: id, description: `${id} 지침`, kind, ...extra } });
