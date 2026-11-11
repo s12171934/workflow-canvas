@@ -5,7 +5,7 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { createStorage, validId, validateWorkflow } from './storage.ts';
-import { composeBrief, checkBranches, checkScripts, checkCoordinatorGroup, checkGroups, checkLoops, checkSpawns, checkVariables, flowOf, linkedWorkflows, preflight } from './execute.ts';
+import { composeBrief, checkBranches, checkScripts, checkCoordinatorGroup, checkGroups, checkLoops, checkSpawns, checkVariables, checkSessions, flowOf, linkedWorkflows, preflight } from './execute.ts';
 import { autoLayout } from '../src/layout.ts';
 import { briefPrompt, generatedWorkflow, generationTimeoutMs, maxPromptLength, workflowPrompt, type Generation } from './generate.ts';
 import { createModelCatalog } from './models.ts';
@@ -437,7 +437,7 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
   async function prepareRun(id: string, graph: Workflow, settings: RunSettings, apiBase: string): Promise<{ briefPath: string; logId: string; launchKey: string; title: string }> {
     if (!graph.nodes.some(isExecutable)) throw new RunError(400, '실행할 단계가 없습니다.');
     let linked: Map<string, Workflow>;
-    try { linked = await linkedWorkflows(graph, (linkId) => storage.load(linkId)); checkGroups([graph, ...linked.values()]); checkBranches([graph, ...linked.values()]); checkSpawns([graph, ...linked.values()], linked); checkScripts([graph, ...linked.values()]); checkVariables([graph, ...linked.values()]); checkLoops([graph, ...linked.values()], linked); checkCoordinatorGroup(graph); }
+    try { linked = await linkedWorkflows(graph, (linkId) => storage.load(linkId)); checkGroups([graph, ...linked.values()]); checkBranches([graph, ...linked.values()]); checkSpawns([graph, ...linked.values()], linked); checkScripts([graph, ...linked.values()]); checkSessions([graph, ...linked.values()]); checkVariables([graph, ...linked.values()]); checkLoops([graph, ...linked.values()], linked); checkCoordinatorGroup(graph); }
     catch (error) { throw new RunError(400, (error as Error).message); }
     // Requests with different run-time inputs (one per ticket, say) run side by side; the same inputs never overlap.
     const inputs = inputsKey(settings.inputs);

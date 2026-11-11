@@ -1,4 +1,4 @@
-import { userDecisionsHeading, executionLabel, asksAtRun, reportsResults, forwardEdges, loopBody, spawnsRuns, spawnsSubcoordinators, maxSpawnItems, resolveVariables, substituteVariables, variableRefs, createsWorktree, gateOutputs, defaultWorkerModel, launchesWorker, agentOf, fanoutModels, fanoutWorkers, workerModelPattern, isBranch, isExecutable, isGroup, membershipOf, newWorktreeToken, orderNodes, parentWorktree, resolvedParentPath, topologicalOrder, waves, worktreeRepo, type FlowStage, type StageNode, type Workflow, type Cleanup, defaultCleanup } from '../src/model.ts';
+import { userDecisionsHeading, executionLabel, asksAtRun, reportsResults, forwardEdges, loopBody, spawnsRuns, spawnsSubcoordinators, maxSpawnItems, resolveVariables, substituteVariables, variableRefs, createsWorktree, gateOutputs, defaultWorkerModel, launchesWorker, agentOf, fanoutModels, fanoutWorkers, workerModelPattern, isBranch, isExecutable, isGroup, membershipOf, newWorktreeToken, orderNodes, parentWorktree, resolvedParentPath, topologicalOrder, waves, worktreeRepo, type FlowStage, type StageNode, type Workflow, type Cleanup, defaultCleanup, sessionOf } from '../src/model.ts';
 
 export type BriefInput = {
   graph: Workflow;
@@ -196,6 +196,21 @@ export function checkScripts(workflows: Workflow[]) {
   }
 }
 
+/** Refuses a session (see `sessionOf`) whose stages sit in different worktrees: one agent session has one terminal. */
+export function checkSessions(workflows: Workflow[]) {
+  for (const workflow of workflows) {
+    const where = workflows.length > 1 ? `'${workflow.name}'의 ` : '';
+    const groups = new Map<string, Set<string>>();
+    for (const node of workflow.nodes) {
+      const key = sessionOf(node);
+      if (key) groups.set(key, (groups.get(key) ?? new Set()).add(node.parentId ?? ''));
+    }
+    for (const [key, parents] of groups) {
+      if (parents.size > 1) throw new Error(`${where}세션 '${key}' 의 단계가 서로 다른 워크트리 그룹에 있습니다. 한 세션의 단계는 같은 그룹에 둡니다.`);
+    }
+  }
+}
+
 export type PreflightReport = {
   /** True when every check that 실행 runs passed: the workflow would be accepted (run-time settings aside). */
   ok: boolean;
@@ -226,6 +241,7 @@ export async function preflight(graph: Workflow, load: (id: string) => Promise<W
   attempt('branches', () => checkBranches(all));
   attempt('spawns', () => checkSpawns(all, linked));
   attempt('scripts', () => checkScripts(all));
+  attempt('sessions', () => checkSessions(all));
   attempt('variables', () => checkVariables(all));
   attempt('loops', () => checkLoops(all, linked));
   attempt('coordinator', () => checkCoordinatorGroup(graph));
@@ -234,6 +250,20 @@ export async function preflight(graph: Workflow, load: (id: string) => Promise<W
   for (const workflow of all) {
     const where = all.length > 1 ? `'${workflow.name}'의 ` : '';
     const stages = workflow.nodes.filter(isExecutable);
+    // A session runs on the model·effort of whichever of its stages an execution reaches first; stages that set other values say so.
+    const sessionSettings = new Map<string, Map<string, string[]>>();
+    for (const node of workflow.nodes) {
+      const key = sessionOf(node);
+      if (!key || (!node.data.workerModel && !node.data.effort)) continue;
+      const setting = `${node.data.workerModel || defaultWorkerModel}${node.data.effort ? ` · ${node.data.effort}` : ''}`;
+      const bySetting = sessionSettings.get(key) ?? new Map<string, string[]>();
+      bySetting.set(setting, [...(bySetting.get(setting) ?? []), node.data.label || node.id]);
+      sessionSettings.set(key, bySetting);
+    }
+    for (const [key, bySetting] of sessionSettings) {
+      if (bySetting.size < 2) continue;
+      warnings.push(`${where}세션 '${key}' 의 단계마다 모델·effort 가 다릅니다(${[...bySetting].map(([setting, labels]) => `${labels.join('·')}: ${setting}`).join(' / ')}). 한 실행에서는 먼저 닿은 단계의 값으로 돌고 뒤 단계의 값은 무시됩니다.`);
+    }
     for (const branch of workflow.nodes.filter(isBranch)) {
       for (const output of branch.data.outputs ?? []) {
         if (!workflow.edges.some((edge) => edge.source === branch.id && edge.sourceHandle === output.id)) {
@@ -291,6 +321,8 @@ type BriefStage = {
   model?: string;
   agent?: 'claude' | 'codex';
   effort?: string;
+  /** Stages with the same `session` run in one agent session (one terminal) within an execution (coordinator rule "세션 단계"). */
+  session?: string;
   /** One worker per entry, all started at once on this stage's instructions; each is a child Task of the stage Task. */
   fanout?: { name: string; model: string; agent: 'claude' | 'codex' }[];
   /** `wait: false`: stages after this link do not wait for its sub-graph; they follow the link's own predecessors. */
@@ -400,6 +432,7 @@ function stagesOf(graph: Workflow, ctx: BriefContext, fallback: string, prefix =
       ...(launchesWorker(node) ? { ...(node.data.fanout ? { fanout: fanoutOf(node, ctx) }
         : { model: node.data.workerModel || defaultWorkerModel, agent: agentOf(node.data.workerModel || defaultWorkerModel) }),
         ...(node.data.effort ? { effort: node.data.effort } : {}) } : {}),
+      ...(sessionOf(node) ? { session: `${prefix}${sessionOf(node)}` } : {}),
       ...(sub ? { workflow: { id: sub.id, name: sub.name, wait: node.data.linkMode !== 'start', stages: stagesOf(sub, { ...ctx, values: { ...resolveVariables(sub.variables).values, ...ctx.values } }, location, `${prefix}${node.id}.`) } } : {}),
       ...(spawnTarget ? { spawn: { workflowId: spawnTarget.id, name: spawnTarget.name, input: spawnTarget.nodes.find(asksAtRun)?.id ?? '',
         ...(spawnsSubcoordinators(node) ? { as: 'subcoordinator' as const, title: spawnTarget.name.slice(0, 24) } : {}) } } : {}),
@@ -544,7 +577,7 @@ ${subSection}
 - 실행 프로젝트: \`${workspace}\` (사용자가 실행할 때 고른 프로젝트. 그룹 밖 단계는 여기서 작업한다)
 ${graph.variables?.length ? `- 실행 설정값: 이 실행에 주어진 값이다. 단계 지침의 \`{{키}}\` 는 이미 이 값으로 바뀌어 있다. 워커 spec 에는 지침을 그대로 쓰면 되고, 값을 바꾸거나 추측해 채우지 않는다. 값이 "(없음)" 인 설정은 주어지지 않은 것이다.
 ${graph.variables.map((item) => `  - \`${item.key}\` ${item.label}: ${settings[item.key] ? `\`${settings[item.key].replace(/`/g, "'")}\`` : '(없음)'}`).join('\n')}
-` : ''}- 단계 목록(JSON). 위상 순서로 나열되어 있다. \`after\` 는 선행 단계, \`wave\` 는 단계 깊이(같은 wave 는 동시에 돌 수 있다), \`location\` 은 그 단계의 워커가 작업할 경로다(그룹 노드가 정한 Orca 프로젝트·워크트리). \`model\`·\`agent\`·\`effort\` 는 그 단계 워커를 띄울 때 쓸 모델, Orca 에이전트(\`--agent\`: \`claude\` 는 Claude Code, \`codex\` 는 Codex), 추론 수준이다(\`effort\` 가 없으면 모델 기본값). \`fanout\` 이 있는 단계는 \`model\`·\`agent\` 대신 그 목록의 항목마다 워커를 하나씩 띄운다(아래 "모델별 병렬 워커"). \`condition\` 은 연결 설명으로 **참고 정보일 뿐 진행 여부를 바꾸지 않는다.**
+` : ''}- 단계 목록(JSON). 위상 순서로 나열되어 있다. \`after\` 는 선행 단계, \`wave\` 는 단계 깊이(같은 wave 는 동시에 돌 수 있다), \`location\` 은 그 단계의 워커가 작업할 경로다(그룹 노드가 정한 Orca 프로젝트·워크트리). \`model\`·\`agent\`·\`effort\` 는 그 단계 워커를 띄울 때 쓸 모델, Orca 에이전트(\`--agent\`: \`claude\` 는 Claude Code, \`codex\` 는 Codex), 추론 수준이다(\`effort\` 가 없으면 모델 기본값). \`fanout\` 이 있는 단계는 \`model\`·\`agent\` 대신 그 목록의 항목마다 워커를 하나씩 띄운다(아래 "모델별 병렬 워커"). \`session\` 이 있는 단계는 같은 값의 단계들과 한 에이전트 세션을 나눠 쓴다(아래 "세션 단계"). \`condition\` 은 연결 설명으로 **참고 정보일 뿐 진행 여부를 바꾸지 않는다.**
 - 단계 종류(\`kind\`):
   - \`worker\`: 워커 하나가 지침을 수행한다.
   - 들어오는 연결이 여럿인 단계: 기본은 **모두 필요**다. 앞 경로 중 하나라도 건너뛰어지면(고르지 않은 분기 출력, 건너뛴 단계) 이 단계도 건너뛴다. \`join: any\` 인 단계는 분기에서 갈라진 경로가 다시 모이는 곳이라 하나라도 오면 진행한다. 어느 쪽이든 건너뜀 계산은 캔버스가 하고, 너는 건너뛰지 않은 선행이 모두 끝났을 때 띄운다.
@@ -581,7 +614,15 @@ ${worktreeSection}
 5. 아래 "기다리기" 대로 \`check --wait\` 를 반복하며 각 \`worker_done\` 을 처리한다. 진행 규칙은 정해져 있다. 네가 조건을 해석해 바꾸지 않는다.
 ${waitRule}
    - **병렬·합류**: 분기가 아닌 연결은 모두 병렬이다. 한 단계는 \`after\` 의 선행 단계 Task 가 **모두 completed** 일 때 띄운다(건너뜀으로 닫힌 Task 도 completed 다). 선행이 여럿이면 마지막 것이 끝날 때까지 기다린다.
-   - 단계를 띄울 때 \`location\`·\`agent\`·\`model\`·\`effort\` 가 모두 직전 단계와 같으면 같은 터미널을 재사용하고(\`--terminal\`), 하나라도 다르면 새로 띄운다(\`--worktree path:<location> --agent <agent> --model <model> [--effort <effort>]\`. \`--model\`·\`--effort\` 는 \`--terminal\` 과 함께 쓸 수 없다). 탭 이름을 바꾼다. 이어서 띄울 단계가 없는 워커는 release 한다. \`fanout\` 단계의 워커는 재사용하지도, 재사용되지도 않는다.
+   - 단계를 띄울 때 \`location\`·\`agent\`·\`model\`·\`effort\` 가 모두 직전 단계와 같으면 같은 터미널을 재사용하고(\`--terminal\`), 하나라도 다르면 새로 띄운다(\`--worktree path:<location> --agent <agent> --model <model> [--effort <effort>]\`. \`--model\`·\`--effort\` 는 \`--terminal\` 과 함께 쓸 수 없다). 탭 이름을 바꾼다. 이어서 띄울 단계가 없는 워커는 release 한다. \`fanout\` 단계와 \`session\` 단계의 워커는 이 규칙으로 재사용하지도, 재사용되지도 않는다(\`session\` 단계는 아래 "세션 단계").
+   - **세션 단계(\`session\` 이 있는 단계)**: 한 실행 안에서 \`session\` 값이 같은 단계는 모두 한 에이전트 세션(한 터미널)이 맡는다. 앞 단계의 맥락을 쥔 같은 에이전트가 이어서 일하게 하려는 것이다. 실행마다, 세션마다 그 세션 터미널을 하나 기억한다.
+     - 세션 터미널을 아직 모를 때 그 세션의 단계를 띄우면 그 단계의 \`agent\`·\`model\`·\`effort\` 로 \`worker-start --task <task_id> --worktree path:<location> --agent <agent> --model <model> [--effort <effort>] --keep-open\` 로 띄우고, 그 터미널을 세션 터미널로 기억한다.
+     - 세션 터미널을 알면 직전 단계 여부·\`model\`·\`effort\` 와 상관없이 \`worker-start --task <task_id> --terminal <세션 터미널>\` 로 그 터미널에 넣는다(모델·effort 는 처음 띄운 값 그대로다). 되돌아가기로 다시 띄우는 회차도 같다.
+     - **세션 인계**: 어떤 단계의 worker_done 에 \`세션 <session>: <터미널 핸들>\` 줄이 있고 이 실행이 그 세션 터미널을 아직 모르면, 그 핸들을 세션 터미널로 기억한다(앞 실행이 띄운 같은 세션을 이어받는 재진입). 이미 알면 그 줄은 무시한다.
+     - 세션 터미널을 기억하거나 바꿀 때마다 실행 로그 \`note\` 에 "세션 <session> · <실행 라벨>: <터미널 핸들>" 을 남긴다. 네 맥락이 압축돼 세션 터미널을 잊었으면 이 로그에서 다시 읽는다.
+     - 세션 단계의 worker_done 뒤에도 그 워커를 release 하지 않는다. 이 실행이 끝날 때(마무리 보고 전) 세션 워커를 release 하고 세션 터미널을 \`orca terminal close\` 로 닫는다. 아래 "완료 시 정리"가 워커 세션을 남겨 두라고 하면 닫지 않고 \`worker-retain\` 한다.
+     - 세션 단계를 띄울 때 세션 터미널이 닫혀 있으면 새 세션으로 대신하지 않는다. 그 단계 Task 를 \`task-update --status failed --result "세션 소실: <session> <핸들>"\` 로 닫고 실행 로그 \`error\` 에 남긴 뒤, 그 단계에 의존하는 단계는 띄우지 않는다.
+     - 세션 터미널은 "코디네이터 정리 요청"으로 닫지 않는다(\`note\` 에 "닫지 않음: <핸들> 세션 <session>" 으로 남긴다).
 ${handsUserDecisions ? `   - **앞 사용자 분기 판정 전달**: 워커(판정 전용 워커·\`fanout\` 자식 포함)를 띄우기 **직전마다** 그 실행의 decisions 를 조회해(\`curl -s ${apiBase}/api/workflows/${graph.id}/executions/<실행 id>/decisions\`), 응답의 \`userSection\` 이 비어 있지 않으면 그 문자열을 그대로 \`${artifactDir}/<n>-<nodeId>-user-decisions.md\` 에 쓴다(회차마다 다시 쓴다. 비어 있으면 파일을 만들지 않는다). \`userSection\` 은 이 실행에서 지금까지 내려진 사용자(judge \`user\`) 분기 판정을 아래 "워커 spec 규칙" 의 절 형식으로 캔버스가 만든 것이다 — 고치거나 줄이지 않는다.
 ` : ''}   - **코디네이터 정리 요청**: worker_done 본문에 \`코디네이터 정리 필요: <터미널 핸들>[, <터미널 핸들> ...]\` 줄이 있으면, 그 단계 Task 를 닫은 **직후**(다음 단계를 띄우기 전에) 적힌 터미널을 \`orca terminal close --terminal <핸들>\` 로 닫고 실행 로그 \`note\` 에 "<단계 이름> · <실행 라벨>: 코디네이터 정리 <핸들> 닫음" 을 남긴다. 너 자신의 터미널, 그리고 \`worker-list\` 에 진행 중(dispatched)인 이 Run 의 워커 터미널은 닫지 않고 \`note\` 에 "닫지 않음: <핸들> <사유>" 로 남긴다. 이미 닫혀 있으면 넘어간다. 닫기에 실패해도 실행은 계속한다.
    - **모델별 병렬 워커(\`fanout\` 이 있는 단계)**: 선행 단계가 모두 끝나면 단계 Task 를 \`dispatched\` 로 두고(워커를 붙이지 않는다), \`fanout\` 항목마다 단계 Task 의 자식 Task 를 \`task-create --run <run_id> --parent <단계 Task> --task-title "<단계 이름> · <실행 라벨> · <name>" --display-name "<단계 이름> · <실행 라벨> · <name>" --spec "$(cat <파일>)"\` 로 만든다. spec 은 아래 "워커 spec 규칙" 에 "모델별 병렬 워커" 줄을 더한 것이다. 자식 Task 를 모두 만든 뒤 **한꺼번에** \`worker-start --run <run_id> --task <자식 Task> --worktree path:<location> --agent <항목의 agent> --model <항목의 model> [--effort <단계의 effort>]\` 로 띄우고 탭 이름을 "${graph.name.slice(0, 30)} · <실행 라벨> · <단계 이름> · <name>" 으로 바꾼다. 모델을 다른 모델로 바꾸거나 항목을 빼지 않는다.
@@ -671,6 +712,7 @@ ${handsUserDecisions ? `- spec 끝에 다음 절을 넣는다(Task 는 판정 �
 - 단계에 \`reportsItems\` 가 있으면 spec 에 "작업을 마치면 다음 단계가 따로 실행할 항목(각각 대상 워크플로의 워크트리 이름이 된다 — 영문·숫자·\`.\`·\`_\`·\`-\`)을 worker_done 에 \`items: <항목>, <항목>, ...\` 한 줄로 보고한다. 없으면 \`items:\` 만 쓴다" 를 넣는다. \`decision:\`·\`worktree:\` 줄이 있으면 그다음 줄에 쓴다.
 - 되돌아가기로 다시 띄우는 단계(2회차 이상)의 spec 에는 "<회차>회차다. 이 단계의 앞 회차 산출물 \`<앞 회차 경로>\` 와, 되돌아오게 한 분기를 판정한 단계의 마지막 산출물 \`<판정 단계 경로>\` 를 먼저 읽고 그 지적을 반영한다" 를 넣고, 산출물은 \`${artifactDir}/<n>-<nodeId>-r<회차>.txt\` 에 쓴다(1회차는 위 이름 그대로). \`<회차>\` 는 판정 등록 응답의 \`loop.rounds[<nodeId>]\`(단계 기준 누적)다. 그래서 앞 회차 산출물은 언제나 \`-r<회차 - 1>\`(회차 - 1 이 1이면 \`-r\` 없는 이름)이고, 판정 단계의 마지막 산출물은 그 단계가 마지막으로 돈 회차의 이름이다 — 둘 다 정확한 경로를 spec 에 적는다. 워커가 「가장 최근 회차」를 골라야 하면 \`-r<k>\` 의 k 를 **숫자로** 비교해 가장 큰 것을 고르게 한다(이름 사전순이면 \`-r10\` 이 \`-r2\` 앞에 온다).
 - **모델별 병렬 워커**(\`fanout\` 단계의 자식 Task): spec 에 "이 단계는 모델마다 워커 하나씩 같은 지침으로 동시에 돈다. 너는 \`<name>\`(모델 \`<model>\`)이다. 다른 워커와 독립적으로 수행하고, 다른 워커의 산출물을 읽거나 기다리지 않는다. 지침의 \`<리뷰어>\`·\`<워커 이름>\` 자리에는 \`<name>\` 을 쓴다" 를 넣고, 산출물은 \`${artifactDir}/<n>-<nodeId>-<name>.txt\`(2회차 이상이면 \`-r<회차>-<name>.txt\`)에 쓰게 한다.
+- **세션 단계**(\`session\` 이 있는 단계)의 spec 에는 "너는 이 실행의 세션 \`<session>\` 이다. 같은 세션의 다른 단계(<그 세션의 단계 이름들>)도 이 터미널에 Task 로 이어 들어온다. 이 Task 를 마치면 worker_done 을 보내고 세션을 끝내지 말고 다음 Task 를 기다린다. 자기 터미널을 닫지 않는다" 를 넣는다.
 - worker_done 본문은 3줄 이하: 결과, 산출물 경로, 결정이 필요한 것.
 
 ## 완료 시 정리 (사용자가 실행할 때 고른 설정)

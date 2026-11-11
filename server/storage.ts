@@ -2,7 +2,7 @@ import { mkdir, readFile, readdir, rename, stat, writeFile, unlink, utimes } fro
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { Workflow } from '../src/model.ts';
-import { spawnsRuns, effortLevels, maxScriptTimeout, scriptParses, forwardEdges, loopBody, maxLoopRounds, linkModes, spawnAsModes, maxBranchOutputs, maxSpawnItems, maxVariables, validVariableValue, variableKeyPattern, maxGroupDepth, workerModelPattern, isBranch, serializableWorkflow, topologicalOrder, validTrigger, worktreeNamePattern, validTags, maxTags, maxTagLength } from '../src/model.ts';
+import { spawnsRuns, effortLevels, sessionKeyPattern, maxScriptTimeout, scriptParses, forwardEdges, loopBody, maxLoopRounds, linkModes, spawnAsModes, maxBranchOutputs, maxSpawnItems, maxVariables, validVariableValue, variableKeyPattern, maxGroupDepth, workerModelPattern, isBranch, serializableWorkflow, topologicalOrder, validTrigger, worktreeNamePattern, validTags, maxTags, maxTagLength } from '../src/model.ts';
 
 export function validId(id: string): boolean { return /^[a-zA-Z0-9_-]{1,128}$/.test(id); }
 
@@ -49,6 +49,7 @@ export function validateWorkflow(value: unknown): Workflow {
       || !['worker', 'gate', 'branch', 'script', 'note', 'workflow', 'group', 'frame'].includes(node.data.kind)
       || (node.data.workerModel !== undefined && (typeof node.data.workerModel !== 'string' || !workerModelPattern.test(node.data.workerModel)))
       || (node.data.effort !== undefined && !(effortLevels as readonly string[]).includes(node.data.effort))
+      || (node.data.session !== undefined && (node.data.kind !== 'worker' || node.data.fanout !== undefined || typeof node.data.session !== 'string' || !sessionKeyPattern.test(node.data.session)))
       || (node.data.linkMode !== undefined && (node.data.kind !== 'workflow' || !(linkModes as string[]).includes(node.data.linkMode)))
       || (node.data.spawnAs !== undefined && (node.data.kind !== 'workflow' || !(spawnAsModes as string[]).includes(node.data.spawnAs)))
       || (node.data.asker !== undefined && (node.data.kind !== 'gate' || !['coordinator', 'previous', 'auto'].includes(node.data.asker)))
