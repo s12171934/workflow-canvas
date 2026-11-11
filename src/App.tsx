@@ -426,7 +426,10 @@ function Workspace() {
     return { ...execution, status: aggregateStatus(statuses), finished: executionFinished(statuses) };
   }), [executions, nodes, observed, stale]);
   // Finished executions are always hidden; the canvas focuses on work still in progress.
-  const visibleExecutions = useMemo(() => executionStatuses.filter((execution) => !execution.finished), [executionStatuses]);
+  // 보기 전용에서는 상태 미확인(관찰이 끊긴) 실행도 숨긴다.
+  const hiddenUnknown = (execution: { status: StageStatus; finished: boolean }) => viewOnly && !execution.finished && execution.status === 'unknown';
+  const visibleExecutions = useMemo(() => executionStatuses.filter((execution) => !execution.finished && !hiddenUnknown(execution)), [executionStatuses, viewOnly]);
+  const unknownHiddenCount = executionStatuses.filter(hiddenUnknown).length;
   // Automations whose executions are still open: shown so it is clear the canvas is watching a scheduled run.
   const activeAutomations = useMemo(() => {
     const seen = new Map<string, { id: string; name: string }>();
@@ -1223,6 +1226,7 @@ function Workspace() {
             <div className="segmented"><button className={executionView === 'all' ? 'active' : ''} onClick={() => setView('all')}>모아 보기</button>
               <button className={executionView !== 'all' ? 'active' : ''} disabled={!visibleExecutions.length} onClick={() => setView(activeExecution?.id ?? visibleExecutions[0]?.id ?? 'all')}>실행 선택</button></div>
             {finishedCount > 0 && <span className="hide-finished">끝난 실행 {finishedCount}개 숨김</span>}
+            {unknownHiddenCount > 0 && <span className="hide-finished">상태 미확인 {unknownHiddenCount}개 숨김</span>}
             {!visibleExecutions.length && <span className="execution-empty">진행 중인 실행이 없습니다</span>}
             {executionView !== 'all' && <div className="execution-chips">{visibleExecutions.map((execution) => <button key={execution.id}
               className={`run-chip ${execution.status} ${execution.id === executionView ? 'active' : ''}`} title={`${statusLabels[execution.status]}${execution.automation ? ` · 자동화 「${execution.automation.name}」` : ''}`}
@@ -1251,7 +1255,7 @@ function Workspace() {
           <div className="canvas-mode"><span className={`status-dot ${workflow.runId && snapshot && !stale ? 'running' : ''}`} />{workflow.runId ? 'Orca 실시간 관찰' : '설계 모드'}
             {activeAutomations.length > 0 && <span className="automation-badge" title="이 자동화가 시작한 실행이 진행 중입니다"><Zap size={11} />자동화 {activeAutomations.map((item) => `「${item.name}」`).join(' ')} 진행 중</span>}</div>
           {summary && executions.length > 0 && <section className="summary-panel" aria-label="실행 현황">
-            <header><Gauge size={13} />실행 현황 {visibleExecutions.length}{finishedCount > 0 && <small>끝난 실행 {finishedCount}개 숨김</small>}</header>
+            <header><Gauge size={13} />실행 현황 {visibleExecutions.length}{finishedCount > 0 && <small>끝난 실행 {finishedCount}개 숨김</small>}{unknownHiddenCount > 0 && <small>상태 미확인 {unknownHiddenCount}개 숨김</small>}</header>
             {!executionSummaries.length && <p className="summary-empty">진행 중인 실행이 없습니다</p>}
             {executionSummaries.map(({ execution, total, done, tally, running, blocked, failed }) => <button key={execution.id}
               className={`summary-row ${execution.status} ${execution.id === executionView ? 'active' : ''}`} title="클릭해 이 실행만 보기 (다시 누르면 모아 보기)"
