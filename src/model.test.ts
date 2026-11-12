@@ -1,9 +1,73 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { overviewEntries, overviewWorkflows, withoutUnknown } from './overview.ts';
 import { pendingDecisions, frameContents, orderNodes, decisionError, skippedStages, topologicalOrder, waves, nodeExecutionStatus, type FlowStage, type StageNode, membershipOf, nodeLocation, aggregateStatus, executionFinished, taskStatus, projectNodes, serializableWorkflow, newWorkflow, fromSnapshot, type TaskSummary, type WorkerSummary, type RunSnapshot, executionRun, inputsKey, mergeSnapshots, workflowRuns, variableRefs, substituteVariables, resolveVariables, applyDecision, canNest, loopBody, stageRound, loggedExecutions, neighbors, relationTo, tallyStatuses, summarizeExecution, type Execution, cleanTag, validTags, groupByTag } from './model.ts';
 
 const task = (status: string): TaskSummary => ({ id: 'task-a', title: 'A', spec: 'A', status, deps: [] });
 const worker = (liveness: string): WorkerSummary => ({ dispatchId: 'dispatch-a', taskId: 'task-a', liveness, stage: 'working', provider: 'claude', model: 'example-model', outcome: '' });
+
+test('overview combines workflows and Runs without hiding parallel work or mixing failed observations', () => {
+  const graph = newWorkflow();
+  graph.executions = [
+    { id: 'old', label: 'earlier run', runId: 'run-old', bindings: { [graph.nodes[0].id]: 'old-a', [graph.nodes[1].id]: 'old-b' } },
+    { id: 'new', label: 'newer run', runId: 'run-new', bindings: { [graph.nodes[0].id]: 'new-a', [graph.nodes[1].id]: 'new-b' } },
+  ];
+  const other = { ...newWorkflow(), id: 'another-workflow', name: 'Other', runId: 'run-other' };
+  other.executions = [{ id: 'new', label: 'same execution ID, different workflow', bindings: { [other.nodes[0].id]: 'other-a', [other.nodes[1].id]: 'other-b' } }];
+  const snapshot = (id: string, tasks: TaskSummary[]): RunSnapshot => ({ run: { id, objective: id, updatedAt: '' }, tasks, workers: [], observedAt: '2026-11-11T00:00:00Z' });
+  const observations = {
+    'run-old': { snapshot: snapshot('run-old', ['old-a', 'old-b'].map((id) => ({ ...task('completed'), id }))) },
+    'run-new': { snapshot: snapshot('run-new', [{ ...task('running'), id: 'new-a' }, { ...task('pending'), id: 'new-b' }]) },
+    'run-other': { snapshot: snapshot('run-other', [{ ...task('blocked'), id: 'other-a' }, { ...task('pending'), id: 'other-b' }]) },
+  };
+  const entries = overviewEntries([graph, other, newWorkflow()], observations);
+  assert.deepEqual(entries.map((entry) => [entry.workflow.id, entry.execution.id, entry.status]), [[other.id, 'new', 'blocked'], [graph.id, 'new', 'running']]);
+  const disconnected = overviewEntries([graph, other], { ...observations, 'run-other': { ...observations['run-other'], error: 'offline' } });
+  assert.equal(disconnected.find((entry) => entry.workflow.id === graph.id)?.status, 'running');
+  assert.equal(disconnected.find((entry) => entry.workflow.id === other.id)?.status, 'unknown');
+});
+
+test('overview handles linked Tasks, skipped branches, loop rounds and legacy node bindings', () => {
+  const graph = newWorkflow();
+  const [first, second] = graph.nodes;
+  second.data.kind = 'workflow';
+  graph.runId = 'run-a';
+  graph.executions = [{ id: 'a', label: 'loop', bindings: { [first.id]: 'task-a' }, links: { [second.id]: { child: 'task-child' } },
+    history: [{ edge: 'loop', pass: 1, nodes: [first.id], bindings: { [first.id]: 'old-task' } }] }];
+  const snapshot: RunSnapshot = { run: { id: 'run-a', objective: 'A', updatedAt: '' }, tasks: [task('completed'), { ...task('blocked'), id: 'task-child' }], workers: [], observedAt: '' };
+  const entry = overviewEntries([graph], { 'run-a': { snapshot } })[0];
+  assert.equal(entry.stages[0].round, 2);
+  assert.equal(entry.stages[1].status, 'blocked');
+  assert.equal(entry.done, 1);
+  graph.executions[0].skipped = [`${second.id}.child`];
+  assert.equal(overviewEntries([graph], { 'run-a': { snapshot } }).length, 0);
+  graph.executions = [];
+  first.data.taskId = 'task-a';
+  second.data.kind = 'worker';
+  second.data.taskId = 'task-child';
+  assert.equal(overviewEntries([graph], { 'run-a': { snapshot } })[0].status, 'blocked');
+  assert.equal(overviewEntries([graph], {})[0].status, 'unknown');
+});
+
+test('overview renders one workflow graph with counts from concurrent executions on each node', () => {
+  const graph = newWorkflow();
+  const [first, second] = graph.nodes;
+  graph.executions = ['a', 'b'].map((id) => ({ id, label: `Run ${id}`, runId: `run-${id}`,
+    bindings: { [first.id]: `task-${id}-1`, [second.id]: `task-${id}-2` }, decisions: { [first.id]: [id] } }));
+  const observation = (id: string, status: string) => ({ snapshot: {
+    run: { id: `run-${id}`, objective: '', updatedAt: '' }, tasks: [{ ...task(status), id: `task-${id}-1` }, { ...task('pending'), id: `task-${id}-2` }], workers: [], observedAt: '' } });
+  const entries = overviewEntries([graph], { 'run-a': observation('a', 'running'), 'run-b': observation('b', 'blocked') });
+  const groups = overviewWorkflows(entries);
+  assert.equal(groups.length, 1);
+  assert.equal(groups[0].workflow.id, graph.id);
+  assert.equal(groups[0].executionCount, 2);
+  assert.equal(groups[0].stages.length, graph.nodes.length);
+  assert.equal(groups[0].status, 'blocked');
+  assert.deepEqual(groups[0].stages[0].tally, [{ status: 'running', count: 1 }, { status: 'blocked', count: 1 }]);
+  assert.deepEqual(groups[0].stages[1].tally, [{ status: 'pending', count: 2 }]);
+  assert.deepEqual(groups[0].decisions[first.id].sort(), ['a', 'b']);
+  assert.equal(groups[0].done, 0);
+});
 
 test('settled Tasks stay settled even with a live terminal', () => {
   assert.equal(taskStatus(task('completed'), [worker('live')]), 'completed');
@@ -498,4 +562,16 @@ test('(c) loop rounds count per stage across every loop; the limit stays per loo
   assert.deepEqual(second.execution.loops, { 'next-round': 1, 'finish-result': 1 });
   // A retried request reports the same rounds.
   assert.deepEqual(applyDecision(flow, second.execution, 'result', ['retry']).loop?.rounds, second.loop?.rounds);
+});
+
+test('overview hides 상태 미확인 from counts, card status and errors', () => {
+  const stage = (status: 'unknown' | 'running') => ({ node: { id: status } as never, status, round: 1, tally: [{ status, count: 1 }] });
+  const entry = { workflow: {} as never, executionCount: 1, decisions: {}, done: 0, status: 'unknown' as const, error: '일부 실행 상태 미확인',
+    stages: [stage('unknown'), stage('running')], tally: [{ status: 'unknown' as const, count: 1 }, { status: 'running' as const, count: 1 }] };
+  const shown = withoutUnknown(entry);
+  assert.equal(shown.status, 'running');
+  assert.deepEqual(shown.tally, [{ status: 'running', count: 1 }]);
+  assert.deepEqual(shown.stages.map((item) => item.tally.length), [0, 1]);
+  assert.equal('error' in shown, false);
+  assert.equal(withoutUnknown({ ...entry, tally: [{ status: 'unknown', count: 2 }] }).status, 'pending');
 });
