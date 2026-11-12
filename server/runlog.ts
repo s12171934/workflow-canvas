@@ -2,6 +2,7 @@ import { appendFile, open, readFile, readdir, stat, writeFile } from 'node:fs/pr
 import { join } from 'node:path';
 import { executionResults, statusLabels, taskStatus, type LoggedExecution, type RunEvent, type RunLogMeta, type RunLogOutcome, type RunLogSummary, type RunSnapshot, type StageStatus, type WorkflowLive } from '../src/model.ts';
 import { validId } from './storage.ts';
+import type { RunObservation } from '../src/overview.ts';
 export { coordinatorEventTypes } from '../src/model.ts';
 
 const maxListed = 50;
@@ -321,6 +322,28 @@ export function createRunLog(root: string) {
         entry.blocked += statuses.filter((status) => status === 'blocked').length;
       }
       return live;
+    },
+    /** Seed the overview from every registered Run's log, without a CLI read or the history list's 50-entry cap. */
+    async overview(runIds: string[]): Promise<{ observations: Record<string, RunObservation>; settled: string[] }> {
+      await index();
+      const observations: Record<string, RunObservation> = {};
+      const settled: string[] = [];
+      await Promise.all([...new Set(runIds)].map(async (runId) => {
+        const id = runLaunch.get(runId);
+        if (!id) return;
+        const events = await readEvents(id);
+        const tasks = new Map<string, RunEvent>();
+        for (const event of events) if (event.type === 'task' && event.taskId && event.status) tasks.set(event.taskId, event);
+        const finished = lastOf(events, 'finished');
+        const lost = lastOf(events, 'coordinator-lost') > finished;
+        if (finished > lastOf(events, 'task') || lost) settled.push(runId);
+        const lastObserved = [...events].reverse().find((event) => event.type === 'task' || event.type === 'finished');
+        observations[runId] = { snapshot: { run: { id: runId, objective: runId, updatedAt: '' },
+          tasks: [...tasks].map(([taskId, event]) => ({ id: taskId, title: event.message, spec: '', deps: [], status: event.status! })),
+          workers: [], observedAt: lastObserved?.at ?? stampOf(id)! },
+          ...(lost ? { error: '코디네이터가 종료되어 실행이 중단되었습니다.' } : {}) };
+      }));
+      return { observations, settled };
     },
     async metaOfRun(runId: string) {
       await index();

@@ -9,7 +9,40 @@ import { createModelCatalog, latestPerFamily } from './models.ts';
 import { createOrcaBridge } from './orca.ts';
 import { launchDirName } from './runlog.ts';
 import { createStorage } from './storage.ts';
+import { overviewEntries } from '../src/overview.ts';
 import { newWorkflow } from '../src/model.ts';
+
+test('overview seeds all historical Runs without Orca calls or the 50-launch history limit', async () => {
+  const { createRunLog } = await import('./runlog.ts');
+  const directory = await mkdtemp(join(process.cwd(), '.local/overview-api-test-'));
+  let calls = 0;
+  const bridge = createOrcaBridge(async () => { calls += 1; throw new Error('overview must use saved observations'); });
+  const graph = { ...newWorkflow(), id: 'overview-test' };
+  const log = createRunLog(join(directory, '.executions'));
+  graph.executions = [];
+  for (let i = 0; i < 52; i++) {
+    const startedAt = new Date(Date.UTC(2026, 10, 1, 0, 0, i));
+    const launch = launchDirName(startedAt, graph.id);
+    await mkdir(join(log.root, launch), { recursive: true });
+    await log.start(launch, { workflowId: graph.id, workflowName: graph.name, runId: `run-${i}`, startedAt: startedAt.toISOString() });
+    graph.executions.push({ id: `execution-${i}`, label: `Execution ${i}`, runId: `run-${i}`,
+      bindings: Object.fromEntries(graph.nodes.map((node, n) => [node.id, `task-${i}-${n}`])) });
+    for (let n = 0; n < graph.nodes.length; n++) await log.append(launch, { type: 'task', taskId: `task-${i}-${n}`, message: graph.nodes[n].data.label, status: i === 0 && n === 0 ? 'blocked' : 'completed' });
+    if (i !== 0) await log.append(launch, { type: 'finished', status: 'completed', message: 'Done' });
+  }
+  await createStorage(directory).save(graph);
+  const server = createApp(directory, bridge).listen(0, '127.0.0.1');
+  await new Promise<void>((resolve) => server.once('listening', resolve));
+  try {
+    const response = await fetch(`http://127.0.0.1:${(server.address() as AddressInfo).port}/api/executions/overview`);
+    assert.equal(response.status, 200);
+    const data = await response.json();
+    assert.equal(calls, 0);
+    assert.equal(Object.keys(data.observations).length, 52);
+    assert.equal(data.settled.length, 51);
+    assert.deepEqual(overviewEntries(data.graphs, data.observations).map((entry) => [entry.execution.id, entry.status]), [['execution-0', 'blocked']]);
+  } finally { await new Promise<void>((resolve) => server.close(() => resolve())); await rm(directory, { recursive: true, force: true }); }
+});
 
 /** Orca answers for the run dialog's project check. */
 function places(args: string[]) {

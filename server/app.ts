@@ -7,6 +7,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { createStorage, validId, validateWorkflow } from './storage.ts';
 import { composeBrief, checkBranches, checkScripts, checkCoordinatorGroup, checkGroups, checkLoops, checkSpawns, checkVariables, checkSessions, flowOf, linkedWorkflows, preflight } from './execute.ts';
 import { autoLayout } from '../src/layout.ts';
+import { overviewExecutions } from '../src/overview.ts';
 import { briefPrompt, generatedWorkflow, generationTimeoutMs, maxPromptLength, workflowPrompt, type Generation } from './generate.ts';
 import { createModelCatalog } from './models.ts';
 import { coordinatorEventTypes, createRunLog, launchDirName, quietEveryMs, settledEveryMs } from './runlog.ts';
@@ -139,6 +140,12 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
   app.get('/api/workflows', async (_req, res) => {
     const [items, live] = await Promise.all([storage.list(), runlog.liveByWorkflow().catch(() => ({} as Record<string, WorkflowLive>))]);
     res.json(items.map((item) => live[item.id] ? { ...item, live: live[item.id] } : item));
+  });
+  // The overview renders logged observations first, then polls only unsettled Runs for fresh Orca state.
+  app.get('/api/executions/overview', async (_req, res) => {
+    const graphs = await Promise.all((await storage.list()).map((item) => storage.load(item.id)));
+    const runIds = graphs.flatMap((graph) => overviewExecutions(graph).map((execution) => executionRun(graph, execution))).filter(Boolean);
+    res.json({ graphs, ...await runlog.overview(runIds) });
   });
   app.post('/api/validate', (req, res) => {
     try { res.json(validateWorkflow(req.body)); }

@@ -28,6 +28,7 @@ function descriptionPlaceholder(kind: NodeKind): string {
   return kind === 'note' ? '실행에 쓰이지 않는 설명입니다.' : kind === 'branch' ? '무엇을 근거로 어느 출력을 고를지 적으세요.' : kind === 'gate' ? '무엇을 확인하고 통과·거절을 정할지 적으세요.' : '목표, 작업 범위, 완료 조건을 적으세요.';
 }
 import { RunLogDialog } from './RunLog';
+import { ExecutionOverview } from './ExecutionOverview';
 import { autoLayout, estimatedSize } from './layout';
 import { midpoint, roundedPath, routeEdge } from './routing';
 
@@ -341,6 +342,13 @@ function ZoomVars({ target }: { target: RefObject<HTMLElement | null> }) {
 export function App() { return <ReactFlowProvider><Workspace /></ReactFlowProvider>; }
 
 function Workspace() {
+  const [overviewOpen, setOverviewOpen] = useState(() => new URLSearchParams(window.location.search).get('view') === 'executions');
+  useEffect(() => {
+    const url = new URL(window.location.href);
+    if (overviewOpen) url.searchParams.set('view', 'executions');
+    else if (url.searchParams.get('view') === 'executions') url.searchParams.delete('view');
+    window.history.replaceState(null, '', url);
+  }, [overviewOpen]);
   const [workflow, setWorkflow] = useState<Workflow>(blankWorkflow);
   const [nodes, setNodes, onNodesChange] = useNodesState<StageNode>(workflow.nodes);
   const [edges, setEdges, onEdgesChange] = useEdgesState<WorkflowEdge>(workflow.edges);
@@ -364,6 +372,7 @@ function Workspace() {
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement | null;
+      if (document.querySelector('.execution-overview')) return;
       if (event.metaKey || event.ctrlKey || event.altKey || target?.closest('input, textarea, select, [contenteditable="true"]')) return;
       if (event.key === 'v' || event.key === 'V') setPointerMode('select');
       else if (event.key === 'h' || event.key === 'H') setPointerMode('pan');
@@ -411,6 +420,7 @@ function Workspace() {
   const { fitView, screenToFlowPosition, getInternalNode } = useReactFlow<StageNode>();
   const current = useMemo(() => serializableWorkflow({ ...workflow, nodes, edges }), [workflow, nodes, edges]);
   const fingerprint = JSON.stringify(current);
+  const initialFingerprint = useRef(fingerprint);
   const dirty = fingerprint !== savedFingerprint;
   const selected = nodes.find((node) => node.id === selectedId);
   const instructionNode = instructionNodeId ? nodes.find((node) => node.id === instructionNodeId && !isGroup(node) && !isFrame(node)) : undefined;
@@ -596,6 +606,7 @@ function Workspace() {
   }, [dirty]);
 
   useEffect(() => {
+    if (overviewOpen) return;
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout>;
     const controller = new AbortController();
@@ -630,9 +641,10 @@ function Workspace() {
     }
     void refresh();
     return () => { cancelled = true; controller.abort(); clearTimeout(timer); };
-  }, []);
+  }, [overviewOpen]);
 
   useEffect(() => {
+    if (overviewOpen) return;
     setSnapshot(null);
     setSnapshotError('');
     if (!workflow.runId) return;
@@ -650,7 +662,7 @@ function Workspace() {
     }
     void refresh();
     return () => { cancelled = true; controller.abort(); clearTimeout(timer); };
-  }, [workflow.runId]);
+  }, [workflow.runId, overviewOpen]);
 
   // The other Runs: polled (less often than the selected one) until every execution in them has finished, then left as last seen.
   const executionsRef = useRef(executions);
@@ -659,6 +671,7 @@ function Workspace() {
   nodesRef.current = nodes;
   const otherRuns = workflowRuns(workflow).filter((runId) => runId !== workflow.runId).join(',');
   useEffect(() => {
+    if (overviewOpen) return;
     const runIds = otherRuns ? otherRuns.split(',') : [];
     setOtherSnapshots((value) => Object.fromEntries(Object.entries(value).filter(([runId]) => runIds.includes(runId))));
     if (!runIds.length) return;
@@ -683,7 +696,7 @@ function Workspace() {
     }
     void refresh();
     return () => { cancelled = true; controller.abort(); clearTimeout(timer); };
-  }, [otherRuns]);
+  }, [otherRuns, overviewOpen]);
 
   // Pick up what the coordinator (or an automation's coordinator) registers — Run, executions — and automation changes,
   // without touching local graph edits. Fast right after 실행, slower otherwise.
@@ -848,6 +861,21 @@ function Workspace() {
     try { applyWorkflow(await api<Workflow>(`/api/workflows/${id}`), true); rememberWorkflow(id); closeDrawer(); }
     catch (error) { setNotice((error as Error).message); }
     finally { setBusy(false); }
+  }
+  async function openOverviewExecution(id: string, executionId: string, nodeId?: string) {
+    const untouched = !restored.current && fingerprint === initialFingerprint.current;
+    if (id !== workflow.id && !untouched && !confirmReplace()) return;
+    try {
+      if (id !== workflow.id) {
+        applyWorkflow(await api<Workflow>(`/api/workflows/${encodeURIComponent(id)}`), true);
+        rememberWorkflow(id);
+      }
+      restored.current = true;
+      setView(executionId || 'all');
+      setOverviewOpen(false);
+      closeDrawer();
+      if (nodeId) setTimeout(() => focusNode(nodeId), 120);
+    } catch (error) { setNotice((error as Error).message); }
   }
   function addNode(kind: StageKind) {
     const id = crypto.randomUUID();
@@ -1176,12 +1204,14 @@ function Workspace() {
       {!project && !worktrees.length && selected && !isGroup(selected) && <p className="field-help">어느 그룹에도 속하지 않아 실행할 때 고른 프로젝트에서 작업합니다.</p>}</div>;
   }
   return <CanvasContext.Provider value={canvasContext}><div className={`workspace ${lockedView ? 'locked-view' : ''}`}>
-    <main className="main">
+    {overviewOpen && <ExecutionOverview onClose={() => setOverviewOpen(false)} onOpen={openOverviewExecution} />}
+    <main className="main" inert={overviewOpen} aria-hidden={overviewOpen || undefined}>
       <header className="topbar"><div className="topbar-title"><button className="icon-button mobile-menu" aria-label="메뉴 열기" aria-expanded={panels.left} onClick={() => setPanels((value) => ({ ...value, left: !value.left }))}><Menu size={20} /></button>
           <div className="title-block"><input className="workflow-name" aria-label="워크플로 이름" value={workflow.name} maxLength={500} disabled={viewOnly} onChange={(event) => setWorkflow((value) => ({ ...value, name: event.target.value }))} />
             <p title={workflow.description}>{workflow.description || '단계를 연결해 작업의 흐름을 만드세요.'}</p></div>
           <div className="heading-stats"><button className="stat-button" disabled={!liveCount} title={liveCount ? '실행 중인 단계로 차례로 이동' : '실행 중인 단계가 없습니다'} onClick={focusNextLive}><i className={`status-dot ${liveCount ? 'running live-pulse' : ''}`} />실행 중 {liveCount}</button><span><Check size={14} />완료 {counts.completed ?? 0}</span><span className="total">{stageCount} 단계</span></div></div>
         <div className="toolbar-actions"><input ref={importRef} type="file" accept="application/json,.json" hidden onChange={(event) => { void importFile(event.target.files?.[0]); event.target.value = ''; }} />
+          <button className="button overview-launch" aria-label="전체 실행" onClick={() => setOverviewOpen(true)} title="모든 워크플로의 실행을 한눈에 보기"><LayoutDashboard size={15} /><span>전체 실행</span></button>
           <button className="button ghost file-action lock-hide" onClick={() => importRef.current?.click()} title="JSON 가져오기"><ArrowUpFromLine size={15} /><span>가져오기</span></button>
           <button className="button ghost file-action" onClick={download} title="JSON 내보내기"><ArrowDownToLine size={15} /><span>내보내기</span></button>
           {saved.some((item) => item.id === workflow.id) && <button className="button ghost" onClick={() => setLogOpen(true)} title="실행 요청별 이벤트·산출물·보고"><History size={15} /><span>실행 로그</span></button>}
@@ -1283,7 +1313,7 @@ function Workspace() {
             selectionOnDrag={pointerMode === 'select' && !viewOnly} panOnDrag={pointerMode === 'select' && !viewOnly ? [1, 2] : true} panOnScroll multiSelectionKeyCode={['Meta', 'Control']}
             onBeforeDelete={async () => { if (!viewOnly) removeSelected(); return false; }}
             onNodeClick={(event, node) => clickNode(node.id, event.metaKey || event.ctrlKey)} onEdgeClick={(_event, edge) => { setSelectedEdgeId(edge.id); setSelectedId(null); setMultiIds([]); }}
-            onPaneClick={() => { setSelectedId(null); setSelectedEdgeId(null); setMultiIds([]); }} elevateNodesOnSelect={false} fitView fitViewOptions={{ padding: 0.25 }} minZoom={0.15} maxZoom={1.6} deleteKeyCode={viewOnly ? null : ['Backspace', 'Delete']} colorMode="dark" proOptions={{ hideAttribution: false }}>
+            onPaneClick={() => { setSelectedId(null); setSelectedEdgeId(null); setMultiIds([]); }} elevateNodesOnSelect={false} fitView fitViewOptions={{ padding: 0.25 }} minZoom={0.15} maxZoom={1.6} deleteKeyCode={viewOnly || overviewOpen ? null : ['Backspace', 'Delete']} colorMode="dark" proOptions={{ hideAttribution: false }}>
             <Background gap={22} size={1} color="#2c353d" />
             <Controls showInteractive={false} />
             <MiniMap<StageNode> nodeComponent={MiniMapNode} maskColor="rgba(16,20,25,.6)" pannable zoomable />
@@ -1295,6 +1325,7 @@ function Workspace() {
         <aside className="sidebar floating-panel" hidden={!panels.left} aria-label="워크플로 목록">
           <div className="sidebar-head"><a className="brand" href="/" onClick={(event) => event.preventDefault()}><span className="brand-mark"><Network size={23} /></span><span>workflow<span className="brand-sub">canvas</span></span><span className="version">0.1</span></a><button className="icon-button panel-collapse" title="사이드바 접기 ([)" aria-label="사이드바 접기" onClick={() => setPanels((value) => ({ ...value, left: false }))}><PanelLeftClose size={16} /></button></div>
           <div className="workspace-label"><span className="workspace-avatar">W</span><div>로컬 워크스페이스<small>Orca orchestration</small></div><ChevronRight size={14} /></div>
+          <button className="sidebar-item overview-sidebar-launch" onClick={() => { setOverviewOpen(true); closeDrawer(); }}><LayoutDashboard size={16} /><span>전체 실행</span><ChevronRight size={14} /></button>
           <div className="sidebar-section-title">워크플로<span>{saved.length}</span></div>
           {(() => {
             const activeRow = (key: string) => <button key={key} className="sidebar-item active" onClick={closeDrawer}><GitBranch size={17} /><span title={workflow.name}>{workflow.name}</span>
