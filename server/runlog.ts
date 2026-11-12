@@ -17,6 +17,8 @@ const watchWindowMs = 7 * 24 * 60 * 60 * 1000;
 export const quietAfterMs = 30 * 60 * 1000;
 export const idleAfterMs = 6 * 60 * 60 * 1000;
 export const quietEveryMs = 5 * 60 * 1000;
+/** A Run whose executions have all finished (or whose launch ended) is read this rarely by the dashboard's decision list. */
+export const settledEveryMs = 15 * 60 * 1000;
 const fileName = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,200}$/;
 const hidden = new Set(['meta.json', 'events.jsonl']);
 /** Index of the last event of a type, or -1. */
@@ -109,12 +111,15 @@ export function createRunLog(root: string) {
    * Whether a launch should be read now by `reader`: always while it moves, else once per `quietEveryMs` (see quietAfterMs).
    * Running Tasks keep a launch at the normal pace for `idleAfterMs`, as a long Task logs nothing until it ends.
    */
-  async function readNow(reader: string, id: string, events: RunEvent[], now: number) {
+  async function quiet(id: string, events: RunEvent[], now: number) {
     const last = events.length ? Date.parse(events[events.length - 1].at) : Date.parse(stampOf(id)!);
     const runId = (await readMeta(id))?.runId;
     const running = runId ? [...(await remembered(runId, id)).tasks.values()].includes('running') : false;
+    return now - last >= (running ? idleAfterMs : quietAfterMs);
+  }
+  async function readNow(reader: string, id: string, events: RunEvent[], now: number) {
     const key = `${reader}:${id}`;
-    if (now - last < (running ? idleAfterMs : quietAfterMs)) { quietReads.delete(key); return true; }
+    if (!await quiet(id, events, now)) { quietReads.delete(key); return true; }
     if (now - (quietReads.get(key) ?? 0) < quietEveryMs) return false;
     quietReads.set(key, now);
     return true;
@@ -322,11 +327,16 @@ export function createRunLog(root: string) {
       const id = runId ? runLaunch.get(runId) : undefined;
       return id ? readMeta(id) : undefined;
     },
-    /** Whether the launch that owns a Run has ended (see `ended`): false for a Run no launch owns. */
-    async runEnded(runId: string) {
+    /**
+     * How the launch that owns a Run stands: `ended` (see `ended`), `quiet` (see quietAfterMs) or `moving`; `moving` for a
+     * Run no launch owns, so it is never read less often than before.
+     */
+    async runPace(runId: string, now = Date.now()): Promise<'ended' | 'quiet' | 'moving'> {
       await index();
       const id = runId ? runLaunch.get(runId) : undefined;
-      return id ? ended(await readEvents(id)) : false;
+      if (!id) return 'moving';
+      const events = await readEvents(id);
+      return ended(events) ? 'ended' : await quiet(id, events, now) ? 'quiet' : 'moving';
     },
     /** Id of the launch that owns a Run, if any. */
     async launchOfRun(runId: string) {

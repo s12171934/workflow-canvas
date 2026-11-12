@@ -74,8 +74,9 @@ export const orcaCommand: Command = (args, options) => {
 };
 
 /** How long a read is reused (`fresh`) and how long the last good value stands in for a failed read (`stale`). */
-export type CacheTimes = Partial<Record<'status' | 'locations' | 'runs' | 'automations' | 'snapshot', number>> & { staleMs?: number };
-export const defaultCacheTimes: CacheTimes = { status: 4000, locations: 10_000, runs: 30_000, automations: 10_000, snapshot: 2000, staleMs: 60_000 };
+/** `run`: a Run's own row (objective), part of each snapshot; it does not change while the Run goes on, so it is reused long. */
+export type CacheTimes = Partial<Record<'status' | 'locations' | 'runs' | 'automations' | 'snapshot' | 'run', number>> & { staleMs?: number };
+export const defaultCacheTimes: CacheTimes = { status: 4000, locations: 10_000, runs: 30_000, automations: 10_000, snapshot: 2000, run: 10 * 60_000, staleMs: 60_000 };
 
 /**
  * Reads shared by the canvas polls, several tabs and the background watcher: one CLI call per key at a time (callers
@@ -196,7 +197,7 @@ export function createOrcaBridge(command: Command = orcaCommand, cacheTimes: Cac
     },
     async loadSnapshot(runId: string): Promise<RunSnapshot> {
       const [detail, tasks] = await Promise.all([
-        command(['orchestration', 'run-show', '--full', '--id', runId]),
+        cache.read('run', runId, () => command(['orchestration', 'run-show', '--full', '--id', runId])),
         command(['orchestration', 'task-list', '--full', '--run', runId]),
       ]);
       const workers: WorkerSummary[] = [];

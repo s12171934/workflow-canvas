@@ -9,7 +9,7 @@ import { composeBrief, checkBranches, checkScripts, checkCoordinatorGroup, check
 import { autoLayout } from '../src/layout.ts';
 import { briefPrompt, generatedWorkflow, generationTimeoutMs, maxPromptLength, workflowPrompt, type Generation } from './generate.ts';
 import { createModelCatalog } from './models.ts';
-import { coordinatorEventTypes, createRunLog, launchDirName, quietEveryMs } from './runlog.ts';
+import { coordinatorEventTypes, createRunLog, launchDirName, quietEveryMs, settledEveryMs } from './runlog.ts';
 import { applyDecision, decisionError, executionResults, executionRun, pendingDecisions, type PendingDecision, maxSpawnItems, requestKey, resolveVariables, validVariableValue, spawnsRuns, spawnsSubcoordinators, type SpawnResult, type RunLogMeta, executionTasks, inputsKey, loggedExecutions, skippedStages, type Execution, type RunLogDetail } from '../src/model.ts';
 import { defaultCleanup, executionLabel, maxRunTitle, type AutomationConfig, type AutomationState, type Cleanup, asksAtRun, createsWorktree, parentWorktree, resolvedParentPath, worktreeRepo, executionFinished, executionStatuses, isExecutable, worktreeNamePattern, type RunSnapshot, serializableWorkflow, userDecisions, userDecisionsSection, type Workflow, type WorkflowLive } from '../src/model.ts';
 
@@ -262,9 +262,11 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
   // dashboard (it answers through the POST below with via '대시보드'). A Run whose snapshot cannot be read is left out,
   // as the canvas shows no card while its snapshot is stale.
   // The dashboard asks every few seconds and a workflow keeps the Runs of all its past executions: a Run whose executions
-  // had all finished, or whose launch ended, is read again only every `quietEveryMs` unless an execution joins it, and
-  // its last snapshot stands in meanwhile, so cards it still had (an ended launch's gate) stay listed. Callers asking while
-  // a collection is under way share it instead of starting another round of Orca reads.
+  // had all finished, or whose launch ended, is read again only every `settledEveryMs` unless an execution joins it, and
+  // its last snapshot stands in meanwhile, so cards it still had (an ended launch's gate) stay listed. An open Run reuses
+  // the background watch's snapshot: up to `watchMs` old while it moves, up to `quietEveryMs` while it is quiet (waiting
+  // on a person: its card is listed already, and answering on the dashboard updates the graph, not the Run). Callers
+  // asking while a collection is under way share it instead of starting another round of Orca reads.
   const settledRuns = new Map<string, { at: number; executions: string; snapshot: RunSnapshot }>();
   const decisionsMaxAgeMs = options.watchMs ?? 0;
   let collecting: Promise<unknown> | undefined;
@@ -288,9 +290,10 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
       const ofRun = (runId: string) => executions.filter((execution) => executionRun(graph, execution) === runId).map((execution) => execution.id).join(',');
       for (const runId of new Set(executions.map((execution) => executionRun(graph, execution)).filter(Boolean))) {
         const settled = settledRuns.get(`${graph.id}:${runId}`);
-        if (settled && settled.executions === ofRun(runId) && Date.now() - settled.at < quietEveryMs) { snapshots.set(runId, settled.snapshot); continue; }
-        // The background watch reads open Runs every `watchMs`: its snapshot serves here too, so asks add no reads of their own.
-        try { snapshots.set(runId, await bridge.snapshot(runId, decisionsMaxAgeMs)); read.add(runId); } catch { /* stale: no cards for this Run */ }
+        if (settled && settled.executions === ofRun(runId) && Date.now() - settled.at < settledEveryMs) { snapshots.set(runId, settled.snapshot); continue; }
+        const pace = await runlog.runPace(runId).catch(() => 'moving' as const);
+        try { snapshots.set(runId, await bridge.snapshot(runId, pace === 'moving' ? decisionsMaxAgeMs : quietEveryMs)); read.add(runId); }
+        catch { /* stale: no cards for this Run */ }
       }
       const open = new Set<string>();
       for (const execution of executions) {
@@ -303,7 +306,7 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
       for (const runId of read) {
         // An execution whose Task left the Run or failed never reads as finished: the run log knowing the launch ended
         // (finished, stalled) settles its Run as well.
-        if (open.has(runId) && !await runlog.runEnded(runId).catch(() => false)) settledRuns.delete(`${graph.id}:${runId}`);
+        if (open.has(runId) && await runlog.runPace(runId).catch(() => 'moving') !== 'ended') settledRuns.delete(`${graph.id}:${runId}`);
         else settledRuns.set(`${graph.id}:${runId}`, { at: Date.now(), executions: ofRun(runId), snapshot: snapshots.get(runId)! });
       }
     }

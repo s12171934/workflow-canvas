@@ -88,3 +88,18 @@ test('coordinator check: open launches only, quiet ones once per quietEveryMs', 
     assert.deepEqual(await ids(now + quietEveryMs), [busy, quiet].sort());
   } finally { await rm(root, { recursive: true, force: true }); }
 });
+
+test('run pace: ended, quiet or moving, and moving for a Run no launch owns', async () => {
+  await mkdir('.local', { recursive: true });
+  const root = await mkdtemp(join(resolve('.local'), 'runlog-pace-test-'));
+  try {
+    await launch(root, 'wf-failed', 'run-failed', 26 * hour, [{ at: ago(25 * hour), type: 'finished', status: 'failed' }]);
+    await launch(root, 'wf-quiet', 'run-quiet', 3 * hour, [{ at: ago(2 * hour), type: 'task', taskId: 'task-a', status: 'blocked' }]);
+    await launch(root, 'wf-long', 'run-long', 3 * hour, [{ at: ago(2 * hour), type: 'task', taskId: 'task-a', status: 'running' }]);
+    const log = createRunLog(root);
+    assert.equal(await log.runPace('run-failed'), 'ended');
+    assert.equal(await log.runPace('run-quiet'), 'quiet');
+    assert.equal(await log.runPace('run-long'), 'moving');
+    assert.equal(await log.runPace('run-unknown'), 'moving');
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
