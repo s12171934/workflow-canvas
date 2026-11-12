@@ -113,3 +113,30 @@ test('a closed terminal reads as closed; an unreachable Orca is not an answer', 
   await assert.rejects(down.terminalOpen('term_live'));
   assert.equal(await open.terminalOpen('not a handle'), false);
 });
+test('a background reader can reuse an older snapshot; other readers keep the short window', async () => {
+  let reads = 0;
+  const bridge = createOrcaBridge(async (args) => {
+    if (args[1] === 'run-show') { reads++; return { run: { id: 'run-a', objective: 'A' } }; }
+    if (args[1] === 'task-list') return { tasks: [] };
+    return { workers: [], page: { hasMore: false } };
+  }, { snapshot: 10 });
+  await bridge.snapshot('run-a');
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  // 30ms old: past the 10ms window, within the 1s a background reader accepts.
+  await bridge.snapshot('run-a', 1000);
+  assert.equal(reads, 1);
+  await bridge.snapshot('run-a');
+  assert.equal(reads, 2);
+});
+test('a Run\'s own row is reused across snapshots; its Tasks and workers are read each time', async () => {
+  const calls: string[] = [];
+  const bridge = createOrcaBridge(async (args) => {
+    calls.push(args[1]);
+    if (args[1] === 'run-show') return { run: { id: 'run-a', objective: 'A' } };
+    if (args[1] === 'task-list') return { tasks: [] };
+    return { workers: [], page: { hasMore: false } };
+  }, { run: 60_000 });
+  await bridge.snapshot('run-a');
+  await bridge.snapshot('run-a');
+  assert.deepEqual(calls.sort(), ['run-show', 'task-list', 'task-list', 'worker-list', 'worker-list']);
+});

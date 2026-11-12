@@ -8,6 +8,7 @@ import { createApp } from './app.ts';
 import { createModelCatalog, latestPerFamily } from './models.ts';
 import { createOrcaBridge } from './orca.ts';
 import { launchDirName } from './runlog.ts';
+import { createStorage } from './storage.ts';
 import { newWorkflow } from '../src/model.ts';
 
 /** Orca answers for the run dialog's project check. */
@@ -439,6 +440,65 @@ test('open user decisions across workflows: listed for the dashboard, gone once 
       body: JSON.stringify({ node: 'gate', outputs: ['approve'], by: 'user', via: '대시보드' }) });
     assert.equal(picked.status, 200);
     assert.deepEqual(await open(), []);
+  } finally {
+    await new Promise<void>((resolve, reject) => { server.close((error) => error ? reject(error) : resolve()); server.closeAllConnections(); });
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+test('open user decisions: Runs whose executions all finished are not read on every ask, and asks in flight are shared', async () => {
+  await mkdir('.local', { recursive: true });
+  const directory = await mkdtemp(join(resolve('.local'), 'api-decisions-reads-test-'));
+  const reads: Record<string, number> = {};
+  const bridge = createOrcaBridge(async (args) => {
+    const place = places(args); if (place) return place;
+    const runId = args[args.indexOf(args[1] === 'run-show' ? '--id' : '--run') + 1];
+    if (args[1] === 'run-show') { reads[runId] = (reads[runId] ?? 0) + 1; await new Promise((done) => setTimeout(done, 50)); return { run: { id: runId, objective: 'A' } }; }
+    const statuses = { 'run-new': ['running', 'ready'], 'run-old': ['completed', 'completed'], 'run-ended': ['completed', 'ready'] }[runId]!;
+    if (args[1] === 'task-list') return { tasks: [{ id: 'task-w', display_name: '구현', status: statuses[0], deps: [] },
+      { id: 'task-g', display_name: '검토', status: statuses[1], deps: ['task-w'] }] };
+    if (args[1] === 'worker-list') return { workers: [], page: { hasMore: false } };
+    return {};
+  });
+  const bindings = { work: 'task-w', gate: 'task-g' };
+  // The workflow's current Run is open; an earlier execution on another Run has finished; one more waits at its gate on a
+  // Run whose launch the log knows has ended.
+  const graph = { ...newWorkflow(), id: 'wf-reads', name: '읽기', runId: 'run-new',
+    nodes: [{ id: 'work', type: 'stage' as const, position: { x: 0, y: 0 }, data: { label: '구현', description: '', kind: 'worker' as const } },
+      { id: 'gate', type: 'stage' as const, position: { x: 300, y: 0 }, data: { label: '검토', description: '머지할까요?', kind: 'gate' as const } }],
+    edges: [{ id: 'e', source: 'work', target: 'gate' }],
+    executions: [{ id: 'exec-old', label: '#1', runId: 'run-old', bindings }, { id: 'exec-ended', label: '#0', runId: 'run-ended', bindings },
+      { id: 'exec-new', label: '#2', bindings }] };
+  const ended = launchDirName(new Date(Date.now() - 3 * 60 * 60 * 1000), graph.id);
+  await mkdir(join(directory, '.executions', ended), { recursive: true });
+  await writeFile(join(directory, '.executions', ended, 'meta.json'), JSON.stringify({ workflowId: graph.id, workflowName: graph.name,
+    startedAt: new Date().toISOString(), runId: 'run-ended', executions: [{ id: 'exec-ended', label: '#0', tasks: ['task-w', 'task-g'] }] }));
+  await writeFile(join(directory, '.executions', ended, 'events.jsonl'), `${JSON.stringify({ at: new Date().toISOString(), type: 'finished', status: 'failed', message: '' })}\n`);
+  const legacy = launchDirName(new Date(Date.now() - 60 * 60 * 1000), graph.id);
+  await mkdir(join(directory, '.executions', legacy), { recursive: true });
+  await writeFile(join(directory, '.executions', legacy, 'report.md'), '# 보고');
+  const app = createApp(directory, bridge);
+  const server = app.listen(0, '127.0.0.1');
+  await new Promise<void>((resolve) => server.once('listening', resolve));
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const json = { 'Content-Type': 'application/json' };
+  try {
+    await fetch(`${base}/api/workflows/${graph.id}`, { method: 'PUT', headers: json, body: JSON.stringify(graph) });
+    await fetch(`${base}/api/workflows/${graph.id}/logs`); // adopts run-new: the workflow has an open Run
+    const ask = async () => (await (await fetch(`${base}/api/decisions`)).json()).decisions;
+    const cards = async () => (await ask()).map((card: { executionId: string; node: string }) => `${card.executionId}:${card.node}`);
+    // Three asks at once: one round of reads. The ended launch's gate is listed.
+    const asked = await Promise.all([ask(), ask(), ask()]);
+    assert.deepEqual(asked.map((list) => list.map((card: { executionId: string }) => card.executionId)), [['exec-ended'], ['exec-ended'], ['exec-ended']]);
+    assert.deepEqual(reads, { 'run-old': 1, 'run-ended': 1, 'run-new': 1 });
+    // Later asks read the open Run again, not the finished or ended ones, whose cards stay listed from their last read.
+    assert.deepEqual(await cards(), ['exec-ended:gate']);
+    assert.deepEqual(await cards(), ['exec-ended:gate']);
+    assert.deepEqual(reads, { 'run-old': 1, 'run-ended': 1, 'run-new': 3 });
+    // An execution joining the finished Run makes it read again at once.
+    // (as the coordinator registers it; the canvas's PUT keeps the stored executions)
+    await createStorage(directory).save({ ...graph, executions: [...graph.executions, { id: 'exec-more', label: '#3', runId: 'run-old', bindings }] });
+    await ask();
+    assert.deepEqual(reads, { 'run-old': 2, 'run-ended': 1, 'run-new': 4 });
   } finally {
     await new Promise<void>((resolve, reject) => { server.close((error) => error ? reject(error) : resolve()); server.closeAllConnections(); });
     await rm(directory, { recursive: true, force: true });

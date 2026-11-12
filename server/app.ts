@@ -9,7 +9,7 @@ import { composeBrief, checkBranches, checkScripts, checkCoordinatorGroup, check
 import { autoLayout } from '../src/layout.ts';
 import { briefPrompt, generatedWorkflow, generationTimeoutMs, maxPromptLength, workflowPrompt, type Generation } from './generate.ts';
 import { createModelCatalog } from './models.ts';
-import { coordinatorEventTypes, createRunLog, launchDirName } from './runlog.ts';
+import { coordinatorEventTypes, createRunLog, launchDirName, quietEveryMs, settledEveryMs } from './runlog.ts';
 import { applyDecision, decisionError, executionResults, executionRun, pendingDecisions, type PendingDecision, maxSpawnItems, requestKey, resolveVariables, validVariableValue, spawnsRuns, spawnsSubcoordinators, type SpawnResult, type RunLogMeta, executionTasks, inputsKey, loggedExecutions, skippedStages, type Execution, type RunLogDetail } from '../src/model.ts';
 import { defaultCleanup, executionLabel, maxRunTitle, type AutomationConfig, type AutomationState, type Cleanup, asksAtRun, createsWorktree, parentWorktree, resolvedParentPath, worktreeRepo, executionFinished, executionStatuses, isExecutable, worktreeNamePattern, type RunSnapshot, serializableWorkflow, userDecisions, userDecisionsSection, type Workflow, type WorkflowLive } from '../src/model.ts';
 
@@ -70,17 +70,20 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
   const storage = createStorage(directory);
   const runlog = createRunLog(join(directory, '.executions'));
   // Background observer: results of open Runs are logged even while no canvas is open.
-  if (options.watchMs) runlog.watch((runId) => bridge.snapshot(runId), options.watchMs);
+  // A snapshot up to one interval old (read for /api/decisions meanwhile) is as good as a new read here.
+  if (options.watchMs) runlog.watch((runId) => bridge.snapshot(runId, options.watchMs), options.watchMs);
   /**
    * Dead coordinators: a run whose coordinator terminal is gone from Orca, with no 'finished' event, is `stalled` — nobody
-   * is left to finish it. The Run is observed first so a run that did settle is logged as finished, not stalled. When Orca
-   * does not answer, nothing is marked (unknown is not dead).
+   * is left to finish it. Once the terminal is gone the Run is observed first, so a run that did settle is logged as
+   * finished, not stalled (the background watch reads open Runs; reading each one here too would double the CLI calls).
+   * When Orca does not answer, nothing is marked (unknown is not dead).
    */
   async function watchCoordinators() {
     for (const { id, terminal, runId } of await runlog.coordinatorsToWatch().catch(() => [])) {
       try {
+        if (await bridge.terminalOpen(terminal)) continue;
         if (runId) await runlog.observe(await bridge.snapshot(runId));
-        if (!await bridge.terminalOpen(terminal)) await runlog.markLost(id, terminal);
+        await runlog.markLost(id, terminal);
       } catch { /* Orca unreachable: try again next time */ }
     }
   }
@@ -258,7 +261,20 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
   // Every user decision open now, across the workflows with open Runs: the same cards the canvas shows, for the agent
   // dashboard (it answers through the POST below with via '대시보드'). A Run whose snapshot cannot be read is left out,
   // as the canvas shows no card while its snapshot is stale.
+  // The dashboard asks every few seconds and a workflow keeps the Runs of all its past executions: a Run whose executions
+  // had all finished, or whose launch ended, is read again only every `settledEveryMs` unless an execution joins it, and
+  // its last snapshot stands in meanwhile, so cards it still had (an ended launch's gate) stay listed. An open Run reuses
+  // the background watch's snapshot: up to `watchMs` old while it moves, up to `quietEveryMs` while it is quiet (waiting
+  // on a person: its card is listed already, and answering on the dashboard updates the graph, not the Run). Callers
+  // asking while a collection is under way share it instead of starting another round of Orca reads.
+  const settledRuns = new Map<string, { at: number; executions: string; snapshot: RunSnapshot }>();
+  const decisionsMaxAgeMs = options.watchMs ?? 0;
+  let collecting: Promise<unknown> | undefined;
   app.get('/api/decisions', async (_req, res) => {
+    collecting ??= openDecisions().finally(() => { collecting = undefined; });
+    res.json(await collecting);
+  });
+  async function openDecisions() {
     const live = await runlog.liveByWorkflow().catch(() => ({} as Record<string, WorkflowLive>));
     const decisions: (PendingDecision & { workflowId: string; workflowName: string; runId: string })[] = [];
     for (const id of Object.keys(live)) {
@@ -270,18 +286,32 @@ export function createApp(directory: string, bridge = createOrcaBridge(), option
       try { flow = flowOf(graph, await linkedWorkflows(graph, (linkId) => storage.load(linkId))); }
       catch { continue; }
       const snapshots = new Map<string, RunSnapshot>();
+      const read = new Set<string>();
+      const ofRun = (runId: string) => executions.filter((execution) => executionRun(graph, execution) === runId).map((execution) => execution.id).join(',');
       for (const runId of new Set(executions.map((execution) => executionRun(graph, execution)).filter(Boolean))) {
-        try { snapshots.set(runId, await bridge.snapshot(runId)); } catch { /* stale: no cards for this Run */ }
+        const settled = settledRuns.get(`${graph.id}:${runId}`);
+        if (settled && settled.executions === ofRun(runId) && Date.now() - settled.at < settledEveryMs) { snapshots.set(runId, settled.snapshot); continue; }
+        const pace = await runlog.runPace(runId).catch(() => 'moving' as const);
+        try { snapshots.set(runId, await bridge.snapshot(runId, pace === 'moving' ? decisionsMaxAgeMs : quietEveryMs)); read.add(runId); }
+        catch { /* stale: no cards for this Run */ }
       }
+      const open = new Set<string>();
       for (const execution of executions) {
         const runId = executionRun(graph, execution);
         const snapshot = snapshots.get(runId);
         if (!snapshot || executionFinished(executionStatuses(graph.nodes, execution, snapshot, false))) continue;
+        open.add(runId);
         for (const item of pendingDecisions(flow, execution, snapshot)) decisions.push({ ...item, workflowId: graph.id, workflowName: graph.name, runId });
       }
+      for (const runId of read) {
+        // An execution whose Task left the Run or failed never reads as finished: the run log knowing the launch ended
+        // (finished, stalled) settles its Run as well.
+        if (open.has(runId) && await runlog.runPace(runId).catch(() => 'moving') !== 'ended') settledRuns.delete(`${graph.id}:${runId}`);
+        else settledRuns.set(`${graph.id}:${runId}`, { at: Date.now(), executions: ofRun(runId), snapshot: snapshots.get(runId)! });
+      }
     }
-    res.json({ decisions });
-  });
+    return { decisions };
+  }
   // Read-only: the checks 실행 would run, all of them, without starting a coordinator (used by the 워크플로 검증 workflow).
   app.get('/api/workflows/:id/check', async (req, res) => {
     if (!validId(req.params.id)) { res.status(400).json({ error: '올바르지 않은 워크플로 ID입니다.' }); return; }

@@ -74,8 +74,9 @@ export const orcaCommand: Command = (args, options) => {
 };
 
 /** How long a read is reused (`fresh`) and how long the last good value stands in for a failed read (`stale`). */
-export type CacheTimes = Partial<Record<'status' | 'locations' | 'runs' | 'automations' | 'snapshot', number>> & { staleMs?: number };
-export const defaultCacheTimes: CacheTimes = { status: 4000, locations: 10_000, runs: 30_000, automations: 10_000, snapshot: 2000, staleMs: 60_000 };
+/** `run`: a Run's own row (objective), part of each snapshot; it does not change while the Run goes on, so it is reused long. */
+export type CacheTimes = Partial<Record<'status' | 'locations' | 'runs' | 'automations' | 'snapshot' | 'run', number>> & { staleMs?: number };
+export const defaultCacheTimes: CacheTimes = { status: 4000, locations: 10_000, runs: 30_000, automations: 10_000, snapshot: 2000, run: 10 * 60_000, staleMs: 60_000 };
 
 /**
  * Reads shared by the canvas polls, several tabs and the background watcher: one CLI call per key at a time (callers
@@ -84,11 +85,12 @@ export const defaultCacheTimes: CacheTimes = { status: 4000, locations: 10_000, 
 function createReadCache(times: CacheTimes) {
   const entries = new Map<string, { value?: unknown; at?: number; pending?: Promise<unknown> }>();
   return {
-    read<T>(kind: Exclude<keyof CacheTimes, 'staleMs'>, key: string, load: () => Promise<T>, { stale = true } = {}): Promise<T> {
+    /** `fresh`: how long a value is reused for this caller, when it tolerates an older one than `times[kind]`. */
+    read<T>(kind: Exclude<keyof CacheTimes, 'staleMs'>, key: string, load: () => Promise<T>, { stale = true, fresh }: { stale?: boolean; fresh?: number } = {}): Promise<T> {
       const id = `${kind}:${key}`;
       const entry = entries.get(id) ?? {};
       entries.set(id, entry);
-      if (entry.at !== undefined && Date.now() - entry.at < (times[kind] ?? 0)) return Promise.resolve(entry.value as T);
+      if (entry.at !== undefined && Date.now() - entry.at < Math.max(fresh ?? 0, times[kind] ?? 0)) return Promise.resolve(entry.value as T);
       if (entry.pending) return entry.pending as Promise<T>;
       const pending = load().then((value) => { entry.value = value; entry.at = Date.now(); return value; }, (error) => {
         if (stale && entry.at !== undefined && Date.now() - entry.at < (times.staleMs ?? 0)) return entry.value as T;
@@ -188,13 +190,14 @@ export function createOrcaBridge(command: Command = orcaCommand, cacheTimes: Cac
       } while (cursor != null);
       return runs;
     },
-    async snapshot(runId: string): Promise<RunSnapshot> {
+    /** `maxAgeMs`: a background reader that can use a snapshot this old (another reader's) instead of reading Orca again. */
+    async snapshot(runId: string, maxAgeMs?: number): Promise<RunSnapshot> {
       if (!/^[a-zA-Z0-9_-]{1,128}$/.test(runId)) throw new Error('올바르지 않은 Run ID입니다.');
-      return cache.read('snapshot', runId, () => bridge.loadSnapshot(runId));
+      return cache.read('snapshot', runId, () => bridge.loadSnapshot(runId), { fresh: maxAgeMs });
     },
     async loadSnapshot(runId: string): Promise<RunSnapshot> {
       const [detail, tasks] = await Promise.all([
-        command(['orchestration', 'run-show', '--full', '--id', runId]),
+        cache.read('run', runId, () => command(['orchestration', 'run-show', '--full', '--id', runId])),
         command(['orchestration', 'task-list', '--full', '--run', runId]),
       ]);
       const workers: WorkerSummary[] = [];

@@ -8,11 +8,31 @@ const maxListed = 50;
 const maxFileBytes = 1024 * 1024;
 /** Runs older than this are no longer watched in the background (the canvas still observes them while open). */
 const watchWindowMs = 7 * 24 * 60 * 60 * 1000;
+/**
+ * Every Orca read starts a CLI (Electron) process, so a Run that has gone quiet is read rarely: one with no logged event
+ * for `quietAfterMs` while nothing runs (waiting on a person or on a dead worker), or for `idleAfterMs` whatever it shows,
+ * is read once every `quietEveryMs` (the agent dashboard rereads settled Runs at the same pace). Any new event makes it
+ * read at the normal pace again.
+ */
+export const quietAfterMs = 30 * 60 * 1000;
+export const idleAfterMs = 6 * 60 * 60 * 1000;
+export const quietEveryMs = 5 * 60 * 1000;
+/** A Run whose executions have all finished (or whose launch ended) is read this rarely by the dashboard's decision list. */
+export const settledEveryMs = 15 * 60 * 1000;
 const fileName = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,200}$/;
 const hidden = new Set(['meta.json', 'events.jsonl']);
 /** Index of the last event of a type, or -1. */
 const lastOf = (events: RunEvent[], type: string) => events.map((event) => event.type).lastIndexOf(type);
 const stampPattern = /^(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})-(\d{3})Z-/;
+/**
+ * The launch is over: its executions all settled ('finished', completed or failed, with no Task change since), its
+ * coordinator is gone (stalled), or its coordinator never started. Nothing is left to watch until a Task changes again.
+ */
+export function ended(events: RunEvent[]) {
+  const finished = lastOf(events, 'finished');
+  return (finished >= 0 && finished > lastOf(events, 'task')) || lastOf(events, 'coordinator-lost') > finished
+    || events.some((event) => event.type === 'coordinator-failed');
+}
 
 /** Launch directories are named `<ISO stamp with : and . replaced>-<workflow id>`. */
 export function launchDirName(startedAt: Date, workflowId: string) {
@@ -53,6 +73,8 @@ export function createRunLog(root: string) {
   /** Launch ids whose Run is still open: the background watcher polls these. */
   const active = new Set<string>();
   let indexed: Promise<void> | undefined;
+  /** When each quiet launch was last read, per reader (background watch, coordinator check). */
+  const quietReads = new Map<string, number>();
 
   const validLaunch = (workflowId: string, id: string) => validId(workflowId) && /^[a-zA-Z0-9_-]{1,200}$/.test(id) && id.endsWith(`-${workflowId}`) && !!stampOf(id);
 
@@ -79,10 +101,28 @@ export function createRunLog(root: string) {
         const meta = await readMeta(id);
         if (!meta?.runId || runLaunch.has(meta.runId)) continue;
         runLaunch.set(meta.runId, id);
-        if (recent(id) && !['completed', 'stalled'].includes(outcomeOf(meta, await readEvents(id)))) active.add(id);
+        // Ended launches (failed ones too) are left out; a later snapshot that shows a Task moving puts one back.
+        if (recent(id) && !ended(await readEvents(id))) active.add(id);
       }
     })();
     return indexed;
+  }
+  /**
+   * Whether a launch should be read now by `reader`: always while it moves, else once per `quietEveryMs` (see quietAfterMs).
+   * Running Tasks keep a launch at the normal pace for `idleAfterMs`, as a long Task logs nothing until it ends.
+   */
+  async function quiet(id: string, events: RunEvent[], now: number) {
+    const last = events.length ? Date.parse(events[events.length - 1].at) : Date.parse(stampOf(id)!);
+    const runId = (await readMeta(id))?.runId;
+    const running = runId ? [...(await remembered(runId, id)).tasks.values()].includes('running') : false;
+    return now - last >= (running ? idleAfterMs : quietAfterMs);
+  }
+  async function readNow(reader: string, id: string, events: RunEvent[], now: number) {
+    const key = `${reader}:${id}`;
+    if (!await quiet(id, events, now)) { quietReads.delete(key); return true; }
+    if (now - (quietReads.get(key) ?? 0) < quietEveryMs) return false;
+    quietReads.set(key, now);
+    return true;
   }
   async function append(id: string, event: Omit<RunEvent, 'at'> & { at?: string }) {
     const line: RunEvent = { at: event.at ?? new Date().toISOString(), ...event };
@@ -203,6 +243,7 @@ export function createRunLog(root: string) {
         for (const id of [...active]) {
           const runId = (await readMeta(id))?.runId;
           if (!runId || !recent(id)) { active.delete(id); continue; }
+          if (!await readNow('watch', id, await readEvents(id), Date.now())) continue;
           try { await log.observe(await snapshot(runId)); } catch { /* Orca unreachable: try again next tick */ }
         }
         if (!stopped) { timer = setTimeout(tick, intervalMs); timer.unref?.(); }
@@ -239,17 +280,15 @@ export function createRunLog(root: string) {
      * Recent launches still open whose coordinator terminal is known: the server checks that terminal is alive in Orca and
      * marks the launch `stalled` (a `coordinator-lost` event) when it is gone before the run finished.
      */
-    async coordinatorsToWatch(): Promise<{ id: string; terminal: string; runId?: string }[]> {
+    async coordinatorsToWatch(now = Date.now()): Promise<{ id: string; terminal: string; runId?: string }[]> {
       const due: { id: string; terminal: string; runId?: string }[] = [];
       for (const id of await launches()) {
         if (!recent(id)) continue;
         const meta = await readMeta(id);
         if (!meta?.coordinatorTerminal) continue;
         const events = await readEvents(id);
-        // Finished (completed or failed), already stalled, or never started: nothing to watch.
-        const finished = lastOf(events, 'finished');
-        if ((finished >= 0 && finished > lastOf(events, 'task')) || lastOf(events, 'coordinator-lost') > finished
-          || events.some((event) => event.type === 'coordinator-failed')) continue;
+        // Finished (completed or failed), already stalled, or never started: nothing to watch. Quiet ones are checked rarely.
+        if (ended(events) || !await readNow('coordinator', id, events, now)) continue;
         due.push({ id, terminal: meta.coordinatorTerminal, ...(meta.runId ? { runId: meta.runId } : {}) });
       }
       return due;
@@ -287,6 +326,17 @@ export function createRunLog(root: string) {
       await index();
       const id = runId ? runLaunch.get(runId) : undefined;
       return id ? readMeta(id) : undefined;
+    },
+    /**
+     * How the launch that owns a Run stands: `ended` (see `ended`), `quiet` (see quietAfterMs) or `moving`; `moving` for a
+     * Run no launch owns, so it is never read less often than before.
+     */
+    async runPace(runId: string, now = Date.now()): Promise<'ended' | 'quiet' | 'moving'> {
+      await index();
+      const id = runId ? runLaunch.get(runId) : undefined;
+      if (!id) return 'moving';
+      const events = await readEvents(id);
+      return ended(events) ? 'ended' : await quiet(id, events, now) ? 'quiet' : 'moving';
     },
     /** Id of the launch that owns a Run, if any. */
     async launchOfRun(runId: string) {
