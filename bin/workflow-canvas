@@ -1,17 +1,17 @@
-#!/usr/bin/env node
-import { spawn } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
-import { resolve, dirname } from 'node:path';
-
-const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const args = process.argv.slice(2);
-if (args.includes('--help')) {
-  console.log('workflow-canvas [--dev] [--port <port>]\nLocal Orca graph canvas; binds to 127.0.0.1.');
-  process.exit(0);
-}
-const child = spawn(process.execPath, ['--import', 'tsx', resolve(root, 'server/index.ts'), ...args], {
-  cwd: root, stdio: 'inherit', env: process.env,
-});
-for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => child.kill(signal));
-child.on('exit', (code) => { process.exitCode = code ?? 1; });
-child.on('error', (error) => { console.error(error.message); process.exitCode = 1; });
+#!/bin/sh
+set -eu
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+for arg in "$@"; do
+  if [ "$arg" = '--dev' ]; then exec node "$root/scripts/dev.mjs" "$@"; fi
+  if [ "$arg" = '--help' ]; then
+    echo 'workflow-canvas [--dev] [--port <port>]'
+    echo 'Local Orca graph canvas; binds to 127.0.0.1.'
+    exit 0
+  fi
+done
+binary="$root/.local/target/release/workflow-canvas"
+if [ ! -x "$binary" ] || [ ! -f "$root/dist/index.html" ]; then
+  echo '빌드가 필요합니다. npm run build를 먼저 실행하세요.' >&2
+  exit 1
+fi
+exec "$binary" --root "$root" "$@"

@@ -1,3 +1,4 @@
+import { calculate, calculateMemo } from "./core.ts";
 import type { Edge, Node } from '@xyflow/react';
 import { autoLayout } from './layout.ts';
 
@@ -60,7 +61,7 @@ export type GroupScope = 'project' | 'worktree';
 export type NodeKind = StageKind | 'group' | 'frame';
 /**
  * Fallback model ids offered per launching node, used only when the server cannot reach the Anthropic Models API
- * (`server/models.ts` serves the newest of each family at /api/models); unset means `defaultWorkerModel`.
+ * (`rust/server/src/models.rs` serves the newest of each family at /api/models); unset means `defaultWorkerModel`.
  */
 export const workerModels = ['claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5', 'claude-fable-5-2'] as const;
 export const defaultWorkerModel = 'claude-opus-5-5';
@@ -205,13 +206,16 @@ export const isGroup = (node: Pick<StageNode, 'data'>) => node.data.kind === 'gr
 export const isFrame = (node: Pick<StageNode, 'data'>) => node.data.kind === 'frame';
 /** A worktree group whose worktree does not exist yet: the coordinator creates one per execution. */
 /** React Flow needs every parent before its children: project groups, then worktree groups, then stages (stable within each). */
+let orderedShape = '', orderedIds: string[] = [];
 export function orderNodes<T extends Pick<StageNode, 'id' | 'data' | 'parentId'>>(nodes: T[]): T[] {
-  const byId = new Map(nodes.map((node) => [node.id, node]));
-  const depth = (node: T) => { let d = 0; for (let p = node.parentId; p && d < maxGroupDepth + 1; p = byId.get(p)?.parentId) d += 1; return d; };
-  // Top-level memo groups first (they sit under everything), then groups by nesting depth — a memo group inside a group right
-  // after its group's level, so it draws over that group but under the groups nested beside it — then stages.
-  const rank = (node: T) => isFrame(node) ? (node.parentId ? depth(node) - 0.5 : -1) : isGroup(node) ? depth(node) : maxGroupDepth + 2;
-  return nodes.map((node, index) => ({ node, index, rank: rank(node) })).sort((a, b) => a.rank - b.rank || a.index - b.index).map(({ node }) => node);
+  const shape = nodes.map(node => ({ id: node.id, parentId: node.parentId, data: { kind: node.data.kind } }));
+  const key = JSON.stringify(shape);
+  if (key !== orderedShape) {
+    orderedIds = calculate<typeof shape>('orderNodes', [shape]).map(node => node.id);
+    orderedShape = key;
+  }
+  const byId = new Map(nodes.map(node => [node.id, node]));
+  return orderedIds.map(id => byId.get(id)!);
 }
 /** Project group + up to this many worktree groups nested inside one another. */
 export const maxGroupDepth = 4;
@@ -282,22 +286,7 @@ export const maxLoopRounds = 200;
 /** Edges that are not loops: the graph they form must be acyclic. */
 export const forwardEdges = <T extends { loop?: EdgeLoop }>(edges: T[]) => edges.filter((edge) => !edge.loop);
 /** Stages a loop runs again: on a forward path from its target to its source, both included. */
-export function loopBody(edges: { source: string; target: string; loop?: EdgeLoop }[], loop: { source: string; target: string }): string[] {
-  const forward = forwardEdges(edges);
-  const reach = (start: string, down: boolean) => {
-    const seen = new Set([start]);
-    for (let queue = [start], id = queue.shift(); id !== undefined; id = queue.shift()) {
-      for (const edge of forward) {
-        const [from, to] = down ? [edge.source, edge.target] : [edge.target, edge.source];
-        if (from === id && !seen.has(to)) { seen.add(to); queue.push(to); }
-      }
-    }
-    return seen;
-  };
-  const after = reach(loop.target, true);
-  const before = reach(loop.source, false);
-  return [...after].filter((id) => before.has(id));
-}
+export function loopBody(edges: { source: string; target: string; loop?: EdgeLoop }[], loop: { source: string; target: string }): string[] { return calculate<string[]>("loopBody", [edges, loop]); }
 /**
  * One setting of a workflow, like an environment variable: given per 실행 or fixed per automation, written into the brief,
  * and replacing {{key}} in stage instructions. Linked workflows (expanded or spawned) receive the same key's value.
@@ -310,26 +299,13 @@ export const maxVariableValue = 2000;
 export const validVariableValue = (value: unknown): value is string => typeof value === 'string' && value.length <= maxVariableValue && !/[\u0000-\u001f\u007f]/.test(value);
 const variableRef = /\{\{\s*([a-z][a-z0-9_]{0,39})\s*\}\}/g;
 /** Keys a text refers to as {{key}}. */
-export function variableRefs(text: string): string[] {
-  return [...new Set([...text.matchAll(variableRef)].map((match) => match[1]))];
-}
+export function variableRefs(text: string): string[] { return calculate<string[]>("variableRefs", [text]); }
 /** Replaces {{key}} with its value; keys without a value stay as written. */
-export function substituteVariables(text: string, values: Record<string, string>): string {
-  return text.replace(variableRef, (whole, key: string) => Object.prototype.hasOwnProperty.call(values, key) ? values[key] : whole);
-}
+export function substituteVariables(text: string, values: Record<string, string>): string { return calculate<string>("substituteVariables", [text, values]); }
 /**
  * The values a run uses: what was given (declared keys only), else the default. Returns the required keys left empty too.
  */
-export function resolveVariables(variables: WorkflowVariable[] | undefined, given: Record<string, string> = {}): { values: Record<string, string>; missing: WorkflowVariable[] } {
-  const values: Record<string, string> = {};
-  const missing: WorkflowVariable[] = [];
-  for (const variable of variables ?? []) {
-    const value = (given[variable.key] ?? '').trim() || (variable.default ?? '').trim();
-    if (value) values[variable.key] = value;
-    else if (variable.required) missing.push(variable);
-  }
-  return { values, missing };
-}
+export function resolveVariables(variables: WorkflowVariable[] | undefined, given: Record<string, string> = {}): { values: Record<string, string>; missing: WorkflowVariable[] } { return calculate<{ values: Record<string, string>; missing: WorkflowVariable[] }>("resolveVariables", [variables, given]); }
 /**
  * One execution of the graph: maps node IDs to the Task that ran that node in the bound Run.
  * `links` maps a workflow-link node ID to the Tasks of its expanded sub-graph (sub-node path → Task ID).
@@ -437,55 +413,14 @@ export const statusLabels: Record<StageStatus, string> = {
   completed: '완료', failed: '실패', unknown: '상태 미확인', skipped: '건너뜀',
 };
 
-export function taskStatus(task: TaskSummary | undefined, workers: WorkerSummary[]): StageStatus {
-  if (!task) return 'unknown';
-  // Task settlement is authoritative; a completed task may still own a live terminal.
-  if (['completed', 'succeeded', 'done'].includes(task.status)) return 'completed';
-  if (['failed', 'cancelled', 'canceled', 'abandoned'].includes(task.status)) return 'failed';
-  if (['blocked', 'waiting', 'waiting_for_input', 'awaiting_approval'].includes(task.status)) return 'blocked';
-  if (['pending', 'queued', 'todo', 'ready'].includes(task.status)) return 'pending';
-  if (['running', 'in_progress', 'in-progress', 'dispatched', 'active'].includes(task.status)) {
-    const attempts = workers.filter((worker) => worker.taskId === task.id);
-    const current = attempts[0]; // CLI returns newest attempts first; never revive an older attempt.
-    if (current?.liveness === 'unverifiable' || current?.liveness === 'exited') return 'unknown';
-    if (current && ['waiting', 'blocked', 'question', 'escalation'].includes(current.stage)) return 'blocked';
-    return 'running';
-  }
-  return 'unknown';
-}
-
-function bindingStatus(taskId: string | undefined, snapshot: RunSnapshot | null, stale: boolean): StageStatus {
-  if (!taskId) return 'unbound';
-  if (stale) return 'unknown';
-  return taskStatus(snapshot?.tasks.find((item) => item.id === taskId), snapshot?.workers ?? []);
-}
+export function taskStatus(task: TaskSummary | undefined, workers: WorkerSummary[]): StageStatus { return calculate<StageStatus>("taskStatus", [task, workers]); }
 /** Status of one node in one execution; a workflow link aggregates its sub-graph Tasks. */
-export function nodeExecutionStatus(node: StageNode, execution: Execution, snapshot: RunSnapshot | null, stale: boolean): StageStatus {
-  // Skipping is decided by the canvas from branch decisions; it wins over the Task, which the coordinator closes as completed.
-  const skipped = new Set(execution.skipped ?? []);
-  if (node.data.kind === 'workflow' && !spawnsRuns(node)) {
-    const tasks = Object.entries(execution.links?.[node.id] ?? {});
-    const statuses = tasks.map(([path, taskId]) => skipped.has(`${node.id}.${path}`) ? 'skipped' : bindingStatus(taskId, snapshot, stale));
-    return statuses.length && statuses.every((status) => status === 'skipped') ? 'skipped' : aggregateStatus(statuses.filter((status) => status !== 'skipped'));
-  }
-  if (skipped.has(node.id)) return 'skipped';
-  return bindingStatus(execution.bindings[node.id], snapshot, stale);
-}
-/** The Task to open for a node in one execution: its own Task, or a link's first open sub-Task. */
-function nodeExecutionTask(node: StageNode, execution: Execution, snapshot: RunSnapshot | null, stale: boolean): string | undefined {
-  if (node.data.kind !== 'workflow' || spawnsRuns(node)) return execution.bindings[node.id];
-  const tasks = Object.values(execution.links?.[node.id] ?? {});
-  return tasks.find((taskId) => openableStatuses.includes(bindingStatus(taskId, snapshot, stale))) ?? tasks[0];
-}
+export function nodeExecutionStatus(node: StageNode, execution: Execution, snapshot: RunSnapshot | null, stale: boolean): StageStatus { return calculate<StageStatus>("nodeExecutionStatus", [node, execution, snapshot, stale]); }
 /** Statuses for which the canvas offers to open the worker's terminal. */
 export const openableStatuses: StageStatus[] = ['running', 'blocked', 'unknown'];
 // Worst-first, so an aggregate never hides a failure or a question behind finished siblings.
 const aggregateOrder: StageStatus[] = ['failed', 'blocked', 'unknown', 'running', 'pending', 'completed', 'skipped', 'unbound'];
-export function aggregateStatus(statuses: StageStatus[]): StageStatus {
-  const bound: StageStatus[] = statuses.filter((status) => status !== 'unbound');
-  if (!bound.length) return 'unbound';
-  return aggregateOrder.find((status) => bound.includes(status)) ?? 'unknown';
-}
+export function aggregateStatus(statuses: StageStatus[]): StageStatus { return calculate<StageStatus>("aggregateStatus", [statuses]); }
 
 /**
  * Statuses that mean the execution still needs attention, so it stays visible. A pending stage is open too: untaken
@@ -493,28 +428,24 @@ export function aggregateStatus(statuses: StageStatus[]): StageStatus {
  */
 const openStatuses: StageStatus[] = ['running', 'blocked', 'unknown', 'failed', 'pending'];
 /** An execution is finished when nothing is open (only completed or skipped stages) and at least one Task completed. */
-export function executionFinished(statuses: StageStatus[]): boolean {
-  return !statuses.some((status) => openStatuses.includes(status)) && statuses.includes('completed');
+export function executionFinished(statuses: StageStatus[]): boolean { return calculate<boolean>("executionFinished", [statuses]); }
+function statusNodes(nodes: StageNode[], labels = false) {
+  return nodes.map(node => ({ id: node.id, data: { kind: node.data.kind, taskId: node.data.taskId, linkMode: node.data.linkMode,
+    ...(labels ? { label: node.data.label } : {}) } }));
 }
 export function executionStatuses(nodes: StageNode[], execution: Execution, snapshot: RunSnapshot | null, stale: boolean): StageStatus[] {
-  return nodes.filter(isExecutable).map((node) => nodeExecutionStatus(node, execution, snapshot, stale));
+  return calculateMemo<StageStatus[]>('executionStatuses', [statusNodes(nodes), execution, snapshot, stale]);
 }
 
 /** 요약 보기 order: what needs eyes first (running, waiting on a person, failed), then what is settled. */
 export const tallyOrder: StageStatus[] = ['running', 'blocked', 'failed', 'unknown', 'pending', 'completed', 'skipped', 'unbound'];
 /** How many of the given statuses fall in each status, in `tallyOrder`, leaving out the empty ones. */
-export function tallyStatuses(statuses: StageStatus[]): { status: StageStatus; count: number }[] {
-  return tallyOrder.map((status) => ({ status, count: statuses.filter((item) => item === status).length })).filter((item) => item.count > 0);
-}
+export function tallyStatuses(statuses: StageStatus[]): { status: StageStatus; count: number }[] { return calculate<{ status: StageStatus; count: number }[]>("tallyStatuses", [statuses]); }
 export type ExecutionSummary = { total: number; done: number; tally: { status: StageStatus; count: number }[];
   running: string[]; blocked: string[]; failed: string[] };
 /** One execution at a glance: settled stages (completed or skipped) of all, and which stages run, wait, or failed. */
 export function summarizeExecution(nodes: StageNode[], execution: Execution, snapshot: RunSnapshot | null, stale: boolean): ExecutionSummary {
-  const stages = nodes.filter(isExecutable);
-  const statuses = stages.map((node) => nodeExecutionStatus(node, execution, snapshot, stale));
-  const names = (status: StageStatus) => stages.filter((_, index) => statuses[index] === status).map((node) => node.data.label || '이름 없는 단계');
-  return { total: stages.length, done: statuses.filter((status) => status === 'completed' || status === 'skipped').length,
-    tally: tallyStatuses(statuses), running: names('running'), blocked: names('blocked'), failed: names('failed') };
+  return calculateMemo<ExecutionSummary>('summarizeExecution', [statusNodes(nodes, true), execution, snapshot, stale]);
 }
 
 /**
@@ -523,122 +454,36 @@ export function summarizeExecution(nodes: StageNode[], execution: Execution, sna
  * - executionId 'all': aggregate over every execution, with per-execution chips in data.runs.
  * - executionId '<id>': that execution's binding.
  */
+let projectedKey = '', projectedData: StageData[] = [];
 export function projectNodes(nodes: StageNode[], snapshot: RunSnapshot | null, stale: boolean,
   executions: Execution[] = [], executionId: string | null = null, visible?: Set<string>): StageNode[] {
-  const selected = executionId && executionId !== 'all' ? executions.find((item) => item.id === executionId) : undefined;
-  return nodes.map((node) => {
-    if (!isExecutable(node)) return { ...node, data: { ...node.data, status: undefined, runs: undefined, activeTaskId: undefined, decision: undefined, spawned: undefined, round: undefined, live: undefined } };
-    const runs = executions.map((execution) => ({ id: execution.id, label: execution.label,
-      taskId: nodeExecutionTask(node, execution, snapshot, stale), status: nodeExecutionStatus(node, execution, snapshot, stale) }));
-    const taskId = selected ? nodeExecutionTask(node, selected, snapshot, stale) : executionId === 'all' ? undefined : node.data.taskId;
-    const worker = taskId ? snapshot?.workers.find((item) => item.taskId === taskId) : undefined;
-    const task = taskId ? snapshot?.tasks.find((item) => item.id === taskId) : undefined;
-    // Chips show only visible executions; with none visible the node still reports the overall result.
-    const shown = visible ? runs.filter((run) => visible.has(run.id)) : runs;
-    const status = executionId === 'all' ? aggregateStatus((shown.length ? shown : runs).map((run) => run.status))
-      : selected ? nodeExecutionStatus(node, selected, snapshot, stale) : bindingStatus(taskId, snapshot, stale);
-    const requested = spawnsRuns(node) ? (selected ? [selected] : executionId === 'all' ? executions.filter((execution) => !visible || visible.has(execution.id)) : [])
-      .flatMap((execution) => execution.spawned?.[node.id] ?? []) : [];
-    const live = executionId === 'all' ? shown.filter((run) => run.status === 'running').length : status === 'running' ? 1 : 0;
-    return { ...node, data: { ...node.data, status, runs: executionId === 'all' ? shown : undefined, activeTaskId: taskId, live: live || undefined,
-      spawned: requested.length ? requested : undefined,
-      round: (() => { const rounds = (selected ? [selected] : executionId === 'all' ? executions.filter((execution) => !visible || visible.has(execution.id)) : [])
-        .map((execution) => stageRound(execution, node.id)); const top = Math.max(1, ...rounds); return top > 1 ? top : undefined; })(),
-      decision: selected && isBranch(node) ? selected.decisions?.[node.id] : undefined,
-      agent: worker?.provider,
-      model: worker?.model,
-      detail: stale ? 'Orca 상태를 새로 확인할 수 없습니다.' : task?.status,
-    } };
-  });
+  const descriptors = nodes.map(node => ({ id: node.id, data: { kind: node.data.kind, taskId: node.data.taskId, linkMode: node.data.linkMode } }));
+  const args = [descriptors, snapshot, stale, executions, executionId, visible ? [...visible] : undefined];
+  const key = JSON.stringify(args);
+  if (key !== projectedKey) {
+    projectedData = calculate<StageNode[]>('projectNodes', args).map(node => node.data);
+    projectedKey = key;
+  }
+  return nodes.map((node, index) => ({ ...node, data: { ...node.data,
+    status: undefined, runs: undefined, activeTaskId: undefined, decision: undefined, spawned: undefined, round: undefined, live: undefined,
+    ...(isExecutable(node) ? { agent: undefined, model: undefined, detail: undefined } : {}), ...projectedData[index] } }));
 }
 
+let documentShape = '', serializedDocument: Workflow | undefined;
 export function serializableWorkflow(workflow: Workflow): Workflow {
-  const nodeIds = new Set(workflow.nodes.map((node) => node.id));
-  const groupIds = new Set(workflow.nodes.filter(isGroup).map((node) => node.id));
-  const frameIds = new Set(workflow.nodes.filter(isFrame).map((node) => node.id));
-  const branchIds = new Set(workflow.nodes.filter(isBranch).map((node) => node.id));
-
-  const executions = workflow.executions?.map((execution) => {
-    const links = Object.fromEntries(Object.entries(execution.links ?? {})
-      .filter(([nodeId, tasks]) => nodeIds.has(nodeId) && Object.keys(tasks).length));
-    return { id: execution.id, label: execution.label,
-      // Drop bindings for deleted nodes so a saved document never references a missing node.
-      bindings: Object.fromEntries(Object.entries(execution.bindings).filter(([nodeId, taskId]) => nodeIds.has(nodeId) && taskId)),
-      ...(Object.keys(links).length ? { links } : {}),
-      ...(execution.decisions && Object.keys(execution.decisions).length ? { decisions: execution.decisions } : {}),
-      ...(execution.skipped?.length ? { skipped: execution.skipped } : {}),
-      ...(execution.automation ? { automation: { id: execution.automation.id, name: execution.automation.name } } : {}),
-      ...(execution.runId ? { runId: execution.runId } : {}),
-      ...(execution.inputs && Object.keys(execution.inputs).length ? { inputs: execution.inputs } : {}),
-      ...(execution.values && Object.keys(execution.values).length ? { values: execution.values } : {}),
-      ...(execution.loops && Object.keys(execution.loops).length ? { loops: execution.loops } : {}),
-      ...(execution.history?.length ? { history: execution.history } : {}),
-      ...(execution.spawned && Object.keys(execution.spawned).some((nodeId) => nodeIds.has(nodeId))
-        ? { spawned: Object.fromEntries(Object.entries(execution.spawned).filter(([nodeId]) => nodeIds.has(nodeId))) } : {}) };
-  });
-  const { executions: _omit, workspace, cleanup, automations, variables, coordinatorGroup, tags, ...rest } = workflow;
-  const ordered = orderNodes(workflow.nodes);
-  return { ...rest, ...(tags?.length ? { tags } : {}), ...(workspace ? { workspace } : {}),
-    ...(coordinatorGroup && groupIds.has(coordinatorGroup) ? { coordinatorGroup } : {}),
-    ...(variables?.length ? { variables: variables.map((item) => ({ key: item.key, label: item.label.trim() || item.key,
-      ...(item.description ? { description: item.description } : {}), ...(item.default ? { default: item.default } : {}), ...(item.required ? { required: true } : {}) })) } : {}),
-    ...(cleanup ? { cleanup: { coordinator: !!cleanup.coordinator, worktrees: !!cleanup.worktrees, sessions: !!cleanup.sessions } } : {}),
-    ...(automations?.length ? { automations } : {}), ...(executions?.length ? { executions } : {}), nodes: ordered.map((node) => {
-    const group = isGroup(node);
-    const frame = isFrame(node);
-    const parentNode = node.parentId && groupIds.has(node.parentId) ? workflow.nodes.find((item) => item.id === node.parentId) : undefined;
-    const parentId = parentNode && canNest(node, parentNode) ? parentNode.id : undefined;
-    const data: StageData = { label: node.data.label, description: node.data.description, kind: node.data.kind };
-    if (group && createsWorktree(node)) {
-      const source = node.data.nameSource ?? 'fixed';
-      Object.assign(data, { scope: 'worktree', path: '', worktreeMode: 'create', repoPath: node.data.repoPath ?? '', nameSource: source,
-        ...(node.data.baseBranch ? { baseBranch: node.data.baseBranch } : {}),
-        ...(source === 'fixed' && node.data.worktreeName ? { worktreeName: node.data.worktreeName } : {}),
-        ...(source === 'agent' && node.data.nameFrom ? { nameFrom: node.data.nameFrom } : {}),
-        ...(source === 'input' && node.data.inputPrompt ? { inputPrompt: node.data.inputPrompt } : {}),
-        ...(node.data.perExecution ? { perExecution: true } : {}), ...(node.data.parentPath?.trim() ? { parentPath: node.data.parentPath.trim() } : {}) });
-    } else if (group && node.data.scope === 'worktree') Object.assign(data, { scope: 'worktree', path: node.data.path ?? '',
-      ...(node.data.ref ? { ref: node.data.ref } : {}), ...(node.data.repoPath ? { repoPath: node.data.repoPath } : {}),
-      ...(node.data.worktreeName ? { worktreeName: node.data.worktreeName } : {}), ...(node.data.branch ? { branch: node.data.branch } : {}) });
-    else if (group) Object.assign(data, { scope: node.data.scope ?? 'project', path: node.data.path ?? '', ...(node.data.ref ? { ref: node.data.ref } : {}) });
-    else if (node.data.kind === 'workflow') Object.assign(data, node.data.workflowId ? { workflowId: node.data.workflowId } : {}, node.data.linkMode && node.data.linkMode !== 'wait' ? { linkMode: node.data.linkMode } : {},
-      node.data.linkMode === 'spawn' && node.data.spawnAs === 'subcoordinator' ? { spawnAs: 'subcoordinator' } : {});
-    else if (isBranch(node)) Object.assign(data, { mode: node.data.mode ?? 'exclusive', judge: node.data.judge ?? 'previous',
-      outputs: (node.data.outputs ?? []).map((output) => ({ id: output.id, label: output.label })), ...(node.data.taskId ? { taskId: node.data.taskId } : {}) });
-    else if (node.data.kind === 'script') {
-      const parse = node.data.parse ?? 'none';
-      Object.assign(data, { command: node.data.command ?? '', ...(parse !== 'none' ? { parse } : {}),
-        ...(parse === 'regex' && node.data.itemPattern ? { itemPattern: node.data.itemPattern } : {}),
-        ...(node.data.detach ? { detach: true } : {}), ...(node.data.timeoutSec ? { timeoutSec: node.data.timeoutSec } : {}),
-        ...(node.data.taskId ? { taskId: node.data.taskId } : {}) });
-    } else if (node.data.taskId) data.taskId = node.data.taskId;
-    if (launchesWorker(node)) Object.assign(data, { ...(node.data.workerModel && !fansOut(node) ? { workerModel: node.data.workerModel } : {}), ...(node.data.effort ? { effort: node.data.effort } : {}),
-      ...(fansOut(node) ? { fanout: { models: [...node.data.fanout!.models], ...(node.data.fanout!.variable ? { variable: node.data.fanout!.variable } : {}) } } : {}),
-      ...(sessionOf(node) ? { session: sessionOf(node) } : {}) });
-    if (!group && isExecutable(node) && node.data.join === 'any') data.join = 'any';
-    if (node.data.kind === 'gate' && (node.data.asker === 'previous' || node.data.asker === 'auto')) data.asker = node.data.asker;
-    const width = node.width ?? node.measured?.width;
-    const height = node.height ?? node.measured?.height;
-    return { id: node.id, type: group ? 'group' : frame ? 'frame' : 'stage', position: node.position, ...(parentId ? { parentId } : {}),
-      ...(group || frame ? { width: Math.round(width ?? (frame ? 560 : 640)), height: Math.round(height ?? (frame ? 320 : 360)) } : {}),
-      // A note keeps a size only once it has been resized (otherwise it fits its text).
-      ...(node.data.kind === 'note' && node.width && node.height ? { width: Math.round(node.width), height: Math.round(node.height) } : {}), data } as StageNode;
-  }), edges: workflow.edges.filter((edge) => ![edge.source, edge.target].some((id) => groupIds.has(id) || frameIds.has(id)))
-    // Only a branch's edges name an output (its source handle); every other edge leaves the single source port.
-    .map((edge) => ({ id: edge.id, source: edge.source, target: edge.target, label: edge.label,
-      ...(edge.sourceHandle && branchIds.has(edge.source) ? { sourceHandle: edge.sourceHandle } : {}),
-      ...(edge.loop && branchIds.has(edge.source) ? { loop: { max: edge.loop.max, exit: edge.loop.exit } } : {}) })) };
+  const { nodes, ...header } = workflow;
+  const shape = JSON.stringify([header, nodes.map(node => ({ id: node.id, type: node.type, parentId: node.parentId,
+    width: node.width, height: node.height, measured: node.measured, data: node.data }))]);
+  if (shape !== documentShape || !serializedDocument) {
+    serializedDocument = calculate<Workflow>('serializableWorkflow', [workflow]);
+    documentShape = shape;
+  }
+  // Dragging changes coordinates, which pass through unchanged; the Rust-owned schema stays cached.
+  const positions = new Map(nodes.map(node => [node.id, node.position]));
+  return { ...serializedDocument, nodes: serializedDocument.nodes.map(node => ({ ...node, position: positions.get(node.id)! })) };
 }
 
-export function fromSnapshot(snapshot: RunSnapshot): Pick<Workflow, 'nodes' | 'edges' | 'runId' | 'name'> {
-  const tasks = new Map(snapshot.tasks.map((task) => [task.id, task]));
-  const nodes: StageNode[] = snapshot.tasks.map((task) => ({ id: task.id, type: 'stage', position: { x: 0, y: 0 },
-    data: { label: task.title || task.spec.slice(0, 60), description: task.spec, taskId: task.id, kind: 'worker' } }));
-  const edges = snapshot.tasks.flatMap((task) => task.deps.filter((dep) => tasks.has(dep)).map((dep) => ({
-    id: `${dep}-${task.id}`, source: dep, target: task.id,
-  })));
-  return { name: snapshot.run.objective, runId: snapshot.run.id, nodes: autoLayout(nodes, edges), edges };
-}
+export function fromSnapshot(snapshot: RunSnapshot): Pick<Workflow, 'nodes' | 'edges' | 'runId' | 'name'> { return calculate<Pick<Workflow, 'nodes' | 'edges' | 'runId' | 'name'>>("fromSnapshot", [snapshot]); }
 
 export function newWorkflow(): Workflow {
   const nodes: StageNode[] = [
@@ -676,20 +521,16 @@ export function relationTo(nodeId: string, focus: string, near: { upstream: stri
   return up && down ? 'both' : up ? 'upstream' : down ? 'downstream' : 'dim';
 }
 
+function groupDescriptor(node: StageNode) {
+  return { id: node.id, parentId: node.parentId, data: { kind: node.data.kind, scope: node.data.scope, path: node.data.path, repoPath: node.data.repoPath } };
+}
 export function membershipOf(workflow: Pick<Workflow, 'nodes'>, node: StageNode): { project?: StageNode; worktrees: StageNode[] } {
-  const result: { project?: StageNode; worktrees: StageNode[] } = { worktrees: [] };
-  for (let group = groupOf(workflow, node), depth = 0; group && depth <= maxGroupDepth; group = groupOf(workflow, group), depth += 1) {
-    if (group.data.scope === 'worktree') result.worktrees.unshift(group); else result.project ??= group;
-  }
-  return result;
+  const result = calculateMemo<{ project?: { id: string }; worktrees: { id: string }[] }>('membershipOf', [{ nodes: workflow.nodes.map(groupDescriptor) }, groupDescriptor(node)]);
+  const byId = new Map(workflow.nodes.map(node => [node.id, node]));
+  return { ...(result.project ? { project: byId.get(result.project.id) } : {}), worktrees: result.worktrees.map(node => byId.get(node.id)!) };
 }
 /** Project a worktree group belongs to: its own pick, else the nearest enclosing worktree's project or project group. */
-export function worktreeRepo(workflow: Pick<Workflow, 'nodes'>, group: StageNode): string {
-  for (let item: StageNode | undefined = group, depth = 0; item && depth <= maxGroupDepth; item = groupOf(workflow, item), depth += 1) {
-    if (item.data.scope === 'worktree' ? item.data.repoPath : item.data.path) return (item.data.scope === 'worktree' ? item.data.repoPath : item.data.path) ?? '';
-  }
-  return '';
-}
+export function worktreeRepo(workflow: Pick<Workflow, 'nodes'>, group: StageNode): string { return calculateMemo<string>('worktreeRepo', [{ nodes: workflow.nodes.map(groupDescriptor) }, groupDescriptor(group)]); }
 /** The worktree group this one is nested in (it is created as that worktree's child), if any. */
 export function parentWorktree(workflow: Pick<Workflow, 'nodes'>, group: StageNode): StageNode | undefined {
   const parent = groupOf(workflow, group);
@@ -715,20 +556,7 @@ export type Rect = { x: number; y: number; width: number; height: number };
  * What a memo group carries when it moves: stages whose centre lies inside it, and groups or memo groups wholly inside it.
  * `rects` are absolute. A node whose parent group is carried is left out — it moves with that parent.
  */
-export function frameContents(frameId: string, nodes: Pick<StageNode, 'id' | 'data' | 'parentId'>[], rects: Map<string, Rect>): string[] {
-  const frame = rects.get(frameId);
-  if (!frame) return [];
-  const within = (x: number, y: number) => x >= frame.x && x <= frame.x + frame.width && y >= frame.y && y <= frame.y + frame.height;
-  const inside = new Set(nodes.filter((node) => {
-    const rect = rects.get(node.id);
-    if (node.id === frameId || !rect) return false;
-    return isGroup(node) || isFrame(node) ? within(rect.x, rect.y) && within(rect.x + rect.width, rect.y + rect.height)
-      : within(rect.x + rect.width / 2, rect.y + rect.height / 2);
-  }).map((node) => node.id));
-  const byId = new Map(nodes.map((node) => [node.id, node]));
-  const carriedByParent = (node: Pick<StageNode, 'parentId'>) => { for (let p = node.parentId, d = 0; p && d <= maxGroupDepth; p = byId.get(p)?.parentId, d += 1) if (inside.has(p)) return true; return false; };
-  return nodes.filter((node) => inside.has(node.id) && !carriedByParent(node)).map((node) => node.id);
-}
+export function frameContents(frameId: string, nodes: Pick<StageNode, 'id' | 'data' | 'parentId'>[], rects: Map<string, Rect>): string[] { return calculate<string[]>("frameContents", [frameId, nodes, Object.fromEntries(rects)]); }
 
 /** Brings documents from older canvases or servers up to the current node kinds ('task' → 'worker'; unknown → 'note'). */
 export function normalizeNodes(nodes: StageNode[]): StageNode[] {
@@ -811,37 +639,10 @@ export const runEventNames: Record<string, string> = {
   task: 'Task', note: '메모', gate: '게이트', worker: '워커 보고', error: '오류', report: '마무리 보고',
 };
 /** Results of each logged execution in a Run snapshot. A Task missing from the snapshot counts as unknown. */
-export function executionResults(executions: LoggedExecution[], snapshot: RunSnapshot): ExecutionResult[] {
-  return executions.map((execution) => {
-    const skipped = new Set(execution.skipped ?? []);
-    const stages = execution.tasks.map((taskId) => {
-      const task = snapshot.tasks.find((item) => item.id === taskId);
-      return { taskId, title: task?.title ?? taskId, status: skipped.has(taskId) ? 'skipped' as const : taskStatus(task, snapshot.workers) };
-    });
-    const statuses = stages.map((stage) => stage.status);
-    const finished = executionFinished(statuses);
-    return { id: execution.id, label: execution.label, status: aggregateStatus(statuses), finished,
-      stages: stages.map((stage) => stage.status === 'skipped' || (finished && stage.status === 'pending') ? { ...stage, skipped: true } : stage) };
-  });
-}
-export function loggedExecutions(executions: Execution[]): LoggedExecution[] {
-  return executions.map((execution) => {
-    const skipped = executionTasks(execution, execution.skipped ?? []);
-    return { id: execution.id, label: execution.label,
-      tasks: [...new Set([...(execution.history ?? []).flatMap((pass) => Object.values(pass.bindings)), ...Object.values(execution.bindings),
-        ...Object.values(execution.links ?? {}).flatMap((tasks) => Object.values(tasks))])],
-      ...(skipped.length ? { skipped } : {}) };
-  });
-}
+export function executionResults(executions: LoggedExecution[], snapshot: RunSnapshot): ExecutionResult[] { return calculate<ExecutionResult[]>("executionResults", [executions, snapshot]); }
+export function loggedExecutions(executions: Execution[]): LoggedExecution[] { return calculate<LoggedExecution[]>("loggedExecutions", [executions]); }
 /** Task ids bound to these stage paths (`node` or `link.sub.path`) in one execution. */
-export function executionTasks(execution: Execution, paths: string[]): string[] {
-  return paths.flatMap((path) => {
-    if (execution.bindings[path]) return [execution.bindings[path]];
-    const dot = path.indexOf('.');
-    const task = dot > 0 ? execution.links?.[path.slice(0, dot)]?.[path.slice(dot + 1)] : undefined;
-    return task ? [task] : [];
-  });
-}
+export function executionTasks(execution: Execution, paths: string[]): string[] { return calculate<string[]>("executionTasks", [execution, paths]); }
 
 // Flow semantics. Plain edges are AND: a stage runs when every predecessor that was not skipped has finished, and
 // fan-out is parallel. Only a branch node chooses: its outputs are source handles, and an output it did not take
@@ -875,49 +676,7 @@ export type DecisionEffect = { execution: Execution;
  * Records a (validated) decision. Choosing a loop output with rounds left archives the loop body's Tasks and decisions as a
  * finished pass and clears them, so the body runs again; with none left, the loop's exit output is recorded instead.
  */
-export function applyDecision(flow: FlowStage[], execution: Execution, node: string, outputs: string[]): DecisionEffect {
-  const stage = flow.find((item) => item.id === node);
-  const loop = stage?.loops?.find((item) => outputs.includes(item.output));
-  // The same loop choice again before the new round's Tasks are bound is a retried request, not another round.
-  const last = execution.history?.[execution.history.length - 1];
-  if (loop && last?.edge === loop.edge && !execution.bindings[node] && !execution.decisions?.[node]
-    && JSON.stringify(last.decisions?.[node]) === JSON.stringify(outputs)) {
-    const count = execution.loops?.[loop.edge] ?? 0;
-    return { execution, loop: { edge: loop.edge, to: loop.to, restart: last.nodes, ...roundsOf(execution, last.nodes, loop.to), max: loop.max, remaining: loop.max - count }, repeated: true };
-  }
-  const decide = (chosen: string[]) => {
-    const decisions = { ...execution.decisions, [node]: chosen };
-    return { ...execution, decisions, skipped: skippedStages(flow, decisions) };
-  };
-  if (!loop) return { execution: decide(outputs), ...(execution.decisions?.[node] ? { repeated: true } : {}) };
-  const count = execution.loops?.[loop.edge] ?? 0;
-  if (count >= loop.max) return { execution: decide([loop.exit]), exhausted: { output: loop.exit, max: loop.max } };
-  const inBody = new Set(loop.body);
-  const kept = { ...execution.decisions };
-  for (const id of inBody) delete kept[id];
-  const skipped = skippedStages(flow, kept);
-  // Stages after the loop that the earlier pass skipped (their Tasks were closed as skipped) are reachable again once the
-  // body's decisions are cleared: they get new Tasks with the body, or they would stay closed for good.
-  const before = new Set(execution.skipped ?? []);
-  const reopened = new Set(flow.map((stage) => stage.id).filter((id) => !inBody.has(id) && before.has(id) && !skipped.includes(id) && execution.bindings[id]));
-  const body = new Set([...inBody, ...reopened]);
-  const restart = flow.map((stage) => stage.id).filter((id) => body.has(id));
-  const part = <T,>(record: Record<string, T> | undefined, inside: boolean) => Object.fromEntries(Object.entries(record ?? {}).filter(([id]) => body.has(id) === inside));
-  const decisions = part(execution.decisions, false);
-  const spawned: Record<string, SpawnResult[]> = part(execution.spawned, true);
-  const pass: LoopPass = { edge: loop.edge, pass: count + 1, nodes: restart, bindings: part(execution.bindings, true),
-    decisions: { ...part(execution.decisions, true), [node]: outputs }, ...(Object.keys(spawned).length ? { spawned } : {}) };
-  const spawnedKept: Record<string, SpawnResult[]> = part(execution.spawned, false);
-  const { spawned: _spawned, ...rest } = execution;
-  const next: Execution = { ...rest, ...(Object.keys(spawnedKept).length ? { spawned: spawnedKept } : {}), bindings: part(execution.bindings, false), decisions, skipped: skippedStages(flow, decisions),
-    loops: { ...execution.loops, [loop.edge]: count + 1 }, history: [...(execution.history ?? []), pass] };
-  return { execution: next, loop: { edge: loop.edge, to: loop.to, restart, ...roundsOf(next, restart, loop.to), max: loop.max, remaining: loop.max - count - 1 } };
-}
-/** Rounds the restarted stages run now: per stage, across every loop of the execution (see `stageRound`). */
-function roundsOf(execution: Execution, restart: string[], to: string) {
-  const rounds = Object.fromEntries(restart.map((id) => [id, stageRound(execution, id)]));
-  return { pass: rounds[to] ?? stageRound(execution, to), rounds };
-}
+export function applyDecision(flow: FlowStage[], execution: Execution, node: string, outputs: string[]): DecisionEffect { return calculate<DecisionEffect>("applyDecision", [flow, execution, node, outputs]); }
 /** A gate is a user decision with two outputs; every edge leaving it is the 'approve' output. */
 export const gateOutputs: BranchOutput[] = [{ id: 'approve', label: '통과' }, { id: 'reject', label: '거절' }];
 /** A user decision the canvas can take now: its stage is reached, undecided, and every live predecessor finished. */
@@ -928,90 +687,16 @@ export type PendingDecision = { executionId: string; executionLabel: string; nod
 /** A gate whose question the worker before it asks in its own terminal (judge 'previous' on a gate). */
 const askedInWorker = (stage: FlowStage) => !!stage.veto && stage.judge === 'previous';
 /** User decisions of one execution that are open now (gates and user-judged branches whose predecessors finished). */
-export function pendingDecisions(flow: FlowStage[], execution: Execution, snapshot: RunSnapshot | null): PendingDecision[] {
-  if (!snapshot) return [];
-  const decisions = execution.decisions ?? {};
-  const skipped = new Set(execution.skipped ?? []);
-  const done = (id: string) => skipped.has(id) || executionTasks(execution, [id]).some((taskId) =>
-    taskStatus(snapshot.tasks.find((task) => task.id === taskId), snapshot.workers) === 'completed');
-  const status = (id: string) => { const [taskId] = executionTasks(execution, [id]);
-    return taskId ? taskStatus(snapshot.tasks.find((task) => task.id === taskId), snapshot.workers) : 'unbound'; };
-  // A worker-asked gate is open while its worker waits for the user (Orca reports it as needing attention).
-  const asking = (stage: FlowStage) => askedInWorker(stage) && stage.after.length === 1 && status(stage.after[0].id) === 'blocked';
-  return flow.filter((stage) => stage.branch && !decisions[stage.id] && !skipped.has(stage.id)
-    && (stage.judge === 'user' ? stage.after.every((item) => done(item.id)) : asking(stage))).map((stage) => {
-    const [taskId] = executionTasks(execution, [stage.id]);
-    const asker = askedInWorker(stage) ? flow.find((item) => item.id === stage.after[0].id) : undefined;
-    const [askerTask] = asker ? executionTasks(execution, [asker.id]) : [];
-    return { executionId: execution.id, executionLabel: execution.label, node: stage.id, label: stage.label ?? stage.id, question: stage.question ?? '',
-      mode: stage.branch!.mode, outputs: stage.branch!.outputs.map((id) => ({ id, label: stage.outputLabels?.[id] ?? id })), ...(taskId ? { taskId } : {}),
-      ...(asker ? { askedBy: { label: asker.label ?? asker.id, ...(askerTask ? { taskId: askerTask } : {}) } } : {}) };
-  });
-}
+export function pendingDecisions(flow: FlowStage[], execution: Execution, snapshot: RunSnapshot | null): PendingDecision[] { return calculate<PendingDecision[]>("pendingDecisions", [flow, execution, snapshot]); }
 
 /** Kahn order of `ids` over `edges`. When there is a cycle, `cycle` lists it (first node repeated at the end). */
-export function topologicalOrder(ids: string[], edges: { source: string; target: string }[]): { order: string[]; cycle?: string[] } {
-  const indegree = new Map(ids.map((id) => [id, 0]));
-  const next = new Map(ids.map((id) => [id, [] as string[]]));
-  const prev = new Map(ids.map((id) => [id, [] as string[]]));
-  for (const edge of edges) {
-    if (!indegree.has(edge.source) || !indegree.has(edge.target)) continue;
-    next.get(edge.source)!.push(edge.target); prev.get(edge.target)!.push(edge.source);
-    indegree.set(edge.target, indegree.get(edge.target)! + 1);
-  }
-  const queue = ids.filter((id) => indegree.get(id) === 0);
-  const order: string[] = [];
-  for (let id = queue.shift(); id !== undefined; id = queue.shift()) {
-    order.push(id);
-    for (const target of next.get(id)!) { indegree.set(target, indegree.get(target)! - 1); if (indegree.get(target) === 0) queue.push(target); }
-  }
-  if (order.length === ids.length) return { order };
-  // Every node left over still has a left-over predecessor, so walking predecessors must revisit one: that loop is a cycle.
-  const rest = new Set(ids.filter((id) => !order.includes(id)));
-  const walk: string[] = [];
-  let current = [...rest][0];
-  while (!walk.includes(current)) { walk.push(current); current = prev.get(current)!.find((id) => rest.has(id))!; }
-  const loop = walk.slice(walk.indexOf(current)).reverse();
-  // Start the reported loop at the node that comes first in `ids`, so the message is stable.
-  const start = loop.indexOf(ids.find((id) => loop.includes(id))!);
-  const rotated = [...loop.slice(start), ...loop.slice(0, start)];
-  return { order, cycle: [...rotated, rotated[0]] };
-}
+export function topologicalOrder(ids: string[], edges: { source: string; target: string }[]): { order: string[]; cycle?: string[] } { return calculate<{ order: string[]; cycle?: string[] }>("topologicalOrder", [ids, edges]); }
 /** Longest-path depth of each node: stages in the same wave can run side by side. */
-export function waves(order: string[], edges: { source: string; target: string }[]): Map<string, number> {
-  const wave = new Map(order.map((id) => [id, 0]));
-  for (const id of order) for (const edge of edges) if (edge.source === id && wave.has(edge.target)) wave.set(edge.target, Math.max(wave.get(edge.target)!, wave.get(id)! + 1));
-  return wave;
-}
+export function waves(order: string[], edges: { source: string; target: string }[]): Map<string, number> { return new Map(Object.entries(calculate<Record<string, number>>("waves", [order, edges]))); }
 /** Stages no taken path reaches, given the branch decisions so far. Undecided branches keep all their outputs alive. */
-export function skippedStages(flow: FlowStage[], decisions: Record<string, string[]>): string[] {
-  const byId = new Map(flow.map((stage) => [stage.id, stage]));
-  const { order } = topologicalOrder(flow.map((stage) => stage.id), flow.flatMap((stage) => stage.after.map((item) => ({ source: item.id, target: stage.id }))));
-  const skipped = new Set<string>();
-  for (const id of order) {
-    const stage = byId.get(id)!;
-    if (!stage.after.length) continue;
-    const vetoed = stage.after.some((item) => byId.get(item.id)?.veto?.some((output) => decisions[item.id]?.includes(output)));
-    const live = (item: FlowStage['after'][number]) => !skipped.has(item.id)
-      && !(byId.get(item.id)?.branch && decisions[item.id] && item.output && !decisions[item.id].includes(item.output));
-    const runs = stage.join === 'any' ? stage.after.some(live) : stage.after.every(live);
-    if (vetoed || !runs) skipped.add(id);
-  }
-  return order.filter((id) => skipped.has(id));
-}
+export function skippedStages(flow: FlowStage[], decisions: Record<string, string[]>): string[] { return calculate<string[]>("skippedStages", [flow, decisions]); }
 /** Why a reported decision cannot be accepted, or undefined when it can. */
-export function decisionError(flow: FlowStage[], decisions: Record<string, string[]>, node: string, outputs: string[]): string | undefined {
-  const stage = flow.find((item) => item.id === node);
-  if (!stage?.branch) return `'${node}' 는 이 워크플로의 분기·게이트 단계가 아닙니다.`;
-  if (!outputs.length || new Set(outputs).size !== outputs.length) return '출력을 하나 이상, 중복 없이 고르세요.';
-  const unknown = outputs.find((output) => !stage.branch!.outputs.includes(output));
-  if (unknown) return `'${unknown}' 는 이 분기의 출력이 아닙니다. 출력: ${stage.branch.outputs.join(', ')}`;
-  if (stage.branch.mode === 'exclusive' && outputs.length !== 1) return '이 분기는 출력을 하나만 고를 수 있습니다.';
-  if (skippedStages(flow, decisions).includes(node)) return '이 분기는 이미 건너뛴 단계입니다.';
-  const previous = decisions[node];
-  if (previous && (previous.length !== outputs.length || previous.some((output) => !outputs.includes(output)))) return `이 분기는 이미 ${previous.join(', ')} 로 결정되었습니다.`;
-  return undefined;
-}
+export function decisionError(flow: FlowStage[], decisions: Record<string, string[]>, node: string, outputs: string[]): string | undefined { return calculate<string | undefined>("decisionError", [flow, decisions, node, outputs]) ?? undefined; }
 
 /** Heading of the section a worker spec gets with the user-judged branch decisions taken before it (runtime contract (a)). */
 export const userDecisionsHeading = '## 앞 사용자 분기 판정';
@@ -1019,15 +704,6 @@ export const userDecisionsHeading = '## 앞 사용자 분기 판정';
  * User-judged branch decisions (judge `user`, gates excluded) taken so far in an execution: the current ones, else the latest
  * of an earlier loop pass, in flow order.
  */
-export function userDecisions(flow: FlowStage[], execution: Pick<Execution, 'decisions' | 'history'>): { node: string; label: string; outputs: string[] }[] {
-  const latest = new Map<string, string[]>();
-  for (const pass of execution.history ?? []) for (const [node, outputs] of Object.entries(pass.decisions ?? {})) latest.set(node, outputs);
-  for (const [node, outputs] of Object.entries(execution.decisions ?? {})) latest.set(node, outputs);
-  return flow.filter((stage) => stage.branch && stage.judge === 'user' && !stage.veto && latest.has(stage.id))
-    .map((stage) => ({ node: stage.id, label: stage.label ?? stage.id, outputs: latest.get(stage.id)! }));
-}
+export function userDecisions(flow: FlowStage[], execution: Pick<Execution, 'decisions' | 'history'>): { node: string; label: string; outputs: string[] }[] { return calculate<{ node: string; label: string; outputs: string[] }[]>("userDecisions", [flow, execution]); }
 /** The `## 앞 사용자 분기 판정` section for a worker spec; empty when no user-judged branch was decided. */
-export function userDecisionsSection(decisions: { node: string; label: string; outputs: string[] }[]): string {
-  if (!decisions.length) return '';
-  return `${userDecisionsHeading}\n${decisions.map((item) => `- ${item.node} (${item.label}): ${item.outputs.join(', ')}`).join('\n')}\n`;
-}
+export function userDecisionsSection(decisions: { node: string; label: string; outputs: string[] }[]): string { return calculate<string>("userDecisionsSection", [decisions]); }

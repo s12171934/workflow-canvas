@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+if [ -x "$root/.local/toolchain/cargo/bin/cargo" ]; then
+  export CARGO_HOME="$root/.local/toolchain/cargo"
+  export RUSTUP_HOME="$root/.local/toolchain/rustup"
+  exec "$CARGO_HOME/bin/cargo" "$@"
+fi
+if command -v cargo >/dev/null 2>&1; then exec cargo "$@"; fi
+echo 'Rust가 필요합니다. https://rustup.rs 에서 설치한 뒤 다시 실행하세요.' >&2
+exit 1

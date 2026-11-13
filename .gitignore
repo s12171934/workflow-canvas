@@ -8,3 +8,5 @@ dist/
 *.log
 .DS_Store
 coverage/
+target/
+src/generated/

@@ -1,7 +1,7 @@
 ---
 title: workflow-canvas
 created: 2026-11-01
-updated: 2026-11-11
+updated: 2026-11-13
 tags: [domain/인공지능, area/ai에이전트, type/설계, agent/codex-01a192cf-855b-74a1-a995-a16532b61d27]
 source: ai
 status: active
@@ -57,7 +57,7 @@ status: active
 
 ## 런타임 계약 (그래프 작성용)
 
-그래프 지침이 전제로 삼는 캔버스·코디네이터 동작이다. 생성 프롬프트(`server/generate.ts`)도 같은 목록(`server/contract.ts` 의 `runtimeContract`)을 쓰고, 테스트가 이 절과 상수가 같은지 확인한다.
+그래프 지침이 전제로 삼는 캔버스·코디네이터 동작이다. Rust 생성 프롬프트도 `exports/runtime-contract.json`의 같은 목록을 쓰고, 테스트가 이 절과 원본이 같은지 확인한다.
 
 <!-- runtime-contract:start -->
 - **빈 설정값** — 선언했지만 실행 때 비운 설정값은 지침의 `{{키}}` 자리에 빈 문자열로 들어간다. 「`{{키}}` 가 중괄호 그대로면」으로 판별하지 말고 「값이 비어 있으면」으로 쓴다.
@@ -75,10 +75,12 @@ status: active
 
 ## 설치와 기동
 
-- 요구 사항 — Node.js 22 이상, npm, 실행 중인 Orca 앱과 버전에 맞는 Orca CLI.
+- 빌드 요구 사항 — Rust stable과 `wasm32-unknown-unknown` 타깃, Node.js 22 이상, npm.
+- 실행 요구 사항 — 빌드한 Rust 실행 파일과 `dist/`, 실행 중인 Orca 앱과 버전에 맞는 Orca CLI. 일반 서버 실행에는 Node.js가 필요하지 않다.
 - 설치·빌드·실행:
 
 ```sh
+rustup target add wasm32-unknown-unknown
 npm ci
 npm run build
 ./bin/workflow-canvas
@@ -86,7 +88,7 @@ npm run build
 
 - 기본 주소 — `http://127.0.0.1:4318`. Orca 프로젝트의 브라우저 탭에서 연다.
 - tailnet — 서버는 127.0.0.1 에만 묶이고, 다른 기기에서는 `tailscale serve --bg --https=4318 http://127.0.0.1:4318` 의 https 주소로 연다. API 는 루프백과 `*.ts.net` 호스트만 받고, 코디네이터·워커에게 주는 콜백 주소는 요청이 어디로 왔든 `http://127.0.0.1:<포트>` 다. 에이전트 대시보드의 「워크플로 캔버스」 탭이 이 주소를 메트릭 서버에서 받아 iframe 으로 띄운다.
-- 개발 — `npm run dev`로 같은 주소에서 개발 서버를 실행한다.
+- 개발 — `npm run dev`로 같은 주소에서 Rust 서버와 Vite를 실행한다. Vite는 다음 포트를 함께 사용한다(기본 4319). Rust 코드를 고치면 개발 명령을 다시 실행한다.
 - 포트 변경 — `./bin/workflow-canvas --port 4320`.
 - CLI 선택 — `ORCA_CLI_COMMAND` 우선, 개발 환경은 `orca-dev`, Linux 외부 터미널은 `orca-ide`, 그 외는 `orca`.
 - 환경 변수 — `WORKFLOW_CANVAS_PORT`, `WORKFLOW_CANVAS_DATA_DIR`, `ORCA_CLI_COMMAND`.
@@ -105,8 +107,9 @@ npm run build
 
 - `bin/workflow-canvas` — 로컬 서버 실행 진입점.
 - `exports/workflow.schema.json` — 저장·교환용 JSON Schema. 고유 노드·연결 ID와 참조 무결성도 서버에서 검사한다.
+- `exports/runtime-contract.json` — 브리프·생성 프롬프트·문서가 공유하는 런타임 계약.
 - `examples/` — 기동 때 저장 위치에 넣는 예시 워크플로(저장 형식 그대로, 실행 기록·Run ID 없음).
-- 저장소 내부 코드 — 외부 도구에서 `src/`·`server/`를 직접 참조하지 않는다.
+- 저장소 내부 코드 — 외부 도구에서 `src/`·`rust/`를 직접 참조하지 않는다.
 - 설계와 API — [[40_Tools/workflow-canvas/docs/설계와 연동|설계와 연동]].
 
 ## 검증
@@ -117,5 +120,5 @@ npm test
 npm run build
 ```
 
-- 테스트 — Task와 터미널 상태 분리, 연결 장애, 재시도 순서, 페이지 조회, 그래프 무결성, 실행 전 검사, 저장, API 출처 제한.
+- 테스트 — Task와 터미널 상태 분리, 연결 장애, 재시도 순서, 페이지 조회, 그래프 무결성, 실행 전 검사, 저장, API 출처 제한. 기존 API 테스트는 Rust 서버에, 계산 테스트는 Rust/WASM에 연결한다. 예제 6개의 이전 배치와 연결선 113개를 고정한 비교 테스트와 실제 Rust CLI 어댑터의 프로세스 테스트를 포함한다.
 - 비밀 검사 — 커밋 대상만 별도 디렉터리에 복사한 뒤 `gitleaks dir <directory> --redact --no-banner`를 실행한다.

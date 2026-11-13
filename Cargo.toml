@@ -1,0 +1,13 @@
+[workspace]
+members = ["rust/core", "rust/server"]
+resolver = "2"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+regex = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

@@ -1,0 +1,14 @@
+
+   - **하위 코디네이터로 띄우기(`spawn.as` 가 `subcoordinator` 인 링크)**: 요청은 위와 같지만 캔버스는 에이전트를 띄우지 않는다. 항목마다 실행 등록·브리프·워크트리만 준비해 `status: "prepared"` 와 `launch`(하위 실행 로그 id)·`brief`(브리프 절대경로)·`worktree`(하위 코디네이터 위치 절대경로)를 돌려준다. 하위 코디네이터는 **너의 워커**로 띄운다. 위 "기다리지 않는다" 대신 아래를 따른다.
+     - 선행이 끝나면 링크 Task 를 `task-update --status dispatched` 로 둔다. 항목이 있으면 위 요청을 보내고, 분기 출력으로 왔으면(빈 항목) 요청을 보내지 않는다.
+     - 응답의 `prepared` 항목마다(`failed` 는 띄우지 않고, `already` 는 이미 띄운 하위로 친다):
+       1. spec 을 Write 도구로 파일에 쓴다: "<brief> 를 읽고 그대로 수행한다. 너는 「<spawn.name>」 실행의 코디네이터이고, 동시에 상위 코디네이터가 띄운 워커다(브리프의 하위 코디네이터 절을 따른다)."
+       2. `orca orchestration task-create --run <run_id> --parent <링크 Task> --task-title "<spawn.title> <항목>" --display-name "<spawn.title> <항목>" --spec "$(cat <파일>)"` 로 링크 Task 의 자식 Task 를 만든다.
+       3. `orca orchestration worker-start --run <run_id> --task <자식 Task> --worktree path:<worktree> --agent claude --model claude-opus-5-5` 로 띄운다(하위 코디네이터는 캔버스 코디네이터와 같은 모델이다. `--effort` 는 넣지 않는다).
+       4. 받은 터미널을 `orca terminal rename --terminal <터미널> --title "<spawn.title> <항목>"` 로 바꾼다.
+       결과를 산출물 `<n>-<링크 nodeId>.txt`(2회차 이상이면 `<n>-<링크 nodeId>-r<회차>.txt`)에 항목마다 한 줄 `<항목> · launch <launch> · task <자식 Task> · dispatch <dispatch id> · terminal <터미널> · <status>[ · <error>]` 로 쓰고, 이 실행의 하위 목록 `<n>-<링크 nodeId>-children.txt`(회차를 넘어 하나로 유지한다)에 같은 줄을 `open` 표시와 함께 덧붙인다. 워커를 띄우지 못한 항목은 자식 Task 를 `failed` 로 닫고 두 파일에 `failed` 로 적는다.
+     - **링크 Task 를 닫는 시점 — 하나라도 끝나면.** 하위 목록에 아직 `open` 인 하위 코디네이터(앞 회차에 띄운 것 포함)가 있으면, 그중 **하나**의 worker_done 이 올 때까지 링크 Task 를 열어 두고 `check --wait` 반복을 계속한다(다른 실행·단계의 진행은 그대로 한다). 하나가 오면 링크 Task 를 `task-update --status completed --result "요청 <n>건 · 실패 <k>건 · 끝남 <항목>"` 으로 닫고, 같은 줄을 링크 산출물 끝에 쓴 뒤 다음 단계를 띄운다. 이 링크 Task 를 `dispatched` 로 두기 전에 이미 끝났지만 아직 어느 링크 결과에도 `끝남` 으로 적지 않은 하위가 있으면 기다리지 않고 그것으로 닫는다. 열린 하위가 하나도 없으면(모두 실패했거나 끝남) 바로 `끝남 없음` 으로 닫는다. 빈 항목으로 왔어도 같은 규칙이다.
+     - **하위의 worker_done**(언제 오든, 앞 회차 것 포함): 자식 Task 가 아직 열려 있으면 보고의 outcome 대로 닫고(`completed`·`failed`), 하위 목록의 그 줄을 `done`·`failed` 와 끝난 시각·본문 첫 줄로 고친다. 실행 로그 `worker` 에 "<spawn.title> <항목>: <본문 첫 줄>" 을 남기고 그 워커를 `worker-release` 한다. 자식 Task 가 실패로 끝나도 이 실행을 멈추지 않고 그 Task 에 의존하는 단계도 없다 — 판단은 뒤 단계가 산출물(하위 그래프가 남긴 `_index` 줄 등)로 한다.
+     - 하위 코디네이터 터미널이 worker_done 없이 닫히면(죽은 워커 규칙) 자식 Task 를 `failed` 로 닫고 `failed` 로 끝난 것으로 친다. 링크 Task 와 뒤 단계를 실패로 만들지 않는다.
+     - 하위가 `ask`·escalation 을 보내면 실행 로그 `note`(escalation 은 `error`)에 남긴다. 그래프 지침으로 답할 수 있으면 `reply` 로 답하고, 사용자 판단이 필요하면 "그 실행의 캔버스 결정 카드로 넘겨라" 로 답한다. 단계 지침이 하위에 지시를 전하라고 하면(예: 계약 정정) `orca orchestration send --to dispatch:<dispatch id> --subject "<요지>" --body "<지시>"` 로 보낸다.
+     - 이 실행이 끝날 때(절차 6) 열린 하위가 남아 있으면 기다리지 않고 마무리 보고에 열린 하위 목록을 적는다. 그래도 코디네이터 터미널은 닫지 않는다(하위의 worker_done 을 받을 곳이 사라진다) — `check --wait` 반복으로 남은 worker_done 을 위처럼 처리하고, 모두 끝나면 완료 시 정리 규칙대로 마친다.

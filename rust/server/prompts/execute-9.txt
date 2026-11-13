@@ -1,0 +1,3 @@
+
+   - `launch` 는 이 실행 요청의 실행 로그 ID 다. 그대로 보낸다.
+   - `coordinatorTerminal` 은 네 터미널 핸들(`echo $ORCA_TERMINAL_HANDLE` 의 값, `term_` 로 시작)이다. 캔버스는 이 터미널이 Orca 에서 사라졌는데 실행이 끝나지 않았으면 실행 로그를 `stalled`(중단됨)로 표시한다.

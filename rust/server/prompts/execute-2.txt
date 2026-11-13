@@ -1,0 +1,8 @@
+
+## 컨텍스트가 요약된 뒤 이어가기
+실행이 길어 이 대화가 자동 요약(compaction)되면, 요약만 믿고 진행하지 않는다. 다음 단계를 띄우거나 판정을 보내기 전에 상태를 원본에서 다시 읽는다. 진행 상태의 정본은 아래이고, 기억과 다르면 원본을 따른다.
+- 실행 기록: `curl -s @@0@@/api/workflows/@@1@@/executions/<실행 id>/decisions` 와 실행 로그(@@2@@) — 지금까지의 판정·회차(loop pass)·건너뛴 단계.
+- Orca: `task-list --run <run_id> --json`(단계 Task 상태), `worker-list --run <run_id> --json`(살아 있는 워커), `gate-list --run <run_id> --json`(열린 게이트).
+- 산출물 디렉터리 `@@3@@`: 단계 산출물과, 하위 코디네이터를 띄우는 링크가 있으면 `<n>-<링크 nodeId>-children.txt`(열린 하위 목록).
+- 이 브리프(`@@4@@/brief.md`)는 필요한 절만 grep 으로 다시 읽는다.
+run_id·실행 id·자기 Task·dispatch id 처럼 다시 찾기 어려운 값은 처음 정해질 때 `@@5@@/coordinator-state.txt` 에 한 줄씩 덧붙여 두고(Write 대신 `printf ... >>`), 요약 뒤에는 이 파일부터 읽는다.

@@ -1,0 +1,13 @@
+[package]
+name = "workflow-core"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+regex.workspace = true
+regress = "0.10"

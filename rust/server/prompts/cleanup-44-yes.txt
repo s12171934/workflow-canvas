@@ -1,0 +1,1 @@
+**정리한다.** 끝난 워커는 `worker-release` 로 터미널을 정리하고, `worker-list --terminal-state reclaimable` 이 빌 때까지 확인한다.
